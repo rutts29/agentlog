@@ -1,0 +1,157 @@
+from __future__ import annotations
+
+import json
+import logging
+from abc import ABC, abstractmethod
+from collections.abc import Iterator
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import xxhash
+
+from agentlog.normalize.models import Harness, ParseResult
+
+log = logging.getLogger("agentlog.ingest")
+
+
+def hash_bytes(data: bytes) -> str:
+    return xxhash.xxh64(data).hexdigest()
+
+
+def hash_prefix(path: Path, nbytes: int) -> str:
+    if nbytes <= 0:
+        return hash_bytes(b"")
+    with path.open("rb") as f:
+        return hash_bytes(f.read(nbytes))
+
+
+def file_stat(path: Path) -> tuple[int, int]:
+    st = path.stat()
+    return st.st_size, st.st_mtime_ns
+
+
+def parse_ts(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        # Heuristic: ms vs s
+        ts = float(value)
+        if ts > 1e12:
+            ts /= 1000.0
+        return datetime.fromtimestamp(ts, tz=timezone.utc)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            dt = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    return None
+
+
+def extract_text(content: Any) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, dict):
+        if "text" in content and isinstance(content["text"], str):
+            return content["text"]
+        if "content" in content:
+            return extract_text(content["content"])
+        return json.dumps(content, ensure_ascii=False)
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                t = item.get("type")
+                if t in ("text", "input_text", "output_text") and isinstance(
+                    item.get("text"), str
+                ):
+                    parts.append(item["text"])
+                elif t == "thinking" and isinstance(item.get("thinking"), str):
+                    parts.append(item["thinking"])
+                elif isinstance(item.get("text"), str):
+                    parts.append(item["text"])
+        return "\n".join(p for p in parts if p)
+    return str(content)
+
+
+_TOOL_PLUMBING_TYPES = frozenset({"tool_result", "tool_use"})
+_IGNORABLE_EMPTY_TYPES = frozenset(
+    {"text", "input_text", "output_text", "thinking"}
+)
+
+
+def content_is_tool_plumbing(content: Any) -> bool:
+    """True when content is only tool_use/tool_result plumbing (no human/assistant text)."""
+    if not isinstance(content, list) or not content:
+        return False
+    if extract_text(content).strip():
+        return False
+    saw_tool = False
+    for item in content:
+        if not isinstance(item, dict):
+            return False
+        btype = item.get("type")
+        if btype in _TOOL_PLUMBING_TYPES:
+            saw_tool = True
+        elif btype in _IGNORABLE_EMPTY_TYPES:
+            continue
+        else:
+            return False
+    return saw_tool
+
+
+def content_hash_text(text: str) -> str:
+    return hash_bytes(text.encode("utf-8", errors="replace"))
+
+
+def iter_jsonl_bytes(
+    data: bytes, *, source: str
+) -> Iterator[tuple[int, int, dict[str, Any] | None, str | None]]:
+    """Yield (line_start, line_end, obj|None, error|None) over a byte slice."""
+    offset = 0
+    while offset < len(data):
+        nl = data.find(b"\n", offset)
+        if nl == -1:
+            line_end = len(data)
+            line = data[offset:line_end]
+            next_offset = line_end
+        else:
+            line_end = nl + 1
+            line = data[offset:nl]
+            next_offset = line_end
+        if line.strip():
+            try:
+                obj = json.loads(line.decode("utf-8", errors="replace"))
+                if isinstance(obj, dict):
+                    yield offset, next_offset, obj, None
+                else:
+                    yield offset, next_offset, None, f"{source}: non-object JSON"
+            except json.JSONDecodeError as exc:
+                yield offset, next_offset, None, f"{source}: {exc}"
+        offset = next_offset
+
+
+class TranscriptAdapter(ABC):
+    harness: Harness
+
+    @abstractmethod
+    def discover(self) -> list[Path]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def parse_chunk(
+        self, path: Path, data: bytes, *, start_offset: int
+    ) -> ParseResult:
+        raise NotImplementedError

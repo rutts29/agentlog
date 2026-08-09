@@ -1,0 +1,81 @@
+{
+  "type": "object",
+  "properties": {
+    "tools": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "url": { "type": "string" },
+          "repo_url": { "type": "string", "description": "GitHub/GitLab repo if open source, else empty" },
+          "category": {
+            "type": "string",
+            "enum": [
+              "transcript-analytics",
+              "agent-config-optimizer",
+              "agent-memory-system",
+              "skill-or-plugin-manager",
+              "coding-agent-observability",
+              "prompt-or-context-optimizer",
+              "other"
+            ]
+          },
+          "what_it_does": { "type": "string", "description": "2-3 sentence factual summary" },
+          "data_sources": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "What it reads, e.g. Claude Code transcripts, Codex sessions, Cursor transcripts, git history, editor telemetry"
+          },
+          "runs_locally": { "type": "boolean" },
+          "open_source": { "type": "boolean" },
+          "license": { "type": "string" },
+          "longitudinal_analysis": {
+            "type": "boolean",
+            "description": "Does it track behavior/metrics over time rather than one-shot snapshots?"
+          },
+          "proposes_config_changes": {
+            "type": "boolean",
+            "description": "Does it suggest or apply edits to AGENTS.md, CLAUDE.md, skills, rules, or memory files?"
+          },
+          "evidence_cited": {
+            "type": "boolean",
+            "description": "Do its outputs cite specific sessions/excerpts as evidence?"
+          },
+          "detects_harmful_config": {
+            "type": "boolean",
+            "description": "Does it identify counterproductive skills, plugins, or rules?"
+          },
+          "maturity": {
+            "type": "string",
+            "enum": ["idea", "prototype", "active-project", "funded-product", "abandoned"]
+          },
+          "stars_or_traction": { "type": "string" },
+          "overlap_with_our_concept": {
+            "type": "string",
+            "enum": ["high", "medium", "low"],
+            "description": "High = analyzes agent transcripts AND recommends config changes; medium = does one of those; low = adjacent"
+          },
+          "differentiation_notes": {
+            "type": "string",
+            "description": "What it does NOT do that our concept does, or vice versa"
+          }
+        },
+        "required": ["name", "url", "category", "what_it_does", "overlap_with_our_concept"]
+      }
+    },
+    "summary": {
+      "type": "object",
+      "properties": {
+        "closest_competitors": { "type": "array", "items": { "type": "string" } },
+        "unclaimed_gaps": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Capabilities from the research brief that no found tool provides"
+        },
+        "crowded_areas": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  },
+  "required": ["tools", "summary"]
+}
