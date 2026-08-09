@@ -59,6 +59,36 @@ def _median(values: list[float]) -> float:
     return 0.5 * (s[m - 1] + s[m])
 
 
+def cluster_bootstrap_median(
+    values: list[float],
+    *,
+    n_boot: int = 2000,
+    seed: int = 0,
+    alpha: float = 0.05,
+) -> IntervalEstimate:
+    """Cluster bootstrap for a single-cell median. Each value is one root cluster."""
+    if not values:
+        return IntervalEstimate(estimate=float("nan"), low=float("nan"), high=float("nan"), n=0)
+    rng = random.Random(seed)
+    point = _median(values)
+    n = len(values)
+    samples: list[float] = []
+    for _ in range(n_boot):
+        draw = [values[rng.randrange(n)] for _ in range(n)]
+        samples.append(_median(draw))
+    samples.sort()
+    lo_i = int(math.floor((alpha / 2) * n_boot))
+    hi_i = int(math.ceil((1 - alpha / 2) * n_boot)) - 1
+    lo_i = max(0, min(lo_i, n_boot - 1))
+    hi_i = max(0, min(hi_i, n_boot - 1))
+    return IntervalEstimate(
+        estimate=point,
+        low=samples[lo_i],
+        high=samples[hi_i],
+        n=n,
+    )
+
+
 def cluster_bootstrap_median_diff(
     values_a: list[float],
     values_b: list[float],

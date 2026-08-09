@@ -5,3 +5,5 @@ dist/
 build/
 .agentlog/
 .research/
+web/node_modules/
+web/dist/
