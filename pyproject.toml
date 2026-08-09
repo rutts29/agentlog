@@ -20,3 +20,6 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agentlog"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/agentlog/analysis/extractors/prompts/ux_extraction_subagent.md" = "agentlog/analysis/extractors/prompts/ux_extraction_subagent.md"

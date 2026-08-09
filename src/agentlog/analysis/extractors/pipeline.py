@@ -13,7 +13,6 @@ from agentlog.analysis.extractors.audit import (
     evaluate_gate,
     load_gold,
     score_predictions,
-    stratified_sample,
 )
 from agentlog.analysis.extractors.deterministic import run_deterministic
 from agentlog.analysis.extractors.llm_client import ChatClient

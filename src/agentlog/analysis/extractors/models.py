@@ -26,6 +26,8 @@ class ExtractorMeta(BaseModel):
     version: str
     model: str | None = None
     prompt_hash: str | None = None
+    packet_id: str | None = None
+    provider: str | None = None
 
 
 class UxObservation(BaseModel):
