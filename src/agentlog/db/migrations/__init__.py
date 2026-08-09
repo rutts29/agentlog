@@ -5,10 +5,12 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 
 from agentlog.db.migrations.v002_extraction import apply as apply_v002
+from agentlog.db.migrations.v003_experiments import apply as apply_v003
 
 # Version 1 = base SCHEMA_SQL in schema.py (implicit).
 MIGRATIONS: list[tuple[int, Callable[[sqlite3.Connection], None]]] = [
     (2, apply_v002),
+    (3, apply_v003),
 ]
 
 

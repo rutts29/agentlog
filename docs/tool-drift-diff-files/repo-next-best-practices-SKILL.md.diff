@@ -1,0 +1,19 @@
+--- /Users/ruttanshbhatelia/side_projects/ai-challenge-loan-ref/.claude/skills/next-best-practices/SKILL.md	2026-02-07 08:19:52
++++ /Users/ruttanshbhatelia/side_projects/ai-challenge-loan-ref/.agents/skills/next-best-practices/SKILL.md	2026-05-02 15:33:04
+@@ -1,7 +1,6 @@
+ ---
+-name: next-best-practices
+-description: Next.js best practices - file conventions, RSC boundaries, data patterns, async APIs, metadata, error handling, route handlers, image/font optimization, bundling
+-user-invocable: false
++name: "next-best-practices"
++description: "Next.js best practices - file conventions, RSC boundaries, data patterns, async APIs, metadata, error handling, route handlers, image/font optimization, bundling"
+ ---
+ 
+ # Next.js Best Practices
+@@ -151,3 +150,6 @@
+ - MCP endpoint for AI-assisted debugging
+ - Rebuild specific routes with `--debug-build-paths`
+ 
++## MANUAL MIGRATION REQUIRED
++
++Review unsupported Claude skill fields manually: `user-invocable`.

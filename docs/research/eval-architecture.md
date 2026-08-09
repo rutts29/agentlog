@@ -9,7 +9,7 @@
 agentlog needs two evaluation systems with a one-way relationship:
 
 - **Type A — evals OF agentlog** are software-quality checks. They ask whether ingestion, normalization, windowing, extraction, citations, and incremental processing are correct. They run against fixtures and gold labels in isolated databases and can fail a build.
-- **Type B — evals BY agentlog** are product analytics. Their resting surface is a descriptive model-usage and collaboration-experience profile of this owner's history—not a performance ranking. They may surface matched-cohort associations only when the §5.2 procedure fully passes. They run against the production evidence ledger and must preserve uncertainty, missingness, and confounding.
+- **Type B — evals BY agentlog** are product analytics. Their resting surface is a descriptive model-usage and interaction-style profile of this owner's history—not a performance ranking. They may surface matched-cohort associations only when the §5.2 procedure fully passes. They run against the production evidence ledger and must preserve uncertainty, missingness, and confounding.
 
 Do not put both behind a generic `evals` package, generic `eval_results` table, or shared “score.” Type A must never appear in the dashboard as user evidence. Type B must never become a CI gate for the parser.
 
@@ -34,7 +34,7 @@ Two independent reviews designed the Type B evaluation layer. This document is R
 | Default product surface | Task-conditioned configuration matrix that can rank when gates pass | Descriptive model-usage & experience profile; 4-way ranked cross-tab not estimable | Descriptive profile is the resting state. Ranking only if §5.2 fully passes, labeled as matched-cohort association. With current data, almost no cell is expected to qualify. |
 | Cell estimability | `model × harness × effort × task` as the comparison cell | Structural zeros (effort Codex-only; model near-nested in harness/era) plus confounding by indication | Keep the cell for descriptive stratification. Do not treat the full ranked cross-tab as estimable. Surface the owner's model-selection pattern as the differentiating signal. |
 | Display / abstention gates | Round-number n tiers (5 / 15 / 30) | Wilson half-width precision gates (e.g. ≤10pp) plus cluster-adjusted event minima | Precision gates are binding (Wilson ≤10pp for binary rates; versioned cluster-bootstrap half-width for the continuous lead rate). Retain tier language for readability only when it does not loosen the precision gate. |
-| Lead metric | Corrections among several peer outcomes; duration usable for efficiency comparisons | Corrections per 10 exchange windows as lead, framed as collaboration experience; duration contextual only; retry/tool-failure within-harness only | Initially adopted B's corrections lead. **Superseded by empirical revision below:** redirect/brake rate is now the lead metric. |
+| Lead metric | Corrections among several peer outcomes; duration usable for efficiency comparisons | Corrections per 10 exchange windows as lead, framed as collaboration experience; duration contextual only; retry/tool-failure within-harness only | Initially adopted B's corrections lead. **Superseded by empirical revision + gap-closure:** redirect/brake rate is the lead *descriptive interaction-style* metric—not a quality-defect rate. |
 | Per-model support | Exact variants kept separate; Cursor blocked until model/effort recovered | Only gpt-5.5 (303) supports a `model × task` grid; gpt-5.6-sol (47) and grok-4.5-build (69) support 2–3 strata; else abstain | Record those counts in §4.4. Most configurations abstain. **Superseded for Cursor:** model/effort now recovered for most transcripts (§4.4); cells without a resolved model still abstain. |
 | Classifier validation n | ≥250 adjudicated root sessions before published task-conditioned comparisons | ~120 suggested | Staged: ~120 to unblock development; ≥250 required before any task-conditioned comparison is published (§4.3). |
 | Task-label evidence | First request plus other pre-treatment signals (constraints, repo, file types) | First user message only, gated on a hand-labeled gold set | Task primary labels from the first substantive user message only, gated on gold. Other pre-treatment signals remain for difficulty features, not primary-task assignment. |
@@ -205,7 +205,7 @@ Copy them to `~/.agentlog/fixtures/private/<harness>/`, redact secrets determini
 Do not label the raw 4,942-window ledger. After mandatory population triage (§4.5), the human-behavior extraction pool is about **1,800 windows** (~1,782 under the exploratory triage rule in `extraction-test-run.md`). Draw gold samples from that pool only.
 
 - **Prevalence sample:** 300 windows selected by a seeded uniform sample over root-session clusters, stratified by harness and calendar month. Against ~1,800 eligible windows this is ~17% of the pool—large enough for precision/false-positive rates without enrichment bias, and still attainable without labeling the full corpus. Do not draw prevalence from auto-review, harness-synthetic, or empty rows.
-- **Challenge sample:** 200 windows deliberately enriched for mid-task redirects / premature-action brakes, agent pushback, corrections (including borderline follow-ups), frustration, tool failures, retries, abandonment candidates, long outputs, multi-agent handoffs, quoted instructions, and low-confidence classifier boundaries. This measures recall and boundary behavior, not prevalence. 500 labeled windows total (~28% of the eligible pool) is a heavy but one-time cost; do not shrink either sample to ease labeling.
+- **Challenge sample:** 200 windows deliberately enriched for mid-task redirects / premature-action brakes, agent pushback, corrections (including borderline follow-ups), soft approvals, frustration (including ambiguous non-affect), tool failures, retries, abandonment candidates, long outputs, multi-agent orchestration (`inter_agent_handoff`, `worker_brief`, `coordinator_nudge`, `cross_harness_reference`), quoted instructions, and low-confidence classifier boundaries. This measures recall and boundary behavior, not prevalence. 500 labeled windows total (~28% of the eligible pool) is a heavy but one-time cost; do not shrink either sample to ease labeling.
 
 Sample at the root-session level first, then windows within roots, so one long session cannot dominate. Freeze 20% of each sample as an untouched regression holdout. Prompt and rule tuning may use the other 80% only.
 
@@ -268,7 +268,7 @@ For each label kind:
 - evidence-span token F1;
 - abstention rate and accuracy among non-abstained cases.
 
-The first production labels—redirect/brake (lead), agent pushback, correction (secondary, abstention-heavy), frustration, failure pattern, handoff candidate, and learning candidate—get independent metrics. “Insight accuracy” is too vague to gate.
+The first production labels—redirect/brake (lead, descriptive), agent pushback, correction (secondary, abstention-heavy), soft approval (stance only), frustration (abstention-heavy), orchestration turn kinds (`inter_agent_handoff`, `worker_brief`, `coordinator_nudge`, `cross_harness_reference`), failure pattern, and learning candidate—get independent metrics. “Insight accuracy” is too vague to gate.
 
 #### Citation faithfulness
 
@@ -305,8 +305,11 @@ Fast local/PR suite:
 
 Scheduled semantic suite:
 
-- redirect/brake precision >= 0.90 and recall >= 0.80 on holdout (lead label);
+- redirect/brake precision >= 0.90 and recall >= 0.80 on holdout (lead descriptive label; gates measure detection quality, not whether a high rate is “bad”);
 - correction precision >= 0.90 and recall >= 0.80 on holdout among non-abstained cases; correction aggregates that skip the abstention rule fail the suite;
+- frustration precision >= 0.90 and recall >= 0.70 on holdout among non-abstained cases; default abstain unless affect is explicit; aggregates that skip abstention fail the suite;
+- soft-approval precision >= 0.85 and recall >= 0.70 on holdout; suite fails if any fixture treats soft approval as terminal task success;
+- orchestration turn-kind precision >= 0.85 and recall >= 0.70 on holdout for `inter_agent_handoff` / `worker_brief` / `coordinator_nudge` / `cross_harness_reference`;
 - agent-pushback precision >= 0.85 and recall >= 0.70 on holdout before dashboard claims;
 - every other production label precision >= 0.85 and recall >= 0.70 before it may produce a dashboard claim;
 - citation semantic-support precision >= 0.95;
@@ -346,7 +349,7 @@ The manifest pins fixture hash, parser version, window-builder version, extracto
 
 ## 4. Type B — evals BY agentlog
 
-Type B's default product surface is a **descriptive model-usage and collaboration-experience profile**: what the owner chose, on which tasks, with what observed collaboration signals. It is not a performance ranking. A 4-way ranked `model × harness × effort × task` cross-tab is not estimable from this corpus—effort is Codex-only, model is near-nested in harness and time-era, and the owner selects model by anticipated difficulty that is never recorded (confounding by indication). The owner's model-selection pattern is itself the valid, differentiating signal; surface that as the feature.
+Type B's default product surface is a **descriptive model-usage and interaction-style profile**: what the owner chose, on which tasks, with what observed steering and orchestration signals. It is not a performance ranking. A 4-way ranked `model × harness × effort × task` cross-tab is not estimable from this corpus—effort is Codex-only, model is near-nested in harness and time-era, and the owner selects model by anticipated difficulty that is never recorded (confounding by indication). The owner's model-selection pattern is itself the valid, differentiating signal; surface that as the feature.
 
 Ranking or “winner” presentation is available only when the §5.2 ten-gate comparison procedure fully passes, and must be labeled a matched-cohort association, never a verdict. With the current data distribution, almost no cell is expected to qualify. Descriptive profile is the resting state; ranking is the rare exception.
 
@@ -564,7 +567,7 @@ Report:
 Harness rules:
 
 - **Codex:** failed when `function_call_output` or an `*_end` record carries non-zero `exit_code`, or an explicit `success=false` in the source payload. Preserve call ID, exit code, and canonical tool family. A call with no result is `unknown`, not failed. A row whose only signal is NULL `tool_events.success` is `unknown`.
-- **Claude Code:** failed when the matching `tool_result.is_error` is true. Preserve `tool_use_id`, input hash, and tool name. A missing `is_error` is unknown. Claude human turns are recoverable after the adapter fix (tool-result rows under the `user` role must not be counted as human messages); tool-failure semantics still depend on `is_error`, not on empty text.
+- **Claude Code:** failed when the matching `tool_result.is_error` is true. Preserve `tool_use_id`, input hash, and tool name. A missing `is_error` is unknown. Claude human turns are recovered (tool-result rows under the `user` role must not be counted as human messages); tool-failure semantics still depend on `is_error`, not on empty text.
 - **Cursor:** failed when a `tool_result.is_error` is true. Current records without that field are unknown. Cursor model/effort recovery (§4.4) is separate missingness from tool-result success.
 
 #### Retry
@@ -743,7 +746,7 @@ Pairwise ranking or “winner” presentation is off by default. Every pairwise 
 4. Require support overlap: the outcome must be observable under the same operational definition in both configurations. Retry and tool-failure comparisons additionally require the same harness.
 5. Stratify by repository and month. Include only shared strata.
 6. Balance pre-treatment difficulty features. Reject comparison when any weighted standardized mean difference exceeds 0.25 after weighting/matching.
-7. Require effective sample size >= 20 per configuration for a winner label, and require each arm to pass the §4.7 precision gate. Against ~1,800 eligible windows this bar is rarely met; do not lower it—abstain instead.
+7. Require effective sample size >= 20 per configuration before any matched-cohort association may leave the descriptive profile, and require each arm to pass the §4.7 precision gate. Against ~1,800 eligible windows this bar is rarely met; do not lower it—abstain instead.
 8. Estimate a risk difference for binary outcomes or median ratio/difference for continuous outcomes, with root-cluster bootstrap intervals.
 9. Apply Benjamini–Hochberg false-discovery control at `q=0.10` across comparisons shown in the same refresh.
 10. Require practical importance as well as uncertainty separation before surfacing a matched-cohort association: at least 5 percentage points for binary redirect-brake/correction/abandonment rates, 20% relative for the continuous lead rate `redirects_brakes_per_10_exchange_windows`, or 20% for cost. Meeting the threshold means the interaction-style (or cost) difference is large enough to show—not that the lower-redirect arm “won.” Duration has no practical-importance ranking threshold because it is contextual only. `clean_completion` has none because the metric is retired.
@@ -787,9 +790,9 @@ Emit no comparative claim when any of these is true:
 - source capability changes the metric definition;
 - the comparison asks for cross-harness retry or tool-failure rates;
 - duration is proposed as the ranked outcome;
-- the confidence interval cannot exclude both zero and the practical-effect threshold for a winner claim.
+- the confidence interval cannot exclude both zero and the practical-effect threshold for an association claim.
 
-When `10 <= effective n < 20`, or when §5.2 has not fully passed, a descriptive difference may be shown but the product must say “not enough comparable history to rank” and must remain on the usage & experience profile.
+When `10 <= effective n < 20`, or when §5.2 has not fully passed, a descriptive difference may be shown but the product must say “not enough comparable history to rank” and must remain on the usage & interaction-style profile.
 
 ### 5.5 Language contract
 
@@ -797,24 +800,30 @@ Allowed:
 
 - “In your observed history…”
 - “your model-selection pattern…”
-- “collaboration experience…”
-- “was associated with…”
-- “had a lower detected redirect/brake rate in this matched cohort…”
-- “matched-cohort association, not a ranking verdict…”
+- “interaction style…” / “steering frequency in these sessions…”
+- “redirect/brake rate describes how much mid-task steering appeared…”
+- “was associated with a different detected redirect/brake rate…”
+- “A … per 10 windows vs B … in this matched cohort…”
+- “matched-cohort association; not a quality ranking…”
 - “evidence is limited because…”
 - “not enough comparable history.”
 - “insufficient precision to aggregate.”
 - “correction status abstained where the follow-up was ambiguous…”
+- “soft approval labeled as stance only; not task success…”
+- “frustration abstained where affect was not explicit…”
 
 Forbidden:
 
 - “proved,” “caused,” “improved,” or “made the agent”;
 - “best model” without task, harness, effort, time range, and comparison cohort;
 - presenting the 4-way configuration matrix as an estimable ranked leaderboard;
-- “success rate” when the metric is the clean-completion proxy;
+- “success rate,” “clean completion,” or any success proxy built from absent redirects, soft approval, or the retired `clean_completion` flag;
 - “0% failures” when failures are unknown or unsupported (including NULL `tool_events.success` without other evidence);
-- quality language for the redirect/brake lead metric (it is collaboration experience);
-- treating keyword “correctionish” rates or non-abstained ambiguous follow-ups as correction evidence.
+- treating the redirect/brake lead metric as a defect, error, failure, or quality score;
+- implying directionality on redirect/brake: “underperformed,” “worse,” “better because fewer redirects,” “cleaner session,” or UI that sorts configurations by lowest redirect rate as a performance ranking;
+- treating a high redirect rate in an exploratory session as model failure, or a low rate as model success;
+- treating keyword “correctionish” rates or non-abstained ambiguous follow-ups as correction evidence;
+- reporting frustration rates without the explicit-affect abstention bar.
 
 ## 6. Path to prospective rigor
 
@@ -885,7 +894,7 @@ Analyze only that comparison with root-cluster uncertainty. Secondary metrics ma
 
 ### 6.6 What this does and does not buy
 
-This protocol can support cautious causal language for the one pre-registered arm contrast under compliance. It does not make historical cells causal, does not identify harness or effort effects, and does not justify filling the ranked 4-way cross-tab. The descriptive usage & experience profile remains the product resting state.
+This protocol can support cautious causal language for the one pre-registered arm contrast under compliance. It does not make historical cells causal, does not identify harness or effort effects, and does not justify filling the ranked 4-way cross-tab. The descriptive usage & interaction-style profile remains the product resting state. For the default primary metric, even a prospective contrast reports steering-frequency differences—not a defect-rate win—unless the pre-registration explicitly chooses a different outcome with a justified quality interpretation.
 
 ## 7. Strands Agents Evals verdict
 
@@ -942,7 +951,7 @@ Steal these patterns:
 - a narrow provider boundary;
 - trace diagnosis as a separate operation from scoring.
 
-Do not import its package, copy its source, convert agentlog's ledger wholesale to OpenTelemetry spans, or use its LLM judges for the personal usage & experience profile.
+Do not import its package, copy its source, convert agentlog's ledger wholesale to OpenTelemetry spans, or use its LLM judges for the personal usage & interaction-style profile.
 
 Reconsider an **optional** adapter only if agentlog later adds active benchmark execution. That adapter could export a selected agentlog session as a Strands `Session` or import a Strands `EvaluationReport`. agentlog would still own discovery, SQLite storage, task labels, outcomes, cohorts, statistical comparison, prospective randomization (§6), and dashboard claims.
 
@@ -1273,9 +1282,9 @@ Gold labels remain version-controlled files or private fixture-store files. The 
 1. Add schema migrations before adding evaluation tables.
 2. Fix `exchange_windows` hashing to include request, response, tool context, and builder version.
 3. Preserve source tool call IDs, argument hashes, result codes, timestamps, and success provenance in all three adapters. Do not treat NULL `tool_events.success` as observed failure or success; record `success_source` so provenance is explicit.
-4. Fix Claude Code human-turn recovery: stop recording Anthropic `user`-role tool results as empty human messages so the 331 genuine human turns (~1.63M chars) are available. This unblocks Claude UX metrics; it does not enlarge Claude to Codex scale.
+4. Keep Claude Code human-turn recovery correct: Anthropic `user`-role tool results must not be recorded as empty human messages. Verified recovery is 331 human turns (~1,630,098 chars). This unblocks Claude UX metrics; it does not enlarge Claude to Codex scale.
 5. Add token-usage normalization where source records support it.
-6. Add root-session resolution and capability manifests; implement deterministic population triage (auto-review, synthetic follow-ups, skill dumps, image-only, stubs) before semantic extraction.
+6. Add root-session resolution and capability manifests; implement deterministic population triage (auto-review, synthetic follow-ups, skill dumps, image-only, stubs) before semantic extraction; recover Cursor model/effort from `state.vscdb` where present.
 
 Type B retry/cost claims and Type A invalidation checks depend on this phase.
 
@@ -1293,21 +1302,22 @@ Do this before adding semantic product claims; otherwise later labels rest on an
 
 1. Add `derivation_runs` and cache keys.
 2. Define validated evidence-reference types.
-3. Implement redirect/brake extraction first (lead metric), then agent pushback, then correction-with-mandatory-abstention—these power dashboard annotations and Type B outcomes.
-4. Add citation integrity checks.
-5. Build the 300-window prevalence and 200-window challenge samples from the ~1,800-window triage pool; label and freeze holdouts.
-6. Enable semantic claims only after their gates pass.
+3. Implement redirect/brake extraction first (lead descriptive metric), then orchestration turn kinds, agent pushback, correction-with-mandatory-abstention, soft-approval-as-stance, and frustration-with-mandatory-abstention—these power dashboard annotations and Type B outcomes.
+4. Enforce extraction truncation and triage caps (§4.5): budget is binding; do not reprocess the raw 4,942-window ledger for UX labels.
+5. Add citation integrity checks.
+6. Build the 300-window prevalence and 200-window challenge samples from the ~1,800-window triage pool; label and freeze holdouts.
+7. Enable semantic claims only after their gates pass.
 
 ### Phase 4 — Type B factual layer
 
-1. Build root task clusters; segregate `codex-auto-review`, subagent-derived rows, Cursor synthetic follow-ups, skill-body dumps, and image-only turns from the main population.
+1. Build root task clusters with orchestration lineage; segregate `codex-auto-review`, subagent-derived independence rows, Cursor synthetic follow-ups, skill-body dumps, and image-only turns from the main human-attitude population; keep worker briefs/handoffs attached to the root for structure (§4.1).
 2. Implement first-message pre-treatment task classification and owner overrides.
 3. Validate the taxonomy on a staged gold set (~120 to unblock; ≥250 before publish—unchanged; abstain from publish if 250 eligible roots cannot be adjudicated).
-4. Compute outcome observations with explicit availability; lead with `redirects_brakes_per_10_exchange_windows`; track agent pushback; keep corrections secondary with mandatory abstention.
-5. Add semantic abandonment, redirect/brake, pushback, and abstention-gated correction observations with evidence. Tool-failure observations must not rely on NULL `success` alone.
-6. Expose the model usage & experience profile: selection shares, per-cell descriptive aggregates under Wilson precision gates, and session drill-downs.
+4. Compute outcome observations with explicit availability; lead with descriptive `redirects_brakes_per_10_exchange_windows`; track agent pushback and orchestration density; keep corrections and frustration secondary with mandatory abstention; never emit `clean_completion`.
+5. Add semantic abandonment, redirect/brake, pushback, soft-approval-as-stance, and abstention-gated correction/frustration observations with evidence. Tool-failure observations must not rely on NULL `success` alone.
+6. Expose the model usage & interaction-style profile: selection shares, per-cell descriptive aggregates under Wilson precision gates, and session drill-downs—no “lowest redirect” ranking chrome.
 
-At the end of this phase, the product may say “what was observed” and show selection patterns, but not name winners.
+At the end of this phase, the product may say “what was observed” and show selection and steering patterns, but not name quality winners.
 
 ### Phase 5 — honest comparisons (rare path)
 
@@ -1316,7 +1326,7 @@ At the end of this phase, the product may say “what was observed” and show s
 3. Add comparison abstention and confounder flags.
 4. Add multiple-comparison correction and practical-effect thresholds.
 5. Add claim rendering from structured comparison status, not free-form LLM prose; matched-cohort association language only.
-6. Update Models & Cost and Insights so the resting UI is the usage & experience profile; comparison views appear only when §5.2 fully passes.
+6. Update Models & Cost and Insights so the resting UI is the usage & interaction-style profile; comparison views appear only when §5.2 fully passes and use non-directional redirect/brake language.
 
 ### Phase 6 — prospective rigor (optional, opt-in)
 
@@ -1340,13 +1350,13 @@ migrations
   -> Type A parser gates
   -> population triage (~1,800-window human pool)
   -> derivation provenance + correct window hashes
-  -> semantic gold/gates (redirect/brake lead; correction abstain)
-  -> task clusters and taxonomy (first-message labels)
-  -> outcome observations (redirect/brake lead metric)
-  -> descriptive usage & experience profile (Wilson gates)
+  -> semantic gold/gates (redirect/brake lead descriptive; correction/frustration abstain)
+  -> task clusters + orchestration lineage (first-message labels)
+  -> outcome observations (redirect/brake interaction-style lead; no clean_completion)
+  -> descriptive usage & interaction-style profile (Wilson gates; truncation-bound extraction)
   -> overlap/confounding engine
-  -> rare matched-cohort association claims
+  -> rare matched-cohort association claims (non-directional on redirect rate)
   -> optional coin-flip experiment (§6)
 ```
 
-The first useful Type B release is not a ranked leaderboard. It is a drillable model-usage and collaboration-experience profile that frequently abstains. Ranking is a rare matched-cohort exception after evidence fields, label quality, precision gates, metric availability, and §5.2 overlap rules all pass—and almost no current cell is expected to qualify. Causal language requires the §6 experiment for exactly one pre-registered contrast.
+The first useful Type B release is not a ranked leaderboard. It is a drillable model-usage and interaction-style profile that frequently abstains and never treats steering frequency as a defect score. Ranking is a rare matched-cohort exception after evidence fields, label quality, precision gates, metric availability, and §5.2 overlap rules all pass—and almost no current cell is expected to qualify. Causal language requires the §6 experiment for exactly one pre-registered contrast.
