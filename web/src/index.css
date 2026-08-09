@@ -1,0 +1,42 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --background: #0a0a0b;
+  --card: #111113;
+  --popover: #161618;
+  --border: #26262a;
+  --muted: #1c1c1f;
+  --foreground: #e7e7ea;
+  --muted-foreground: #8b8b93;
+  --faint-foreground: #55555c;
+  --primary: #d4d4d8;
+  --ring: #3f3f46;
+  --status-ok: rgba(74, 222, 128, 0.85);
+  --status-warn: rgba(251, 191, 36, 0.85);
+  --status-error: rgba(248, 113, 113, 0.85);
+  --status-info: rgba(96, 165, 250, 0.85);
+  --harness-codex: #7c9acb;
+  --harness-claude: #c4a484;
+  --harness-cursor: #8fbc9f;
+  --harness-warp: #b48fb4;
+  --harness-other: #6e6e76;
+}
+
+* {
+  border-color: var(--border);
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--background);
+  color: var(--foreground);
+  font-family: Inter, system-ui, sans-serif;
+}
+
+.tabular {
+  font-feature-settings: "tnum";
+  font-variant-numeric: tabular-nums;
+}

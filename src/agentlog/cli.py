@@ -717,5 +717,32 @@ def experiment_analyze_cmd(
     console.print_json(json.dumps(report.to_dict(), default=str))
 
 
+@app.command("serve")
+def serve_cmd(
+    ctx: typer.Context,
+    host: str = typer.Option("127.0.0.1", "--host"),
+    port: int = typer.Option(8722, "--port"),
+) -> None:
+    """Serve the read-only dashboard API (and built SPA if present)."""
+    import uvicorn
+
+    from agentlog.api.app import create_app
+
+    db_path = Path(ctx.obj["db"])
+    console.print(
+        Panel.fit(
+            f"agentlog serve  http://{host}:{port}\n"
+            f"db (read-only): {db_path}",
+            border_style="cyan",
+        )
+    )
+    uvicorn.run(
+        create_app(db_path),
+        host=host,
+        port=port,
+        log_level="info",
+    )
+
+
 if __name__ == "__main__":
     app()
