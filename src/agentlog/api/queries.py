@@ -1,34 +1,28 @@
 from __future__ import annotations
 
-import json
 import sqlite3
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from agentlog.analysis.performance.gates import (
     AggregateCell,
     evaluate_binary_rate,
-    evaluate_continuous_rate,
     unavailable_cell,
 )
-from agentlog.api.ranges import TimeRange
-
-
-def _session_time_clause(
-    tr: TimeRange,
-    *,
-    start_param: str = "start",
-    end_param: str = "end",
-    alias: str = "s",
-) -> tuple[str, dict[str, Any]]:
-    parts = [f"COALESCE({alias}.started_at, '') < :{end_param}"]
-    params: dict[str, Any] = {end_param: tr.end_iso}
-    if tr.start is not None:
-        parts.append(f"COALESCE({alias}.started_at, '') >= :{start_param}")
-        params[start_param] = tr.start_iso
-    return " AND ".join(parts), params
+from agentlog.api.model_rollup import (
+    collapse_by_model,
+    strict_message_model_sql,
+    unknown_breakdown,
+)
+from agentlog.api.ranges import TimeRange, session_time_clause as _session_time_clause
+from agentlog.api.semantic import redirect_cell
+from agentlog.normalize.model_identity import (
+    UNKNOWN_MODEL_LABEL,
+    display_model,
+    sql_coalesce_model,
+)
 
 
 def _project_label(repo: str | None, cwd: str | None) -> str:
@@ -150,29 +144,111 @@ def sessions_by_harness_daily(
 
 
 def model_mix(conn: sqlite3.Connection, tr: TimeRange) -> list[dict[str, Any]]:
-    """Descriptive model-selection shares — not a quality ranking."""
+    """Descriptive assistant-message model shares — not a quality ranking.
+
+    One row per model identity. The harness split rides along as a
+    breakdown so the rendered label stays the grouping key.
+    """
+    where, params = _session_time_clause(tr)
+    model_expr = strict_message_model_sql()
+    rows = conn.execute(
+        f"""
+        SELECT {model_expr} AS model,
+               s.harness AS harness,
+               COUNT(*) AS messages,
+               COUNT(DISTINCT s.id) AS sessions
+        FROM sessions s
+        JOIN messages m ON m.session_id = s.id
+        WHERE {where}
+          AND m.role = 'assistant'
+        GROUP BY {model_expr}, harness
+        ORDER BY messages DESC
+        """,
+        params,
+    ).fetchall()
+    raw_rows = [dict(r) for r in rows]
+    collapsed = collapse_by_model(raw_rows, count_key="messages")
+    session_rows = {
+        row["model"]: row
+        for row in collapse_by_model(raw_rows, count_key="sessions")
+    }
+    total = sum(int(r["messages"]) for r in collapsed) or 1
+    return [
+        {
+            "model": r["model"],
+            "messages": r["messages"],
+            "sessions": session_rows[r["model"]]["sessions"],
+            "share": r["messages"] / total,
+            "harnesses": session_rows[r["model"]]["harnesses"],
+        }
+        for r in collapsed
+    ]
+
+
+def unknown_model_detail(
+    conn: sqlite3.Connection, tr: TimeRange
+) -> dict[str, Any]:
+    """Assistant messages whose model could not be resolved, with the reason."""
     where, params = _session_time_clause(tr)
     rows = conn.execute(
         f"""
-        SELECT COALESCE(NULLIF(model, ''), '(unknown)') AS model,
-               harness,
+        SELECT m.model AS model_raw,
+               COUNT(*) AS messages,
+               COUNT(DISTINCT s.id) AS sessions
+        FROM sessions s
+        JOIN messages m ON m.session_id = s.id
+        WHERE {where}
+          AND m.role = 'assistant'
+          AND {strict_message_model_sql()} = :unknown_model
+        GROUP BY m.model
+        """,
+        {**params, "unknown_model": UNKNOWN_MODEL_LABEL},
+    ).fetchall()
+    raw_rows = [dict(r) for r in rows]
+    by_session = unknown_breakdown(raw_rows)
+    by_message = unknown_breakdown(raw_rows, count_key="messages")
+    message_reasons = {r["reason"]: r for r in by_message["reasons"]}
+    return {
+        **by_session,
+        "messages": by_message["messages"],
+        "reasons": [
+            {**row, "messages": message_reasons[row["reason"]]["messages"]}
+            for row in by_session["reasons"]
+        ],
+    }
+
+
+def agent_profile_mix(
+    conn: sqlite3.Connection, tr: TimeRange
+) -> list[dict[str, Any]]:
+    """Session counts by agent/profile identity (not a model ranking)."""
+    where, params = _session_time_clause(tr)
+    rows = conn.execute(
+        f"""
+        SELECT COALESCE(NULLIF(s.agent_profile, ''), '(none)') AS agent_profile,
+               s.harness AS harness,
                COUNT(*) AS sessions
         FROM sessions s
         WHERE {where}
-        GROUP BY model, harness
+          AND s.agent_profile IS NOT NULL
+          AND TRIM(s.agent_profile) != ''
+        GROUP BY agent_profile, harness
         ORDER BY sessions DESC
         """,
         params,
     ).fetchall()
-    total = sum(int(r["sessions"]) for r in rows) or 1
+    collapsed = collapse_by_model(
+        [dict(r) for r in rows], model_key="agent_profile"
+    )
+    total = sum(int(r["sessions"]) for r in collapsed) or 1
     return [
         {
-            "model": r["model"],
-            "harness": r["harness"],
-            "sessions": int(r["sessions"]),
-            "share": int(r["sessions"]) / total,
+            "agent_profile": r["agent_profile"],
+            "harnesses": r["harnesses"],
+            "sessions": r["sessions"],
+            "share": r["sessions"] / total,
         }
-        for r in rows
+        for r in collapsed
     ]
 
 
@@ -260,7 +336,10 @@ def recent_sessions(
         SELECT
             s.id,
             s.harness,
-            s.model,
+            s.model_canonical,
+            s.model AS model_raw,
+            s.provider,
+            s.agent_profile,
             s.effort,
             s.repo,
             s.cwd,
@@ -289,7 +368,10 @@ def recent_sessions(
             {
                 "id": r["id"],
                 "harness": r["harness"],
-                "model": r["model"] or "(unknown)",
+                "model": display_model(r["model_canonical"]),
+                "model_raw": r["model_raw"],
+                "provider": r["provider"],
+                "agent_profile": r["agent_profile"],
                 "effort": r["effort"],
                 "project": _project_label(r["repo"], r["cwd"]),
                 "started_at": r["started_at"],
@@ -325,7 +407,9 @@ def list_sessions(
             params[f"h{i}"] = h
     if model:
         placeholders = ",".join(f":m{i}" for i in range(len(model)))
-        clauses.append(f"COALESCE(s.model, '(unknown)') IN ({placeholders})")
+        clauses.append(
+            f"{sql_coalesce_model('s.model_canonical')} IN ({placeholders})"
+        )
         for i, m in enumerate(model):
             params[f"m{i}"] = m
     if q:
@@ -335,6 +419,7 @@ def list_sessions(
             OR COALESCE(s.repo, '') LIKE :q
             OR COALESCE(s.cwd, '') LIKE :q
             OR COALESCE(s.model, '') LIKE :q
+            OR COALESCE(s.model_canonical, '') LIKE :q
             OR EXISTS (
                 SELECT 1 FROM messages m
                 WHERE m.session_id = s.id AND m.role = 'user' AND m.text LIKE :q
@@ -352,7 +437,8 @@ def list_sessions(
     rows = conn.execute(
         f"""
         SELECT
-            s.id, s.harness, s.model, s.effort, s.repo, s.cwd,
+            s.id, s.harness, s.model_canonical, s.model AS model_raw,
+            s.provider, s.agent_profile, s.effort, s.repo, s.cwd,
             s.started_at, s.ended_at,
             (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) AS message_count,
             (SELECT COUNT(*) FROM tool_events t WHERE t.session_id = s.id) AS tool_count
@@ -372,7 +458,10 @@ def list_sessions(
             {
                 "id": r["id"],
                 "harness": r["harness"],
-                "model": r["model"] or "(unknown)",
+                "model": display_model(r["model_canonical"]),
+                "model_raw": r["model_raw"],
+                "provider": r["provider"],
+                "agent_profile": r["agent_profile"],
                 "effort": r["effort"],
                 "project": label,
                 "started_at": r["started_at"],
@@ -397,7 +486,8 @@ def session_detail(conn: sqlite3.Connection, session_id: str) -> dict[str, Any] 
         return None
     messages = conn.execute(
         """
-        SELECT id, seq, role, timestamp, model, effort, text, is_tool_plumbing
+        SELECT id, seq, role, timestamp, model, model_canonical, provider,
+               agent_profile, effort, text, is_tool_plumbing, authored_by_agent
         FROM messages WHERE session_id = ? ORDER BY seq
         """,
         (session_id,),
@@ -422,7 +512,10 @@ def session_detail(conn: sqlite3.Connection, session_id: str) -> dict[str, Any] 
         "session": {
             "id": s["id"],
             "harness": s["harness"],
-            "model": s["model"],
+            "model": display_model(s["model_canonical"]),
+            "model_raw": s["model"],
+            "provider": s["provider"],
+            "agent_profile": s["agent_profile"],
             "effort": s["effort"],
             "project": _project_label(s["repo"], s["cwd"]),
             "repo": s["repo"],
@@ -431,7 +524,20 @@ def session_detail(conn: sqlite3.Connection, session_id: str) -> dict[str, Any] 
             "ended_at": s["ended_at"],
             "branch": s["branch"],
         },
-        "messages": [dict(m) for m in messages],
+        "messages": [
+            {
+                **{
+                    k: v
+                    for k, v in dict(m).items()
+                    if k != "model_canonical"
+                },
+                "model": display_model(m["model_canonical"]),
+                "model_raw": m["model"],
+                "is_tool_plumbing": bool(m["is_tool_plumbing"]),
+                "authored_by_agent": bool(m["authored_by_agent"]),
+            }
+            for m in messages
+        ],
         "tool_events": [dict(t) for t in tools],
         "skills": [dict(sk) for sk in skills],
         "anatomy": {
@@ -462,12 +568,39 @@ def skills_summary(conn: sqlite3.Connection, tr: TimeRange) -> dict[str, Any]:
         """,
         params,
     ).fetchall()
+    # Weekly fire counts per skill for hand-rolled sparklines (8 buckets
+    # anchored to the range end, matching top_projects).
+    week_keys: list[str] = []
+    if tr.end:
+        from datetime import timedelta
+
+        for i in range(7, -1, -1):
+            week_keys.append((tr.end - timedelta(days=7 * i)).strftime("%G-W%V"))
+    fire_rows = conn.execute(
+        f"""
+        SELECT se.skill_name, s.started_at
+        FROM skill_exposures se
+        JOIN sessions s ON s.id = se.session_id
+        WHERE {where} AND s.started_at IS NOT NULL
+        """,
+        params,
+    ).fetchall()
+    by_skill_week: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    for r in fire_rows:
+        try:
+            dt = datetime.fromisoformat(r["started_at"].replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        by_skill_week[r["skill_name"]][dt.strftime("%G-W%V")] += 1
     items = [
         {
             "skill": r["skill_name"],
             "fires": int(r["fires"]),
             "sessions": int(r["sessions"]),
             "last_fired": r["last_fired"],
+            "sparkline": [
+                by_skill_week[r["skill_name"]].get(k, 0) for k in week_keys
+            ],
             # Effectiveness contrasts abstain until semantic labels + precision gates.
             "interaction_style_with": unavailable_cell(
                 metric="redirects_brakes_per_10_exchange_windows",
@@ -503,37 +636,291 @@ def skills_summary(conn: sqlite3.Connection, tr: TimeRange) -> dict[str, Any]:
     }
 
 
-def insights_feed(conn: sqlite3.Connection, tr: TimeRange) -> dict[str, Any]:
-    ux_n = count_ux_observations(conn, tr)
-    return {
-        "items": [],
-        "empty": {
-            "title": "No derived claims yet",
-            "body": (
-                "Insights hold precomputed findings with confidence tags. "
-                "They appear after semantic UX extraction populates ux_observations "
-                f"(currently {ux_n} in range) and a claim clears its precision gate "
-                "and confounder checks. Until then this feed stays empty rather than "
-                "showing speculative patterns."
-            ),
-            "missing": ["ux_observations", "publish-qualified task labels"],
-        },
+_INSIGHT_ACTIVE_CLAIM_STATUSES = frozenset({"candidate", "approved", "published"})
+_INSIGHT_FACT_KINDS = frozenset(
+    {
+        "recurring_instruction",
+        "harness_model_usage",
+        "correction_theme",
+        "session_fact",
     }
+)
+_INSIGHT_SUPPORT_OK = frozenset({"ok", "insufficient"})
+_INSIGHTS_GROUP_CAP = 20
+
+
+def _insights_parse_ts(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _insights_in_range(iso: str | None, tr: TimeRange) -> tuple[bool, bool]:
+    """Return (include, noted_unscoped). Prefer range filter when timestamps parse."""
+    if tr.start is None:
+        return True, False
+    dt = _insights_parse_ts(iso)
+    if dt is None:
+        return True, True
+    return tr.start <= dt <= tr.end, False
+
+
+def _insights_clip(text: str | None, limit: int = 280) -> str:
+    cleaned = " ".join(str(text or "").split())
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[: max(0, limit - 1)] + "…"
+
+
+def _claim_insight_card(
+    claim: Any, *, range_note: bool = False
+) -> dict[str, Any] | None:
+    if claim.status not in _INSIGHT_ACTIVE_CLAIM_STATUSES:
+        return None
+    if claim.kind not in _INSIGHT_FACT_KINDS:
+        return None
+    if claim.kind != "correction_theme" and claim.support_status not in _INSIGHT_SUPPORT_OK:
+        return None
+
+    value = dict(claim.value or {})
+    phrasing = value.get("phrasing") or ""
+    body = _insights_clip(phrasing) or _insights_clip(
+        f"{claim.kind}: {claim.subject} ({claim.predicate})"
+    )
+    if range_note:
+        body = (
+            f"{body} Observed across the full corpus (claim timestamp "
+            "outside the selected range filter)."
+            if body
+            else "Observed across the full corpus (outside selected range)."
+        )
+
+    if claim.kind == "session_fact":
+        card_kind = "fact"
+        title = str(value.get("title") or "Session fact")
+        dnp = claim.does_not_prove or "A single session does not establish a pattern."
+        suggested = None
+        theme = value.get("theme") or claim.subject
+    elif claim.kind == "harness_model_usage":
+        card_kind = "usage"
+        title = f"Model mix · {claim.subject}"
+        dnp = claim.does_not_prove or ""
+        suggested = None
+        theme = None
+    elif claim.kind == "correction_theme":
+        card_kind = "fact"
+        title = "Correction label rate"
+        dnp = claim.does_not_prove or (
+            "Correction labels are descriptive frequency, not a quality score "
+            "and not a config proposal."
+        )
+        suggested = None
+        theme = None
+    else:
+        card_kind = "fact"
+        title = f"Instruction theme · {claim.subject}"
+        dnp = claim.does_not_prove or ""
+        suggested = value.get("suggested_instruction") or None
+        theme = value.get("theme") or claim.subject
+
+    session_id = None
+    for ev in getattr(claim, "evidence", None) or []:
+        if getattr(ev, "session_id", None):
+            session_id = ev.session_id
+            break
+
+    href = f"/sessions/{quote(session_id, safe='')}" if session_id else None
+
+    return {
+        "id": f"claim:{claim.id}",
+        "kind": card_kind,
+        "title": title,
+        "body": body,
+        "confidence": claim.support_status,
+        "sample_size": int(claim.sample_size or 0),
+        "does_not_prove": dnp,
+        "theme": theme,
+        "source": "claim",
+        "source_id": claim.id,
+        "origin": "session" if claim.kind == "session_fact" else "corpus",
+        "suggested_instruction": suggested,
+        "href": href,
+    }
+
+
+def _is_llm_coach_proposal(proposal: Any) -> bool:
+    if proposal.status != "pending":
+        return False
+    if proposal.action == "archive_skill":
+        return False
+    if proposal.model or proposal.run_id:
+        return True
+    for claim in getattr(proposal, "claims", None) or []:
+        if getattr(claim, "kind", None) == "llm_instruction_proposal":
+            return True
+    summary = (proposal.derivation_summary or "").lower()
+    return "llm" in summary or "instruction_proposal" in summary
+
+
+def _proposal_insight_card(
+    proposal: Any, *, range_note: bool = False
+) -> dict[str, Any] | None:
+    if not _is_llm_coach_proposal(proposal):
+        return None
+    body = _insights_clip(proposal.rationale)
+    if range_note and body:
+        body = (
+            f"{body} (proposal timestamp outside selected range; "
+            "shown corpus-wide.)"
+        )
+    elif range_note:
+        body = "Coach suggestion (outside selected range; shown corpus-wide)."
+
+    suggested = None
+    theme = None
+    confidence = "insufficient"
+    for claim in getattr(proposal, "claims", None) or []:
+        value = dict(getattr(claim, "value", None) or {})
+        if not suggested and value.get("suggested_instruction"):
+            suggested = str(value["suggested_instruction"])
+        if theme is None and (
+            value.get("theme")
+            or getattr(claim, "kind", None)
+            in {"llm_instruction_proposal", "recurring_instruction"}
+        ):
+            theme = value.get("theme") or getattr(claim, "subject", None)
+        support = getattr(claim, "support_status", None)
+        if support == "ok":
+            confidence = "ok"
+        elif support == "insufficient" and confidence != "ok":
+            confidence = "insufficient"
+
+    return {
+        "id": f"proposal:{proposal.id}",
+        "kind": "coach",
+        "title": proposal.title or "Harness suggestion",
+        "body": body or "Pending coach suggestion — review on the proposals board.",
+        "confidence": confidence,
+        "sample_size": int(proposal.sample_size or 0),
+        "does_not_prove": proposal.does_not_prove
+        or (
+            "A pending LLM proposal is a review candidate, not proof that the "
+            "edit would improve outcomes."
+        ),
+        "theme": theme,
+        "source": "proposal",
+        "source_id": proposal.id,
+        "origin": "proposal",
+        "suggested_instruction": suggested,
+        "href": "/proposals",
+    }
+
+
+def insights_feed(conn: sqlite3.Connection, tr: TimeRange) -> dict[str, Any]:
+    """Fact + coach cards from live claims and pending LLM proposals.
+
+    Honest insights surface: no causal rankings, no unused-skill spam, no sentiment.
+    """
+    from agentlog.analysis.claims import list_claims, list_proposals
+
+    ux_n = count_ux_observations(conn, tr)
+
+    claims = list_claims(conn, status=None, include_evidence=True, limit=200)
+    proposals = list_proposals(conn, status="pending", include_claims=True, limit=100)
+
+    claim_cards: list[dict[str, Any]] = []
+    claim_cards_fallback: list[dict[str, Any]] = []
+    for claim in claims:
+        if claim.kind not in _INSIGHT_FACT_KINDS:
+            continue
+        if claim.kind == "correction_theme":
+            if claim.status not in _INSIGHT_ACTIVE_CLAIM_STATUSES:
+                continue
+        elif claim.support_status not in _INSIGHT_SUPPORT_OK:
+            continue
+        elif claim.status not in _INSIGHT_ACTIVE_CLAIM_STATUSES:
+            continue
+        in_range, _unscoped = _insights_in_range(claim.observed_at, tr)
+        if in_range:
+            card = _claim_insight_card(claim, range_note=False)
+            if card:
+                claim_cards.append(card)
+        else:
+            card = _claim_insight_card(claim, range_note=True)
+            if card:
+                claim_cards_fallback.append(card)
+
+    coach_cards: list[dict[str, Any]] = []
+    coach_fallback: list[dict[str, Any]] = []
+    for proposal in proposals:
+        in_range, _unscoped = _insights_in_range(proposal.created_at, tr)
+        if in_range:
+            card = _proposal_insight_card(proposal, range_note=False)
+            if card:
+                coach_cards.append(card)
+        else:
+            card = _proposal_insight_card(proposal, range_note=True)
+            if card:
+                coach_fallback.append(card)
+
+    # Prefer range-filtered cards; if that empties the feed, show corpus-wide
+    # rather than inventing a filtered-zero empty state.
+    if not coach_cards and not claim_cards:
+        coach_cards = coach_fallback
+        claim_cards = claim_cards_fallback
+
+    def _fact_sort_key(card: dict[str, Any]) -> tuple[int, int, str]:
+        conf = str(card.get("confidence") or "")
+        conf_rank = 0 if conf == "ok" else 1
+        return (conf_rank, -int(card.get("sample_size") or 0), str(card.get("id")))
+
+    claim_cards.sort(key=_fact_sort_key)
+    session_cards = [card for card in claim_cards if card["origin"] == "session"]
+    corpus_cards = [card for card in claim_cards if card["origin"] != "session"]
+    other_cards = [*coach_cards, *corpus_cards]
+    items = [
+        *session_cards[:_INSIGHTS_GROUP_CAP],
+        *other_cards[:_INSIGHTS_GROUP_CAP],
+    ]
+
+    empty = {
+        "title": "No derived claims yet",
+        "body": (
+            "Insights hold factual claim cards and pending coach suggestions. "
+            "They appear after claim extraction writes recurring-instruction / "
+            "usage / correction facts, or after an LLM proposal run leaves "
+            f"pending review items. UX observations in range: {ux_n}."
+        ),
+        "missing": ["active claims", "pending LLM proposals"],
+    }
+    return {"items": items, "empty": empty}
 
 
 def models_profile(conn: sqlite3.Connection, tr: TimeRange) -> dict[str, Any]:
     mix = model_mix(conn, tr)
+    profiles = agent_profile_mix(conn, tr)
     # Interaction-style cells per model — abstain without semantic data.
     ux_n = count_ux_observations(conn, tr)
     cells = []
     for row in mix[:20]:
-        if row["model"] in {"(unknown)", "<synthetic>"}:
+        if row["model"] == UNKNOWN_MODEL_LABEL:
             cell = unavailable_cell(
                 metric="redirects_brakes_per_10_exchange_windows",
                 kind="continuous",
                 message=(
                     "Model-conditioned aggregates abstain when the model is "
-                    "unknown or synthetic."
+                    "unknown."
                 ),
                 flags=["source_capability", "structural_nestedness"],
             )
@@ -554,17 +941,18 @@ def models_profile(conn: sqlite3.Connection, tr: TimeRange) -> dict[str, Any]:
         cells.append(
             {
                 "model": row["model"],
-                "harness": row["harness"],
+                "harnesses": row["harnesses"],
+                "messages": row["messages"],
                 "sessions": row["sessions"],
                 "share": row["share"],
                 "interaction_style": cell.to_dict(),
-                "flags": _model_confounder_flags(row, mix),
+                "flags": _model_confounder_flags(row),
             }
         )
     return {
         "title": "Model usage and interaction-style profile",
         "subtitle": (
-            "Shares describe your model-selection pattern. "
+            "Shares describe assistant-message model attribution. "
             "Interaction-style rates appear only when precision gates pass. "
             "This is not a quality ranking."
         ),
@@ -576,19 +964,27 @@ def models_profile(conn: sqlite3.Connection, tr: TimeRange) -> dict[str, Any]:
             ),
         },
         "items": cells,
+        "unknown": unknown_model_detail(conn, tr),
+        "unknown_note": (
+            "(unknown) is a declared category, not a fallback bucket: every "
+            "assistant message in it has a stated reason its model could not be "
+            "resolved."
+        ),
+        "profiles": profiles,
+        "profiles_note": (
+            "Agent/profile identities (e.g. codex-auto-review, grok-4.5-build) "
+            "are counted here — not in the model mix."
+        ),
     }
 
 
-def _model_confounder_flags(
-    row: dict[str, Any], mix: list[dict[str, Any]]
-) -> list[str]:
+def _model_confounder_flags(row: dict[str, Any]) -> list[str]:
     flags: list[str] = []
-    model = row["model"]
-    harnesses = {r["harness"] for r in mix if r["model"] == model}
+    harnesses = {h["harness"] for h in row.get("harnesses", [])}
     if len(harnesses) == 1:
         flags.append("harness_model_aliasing")
         flags.append("structural_nestedness")
-    if row["sessions"] < 30:
+    if row["messages"] < 30:
         flags.append("small_sample")
     return flags
 
@@ -596,121 +992,15 @@ def _model_confounder_flags(
 def _model_redirect_cell(
     conn: sqlite3.Connection, tr: TimeRange, model: str
 ) -> AggregateCell:
-    """Build a redirect/brake cell when ux_observations exist (gate-enforced)."""
-    where, params = _session_time_clause(tr)
-    params = {**params, "model": model}
-    rows = conn.execute(
-        f"""
-        SELECT
-            COALESCE(s.parent_session_id, s.id) AS root_id,
-            s.id AS session_id,
-            u.flags_json
-        FROM ux_observations u
-        JOIN exchange_windows w ON w.id = u.window_id
-        JOIN sessions s ON s.id = w.session_id
-        WHERE {where}
-          AND s.model = :model
-          AND s.parent_session_id IS NULL
-        """,
-        params,
-    ).fetchall()
-    if not rows:
-        return unavailable_cell(
-            metric="redirects_brakes_per_10_exchange_windows",
-            kind="continuous",
-            message="No UX observations for this model in range.",
-            flags=["source_capability"],
-        )
-    by_root: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for r in rows:
-        by_root[r["root_id"]].append(dict(r))
-    rates: list[float] = []
-    session_ids: list[str] = []
-    for root_id, windows in by_root.items():
-        n = len(windows)
-        hits = 0
-        for w in windows:
-            try:
-                flags = json.loads(w["flags_json"] or "{}")
-            except json.JSONDecodeError:
-                flags = {}
-            if flags.get("redirect_brake") or flags.get("had_redirect_brake"):
-                hits += 1
-        rates.append((hits / n) * 10.0 if n else 0.0)
-        session_ids.append(root_id)
-    return evaluate_continuous_rate(
-        metric="redirects_brakes_per_10_exchange_windows",
-        per_cluster_values=rates,
-        session_ids=session_ids,
-        availability=1.0,
+    """Model-conditioned redirect/brake cell. Descendant windows roll up to roots."""
+    return redirect_cell(
+        conn, tr, model=model, extra_flags=["structural_nestedness"]
     )
 
 
 def semantic_lead_metric(conn: sqlite3.Connection, tr: TimeRange) -> AggregateCell:
-    """Overview lead interaction-style metric — abstains without UX data."""
-    ux_n = count_ux_observations(conn, tr)
-    if ux_n == 0:
-        where, params = _session_time_clause(tr)
-        ids = [
-            r["id"]
-            for r in conn.execute(
-                f"""
-                SELECT s.id FROM sessions s
-                WHERE {where} AND s.parent_session_id IS NULL
-                ORDER BY COALESCE(s.started_at, '') DESC
-                LIMIT 40
-                """,
-                params,
-            ).fetchall()
-        ]
-        return unavailable_cell(
-            metric="redirects_brakes_per_10_exchange_windows",
-            kind="continuous",
-            message=(
-                "Redirect/brake rate (descriptive steering frequency, not a quality "
-                "score) requires ux_observations. That table is empty until the "
-                "hand-labeling audit unlocks full extraction. No rate, sparkline, "
-                "or delta is shown."
-            ),
-            flags=["source_capability"],
-            session_ids=ids,
-        )
-    where, params = _session_time_clause(tr)
-    rows = conn.execute(
-        f"""
-        SELECT
-            COALESCE(s.parent_session_id, s.id) AS root_id,
-            u.flags_json
-        FROM ux_observations u
-        JOIN exchange_windows w ON w.id = u.window_id
-        JOIN sessions s ON s.id = w.session_id
-        WHERE {where}
-        """,
-        params,
-    ).fetchall()
-    by_root: dict[str, list[Any]] = defaultdict(list)
-    for r in rows:
-        by_root[r["root_id"]].append(r["flags_json"])
-    rates: list[float] = []
-    session_ids: list[str] = []
-    for root_id, flag_blobs in by_root.items():
-        n = len(flag_blobs)
-        hits = 0
-        for blob in flag_blobs:
-            try:
-                flags = json.loads(blob or "{}")
-            except json.JSONDecodeError:
-                flags = {}
-            if flags.get("redirect_brake") or flags.get("had_redirect_brake"):
-                hits += 1
-        rates.append((hits / n) * 10.0 if n else 0.0)
-        session_ids.append(root_id)
-    return evaluate_continuous_rate(
-        metric="redirects_brakes_per_10_exchange_windows",
-        per_cluster_values=rates,
-        session_ids=session_ids,
-        availability=1.0,
-    )
+    """Overview lead interaction-style metric — abstains without published evidence."""
+    return redirect_cell(conn, tr)
 
 
 def binary_cell_for_tests(

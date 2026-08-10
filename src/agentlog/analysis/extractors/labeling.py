@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, TextIO
 
+from agentlog.safety.write_guard import assert_writable
+
 # Gate-relevant keys — abstain is as easy as any positive label.
 KEY_MAP = {
     "r": "redirect_or_brake",
@@ -171,6 +173,7 @@ def load_gold_rows(path: Path) -> dict[str, dict[str, Any]]:
 
 def write_gold_rows(path: Path, rows_by_id: dict[str, dict[str, Any]]) -> None:
     """Rewrite gold file sorted by original insertion / window_id order of keys."""
+    path = assert_writable(path, purpose="gold labels")
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     with tmp.open("w", encoding="utf-8") as f:

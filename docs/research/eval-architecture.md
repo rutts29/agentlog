@@ -453,7 +453,7 @@ Per-model support in the current corpus is extremely uneven. Concrete support fo
 
 Those counts are planning inputs for abstention, not licenses to rank. Configurations outside the rows above default to “insufficient precision / abstain.”
 
-Normalize effort to `low|medium|high|xhigh|unknown` while retaining the source value. Treat `unknown` as a real missingness category, not the default effort.
+Normalize effort to `low|medium|high|xhigh|ultra|max|unknown` while retaining the source value (`effort_source`). Treat `unknown` as a real missingness category, not the default effort. `ultra` (Codex) and `max` (Claude) are first-class canonical values — they are not collapsed into `xhigh`.
 
 Model may change within a session. Assign a dominant model only when it produced at least 80% of assistant exchanges. Otherwise mark the cluster `mixed_model` and exclude it from single-model matched-cohort comparisons. Retain per-exchange assignments for drill-down.
 

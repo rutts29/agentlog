@@ -24,6 +24,7 @@ from agentlog.analysis.extractors.taxonomy import (
     UserStance,
 )
 from agentlog.analysis.extractors.window_context import truncate_for_ux
+from agentlog.safety.redaction import REDACTION_VERSION
 
 SYSTEM_PROMPT = load_ux_prompt()
 PROMPT_HASH = ux_prompt_hash(SYSTEM_PROMPT)
@@ -42,6 +43,14 @@ _FRUSTRATION_CUES = re.compile(
 
 def prompt_hash() -> str:
     return PROMPT_HASH
+
+
+def build_user_message(payloads: list[dict[str, Any]]) -> str:
+    """The single place the labeler's user message is assembled."""
+    return "Label each window independently. Data follows.\n" + "\n".join(
+        f"<window id=\"{p['window_id']}\">\n{json.dumps(p, ensure_ascii=False)}\n</window>"
+        for p in payloads
+    )
 
 
 def _parse_batch_response(data: dict[str, Any], expected_ids: list[str]) -> list[dict]:
@@ -195,6 +204,9 @@ def enforce_reliability_tiers(
             model=DEFAULT_UX_MODEL,
             prompt_hash=PROMPT_HASH,
             provider=ApiExtractionProvider.name,
+            redaction_version=str(
+                payload.get("redaction_version") or REDACTION_VERSION
+            ),
         ),
         turn_kind=turn_kind,
         user_stance=str(user_stance) if user_stance is not None else None,
@@ -251,13 +263,7 @@ class UxExtractor:
         payloads = [truncate_for_ux(c) for c in contexts]
         for p in payloads:
             assert len(p["user"]) <= 4000 + 1
-        user_msg = (
-            "Label each window independently. Data follows.\n"
-            + "\n".join(
-                f"<window id=\"{p['window_id']}\">\n{json.dumps(p, ensure_ascii=False)}\n</window>"
-                for p in payloads
-            )
-        )
+        user_msg = build_user_message(payloads)
         raw = self.provider.complete_json(
             system=SYSTEM_PROMPT, user=user_msg, model=self.model
         )

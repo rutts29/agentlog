@@ -3,6 +3,8 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+BUSY_TIMEOUT_MS = 30_000
+
 SCHEMA_SQL = """
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
@@ -31,7 +33,11 @@ CREATE TABLE IF NOT EXISTS sessions (
     branch TEXT,
     commit_sha TEXT,
     model TEXT,
+    model_canonical TEXT,
+    provider TEXT,
+    agent_profile TEXT,
     effort TEXT,
+    effort_source TEXT,
     UNIQUE (harness, external_id)
 );
 
@@ -42,10 +48,15 @@ CREATE TABLE IF NOT EXISTS messages (
     role TEXT NOT NULL,
     timestamp TEXT,
     model TEXT,
+    model_canonical TEXT,
+    provider TEXT,
+    agent_profile TEXT,
     effort TEXT,
+    effort_source TEXT,
     text TEXT NOT NULL DEFAULT '',
     content_hash TEXT NOT NULL DEFAULT '',
     is_tool_plumbing INTEGER NOT NULL DEFAULT 0,
+    authored_by_agent INTEGER NOT NULL DEFAULT 0,
     UNIQUE (session_id, seq)
 );
 
@@ -112,9 +123,10 @@ END;
 
 
 def connect(db_path: Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(str(db_path))
+    conn = sqlite3.connect(str(db_path), timeout=BUSY_TIMEOUT_MS / 1000)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
     return conn
 
 
@@ -125,17 +137,37 @@ def _column_names(conn: sqlite3.Connection, table: str) -> set[str]:
 
 def migrate_db(conn: sqlite3.Connection) -> None:
     """Apply additive schema upgrades safe against existing databases."""
-    if "messages" in {
+    tables = {
         str(r[0])
         for r in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'"
         )
-    }:
+    }
+    if "messages" in tables:
         cols = _column_names(conn, "messages")
         if "is_tool_plumbing" not in cols:
             conn.execute(
                 "ALTER TABLE messages ADD COLUMN is_tool_plumbing "
                 "INTEGER NOT NULL DEFAULT 0"
+            )
+        if "authored_by_agent" not in cols:
+            conn.execute(
+                "ALTER TABLE messages ADD COLUMN authored_by_agent "
+                "INTEGER NOT NULL DEFAULT 0"
+            )
+        for col in ("model_canonical", "provider", "agent_profile"):
+            if col not in cols:
+                conn.execute(f"ALTER TABLE messages ADD COLUMN {col} TEXT")
+    if "sessions" in tables:
+        cols = _column_names(conn, "sessions")
+        for col in ("model_canonical", "provider", "agent_profile"):
+            if col not in cols:
+                conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} TEXT")
+    if "token_usage" in tables:
+        cols = _column_names(conn, "token_usage")
+        if "model_canonical" not in cols:
+            conn.execute(
+                "ALTER TABLE token_usage ADD COLUMN model_canonical TEXT"
             )
 
 
@@ -145,4 +177,9 @@ def init_db(conn: sqlite3.Connection) -> None:
     from agentlog.db.migrations import apply_migrations
 
     apply_migrations(conn)
+    # Migrations may toggle foreign_keys OFF while rebuilding tables; restore.
+    conn.execute("PRAGMA foreign_keys = ON")
     conn.commit()
+    enabled = conn.execute("PRAGMA foreign_keys").fetchone()
+    if enabled is None or int(enabled[0]) != 1:
+        raise RuntimeError("PRAGMA foreign_keys is not enabled after init_db")

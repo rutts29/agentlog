@@ -40,6 +40,7 @@ class AggregateCell:
     bound_version: str = BOUND_VERSION
     metric: str | None = None
     kind: str | None = None
+    coverage: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -61,6 +62,7 @@ class AggregateCell:
             "flags": list(self.flags),
             "session_ids": list(self.session_ids),
             "bound_version": self.bound_version,
+            "coverage": dict(self.coverage) if self.coverage is not None else None,
         }
 
 

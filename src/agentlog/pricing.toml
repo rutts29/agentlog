@@ -1,0 +1,22 @@
+# Agentlog token pricing table (owner-filled).
+# Cost estimation stays unavailable for any model without rates below.
+#
+# version / as_of document the table; bump version when rates change.
+version = "0"
+as_of = "2026-08-09"
+
+# [[models]]
+# id = "gpt-5.5"                      # must match sessions.model_canonical
+# input_per_mtok = 0.0                # USD per 1,000,000 input tokens
+# output_per_mtok = 0.0               # USD per 1,000,000 output tokens
+# cache_read_per_mtok = 0.0           # optional; omit if N/A
+# cache_write_per_mtok = 0.0          # optional; omit if N/A
+# cached_input_per_mtok = 0.0         # optional Codex-style cached input
+#
+# Example (do not uncomment with guessed numbers):
+# [[models]]
+# id = "claude-opus-4-6"
+# input_per_mtok = 0.0
+# output_per_mtok = 0.0
+# cache_read_per_mtok = 0.0
+# cache_write_per_mtok = 0.0

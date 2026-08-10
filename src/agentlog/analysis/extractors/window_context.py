@@ -17,6 +17,7 @@ from agentlog.analysis.extractors.taxonomy import (
     TOOL_TIMELINE_MAX_LINES,
     USER_TEXT_CAP,
 )
+from agentlog.safety.redaction import REDACTION_VERSION, RedactionReport, redact_text
 
 
 def _trunc(text: str, cap: int) -> str:
@@ -75,6 +76,90 @@ def load_window_contexts(
     return out
 
 
+_MAX_SEQ = 9223372036854775807
+
+
+def _session_has_linked_tools(conn: sqlite3.Connection, session_id: str) -> bool:
+    row = conn.execute(
+        """
+        SELECT 1 FROM tool_events
+        WHERE session_id = ? AND message_id IS NOT NULL
+        LIMIT 1
+        """,
+        (session_id,),
+    ).fetchone()
+    return row is not None
+
+
+def _window_tools(
+    conn: sqlite3.Connection, session_id: str, *, req_seq: int, end_seq: int
+) -> list[sqlite3.Row]:
+    """Tools belonging to a window, resolved through message linkage.
+
+    Tool sequence numbers live in their own coordinate space and must never be
+    compared against message sequence numbers. Linked tools are selected by the
+    message they belong to; orphans are bounded by the tool sequences of their
+    linked neighbours. Sessions with no linkage at all fall back to the raw
+    sequence heuristic, which is the only ordering signal those sources carry.
+    """
+    if not _session_has_linked_tools(conn, session_id):
+        return list(
+            conn.execute(
+                """
+                SELECT tool_name, action, success, seq
+                FROM tool_events
+                WHERE session_id = ? AND seq > ? AND seq < ?
+                ORDER BY seq
+                """,
+                (session_id, req_seq, end_seq),
+            )
+        )
+
+    linked = list(
+        conn.execute(
+            """
+            SELECT te.tool_name, te.action, te.success, te.seq
+            FROM tool_events te
+            JOIN messages m ON m.id = te.message_id
+            WHERE te.session_id = ? AND m.session_id = ?
+              AND m.seq >= ? AND m.seq < ?
+            ORDER BY te.seq
+            """,
+            (session_id, session_id, req_seq, end_seq),
+        )
+    )
+    # Orphan span in tool-sequence space: from this window's first linked tool
+    # up to the next window's first linked tool.
+    bounds = conn.execute(
+        """
+        SELECT
+            COALESCE(MIN(CASE WHEN m.seq >= ? THEN te.seq END), ?) AS lo,
+            COALESCE(MIN(CASE WHEN m.seq >= ? THEN te.seq END), ?) AS hi
+        FROM tool_events te
+        JOIN messages m ON m.id = te.message_id
+        WHERE te.session_id = ? AND m.session_id = ?
+        """,
+        (req_seq, _MAX_SEQ, end_seq, _MAX_SEQ, session_id, session_id),
+    ).fetchone()
+    lo = int(bounds["lo"]) if bounds is not None else _MAX_SEQ
+    hi = int(bounds["hi"]) if bounds is not None else _MAX_SEQ
+    orphans = list(
+        conn.execute(
+            """
+            SELECT tool_name, action, success, seq
+            FROM tool_events
+            WHERE session_id = ? AND message_id IS NULL
+              AND seq >= ? AND seq < ?
+            ORDER BY seq
+            """,
+            (session_id, lo, hi),
+        )
+    )
+    if not orphans:
+        return linked
+    return sorted(linked + orphans, key=lambda r: int(r["seq"]))
+
+
 def _build_one(conn: sqlite3.Connection, win: sqlite3.Row) -> WindowContext:
     session_id = win["session_id"]
     req = conn.execute(
@@ -102,6 +187,7 @@ def _build_one(conn: sqlite3.Connection, win: sqlite3.Row) -> WindowContext:
           AND seq > ?
           AND role = 'user'
           AND COALESCE(is_tool_plumbing, 0) = 0
+          AND COALESCE(authored_by_agent, 0) = 0
         ORDER BY seq
         LIMIT 1
         """,
@@ -123,19 +209,7 @@ def _build_one(conn: sqlite3.Connection, win: sqlite3.Row) -> WindowContext:
             (session_id, req_seq, end_seq),
         )
     )
-    tools = list(
-        conn.execute(
-            """
-            SELECT tool_name, action, success, seq
-            FROM tool_events
-            WHERE session_id = ?
-              AND seq > ?
-              AND seq < ?
-            ORDER BY seq
-            """,
-            (session_id, req_seq, end_seq),
-        )
-    )
+    tools = _window_tools(conn, session_id, req_seq=req_seq, end_seq=end_seq)
     skills = list(
         conn.execute(
             """
@@ -179,6 +253,7 @@ def _build_one(conn: sqlite3.Connection, win: sqlite3.Row) -> WindowContext:
         skill_names=[s["skill_name"] for s in skills],
         skill_exposure_types=[s["exposure_type"] for s in skills],
         is_tool_plumbing=bool(_row_get(req, "is_tool_plumbing", 0)),
+        authored_by_agent=bool(_row_get(req, "authored_by_agent", 0)),
         assistant_msg_count=len(assistants),
         tool_count=len(tools),
         request_message_id=win["request_message_id"],
@@ -186,21 +261,36 @@ def _build_one(conn: sqlite3.Connection, win: sqlite3.Row) -> WindowContext:
     )
 
 
-def truncate_for_ux(ctx: WindowContext) -> dict[str, Any]:
-    """Bounded payload for the UX LLM. Never includes full skill bodies."""
-    user = unwrap_cursor_user_text(ctx.request_text)
+def truncate_for_ux(
+    ctx: WindowContext,
+    *,
+    report: RedactionReport | None = None,
+) -> dict[str, Any]:
+    """Bounded, redacted payload for the UX labeler.
+
+    Redaction runs before truncation so a secret cannot survive by straddling a
+    field cap, and before payload assembly so no caller can construct an
+    unredacted payload by accident.
+    """
+    rep = report if report is not None else RedactionReport()
+    user = redact_text(unwrap_cursor_user_text(ctx.request_text), rep)
+    assistant = redact_text(ctx.assistant_text, rep)
+    next_user = redact_text(unwrap_cursor_user_text(ctx.next_user_text), rep)
     return {
         "window_id": ctx.window_id,
         "harness": ctx.harness,
         "model": ctx.model,
         "user": _trunc(user, USER_TEXT_CAP),
-        "assistant": _trunc(ctx.assistant_text, ASSISTANT_TEXT_CAP),
-        "next_user": _trunc(
-            unwrap_cursor_user_text(ctx.next_user_text), NEXT_USER_TEXT_CAP
-        ),
-        "tool_timeline": ctx.tool_timeline[:TOOL_TIMELINE_MAX_LINES],
-        "skills_loaded": sorted(set(ctx.skill_names))[:40],
+        "assistant": _trunc(assistant, ASSISTANT_TEXT_CAP),
+        "next_user": _trunc(next_user, NEXT_USER_TEXT_CAP),
+        "tool_timeline": [
+            redact_text(t, rep) for t in ctx.tool_timeline[:TOOL_TIMELINE_MAX_LINES]
+        ],
+        "skills_loaded": [
+            redact_text(s, rep) for s in sorted(set(ctx.skill_names))[:40]
+        ],
         "skill_exposure_types": sorted(set(ctx.skill_exposure_types))[:20],
+        "redaction_version": REDACTION_VERSION,
     }
 
 
@@ -222,5 +312,6 @@ def structural_features(ctx: WindowContext) -> dict[str, Any]:
         "skill_names": sorted(set(ctx.skill_names))[:40],
         "request_chars": len((ctx.request_text or "").strip()),
         "is_tool_plumbing": ctx.is_tool_plumbing,
+        "authored_by_agent": ctx.authored_by_agent,
         "image_only_prefix": (ctx.request_text or "").lstrip().startswith("[Image:"),
     }

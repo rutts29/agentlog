@@ -28,6 +28,7 @@ class ExtractorMeta(BaseModel):
     prompt_hash: str | None = None
     packet_id: str | None = None
     provider: str | None = None
+    redaction_version: str | None = None
 
 
 class UxObservation(BaseModel):
@@ -70,6 +71,7 @@ class WindowContext(BaseModel):
     skill_names: list[str] = Field(default_factory=list)
     skill_exposure_types: list[str] = Field(default_factory=list)
     is_tool_plumbing: bool = False
+    authored_by_agent: bool = False
     assistant_msg_count: int = 0
     tool_count: int = 0
     request_message_id: str = ""

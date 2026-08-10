@@ -10,10 +10,18 @@ from agentlog.analysis.windows import build_exchange_windows
 from agentlog.config import PARSER_VERSION
 from agentlog.db.repository import Repository
 from agentlog.ingest.base import TranscriptAdapter, hash_prefix
-from agentlog.ingest.checkpoint import IngestAction, decide, read_slice
+from agentlog.ingest.checkpoint import (
+    CheckpointDecision,
+    IngestAction,
+    decide,
+    read_slice,
+)
 from agentlog.ingest.claude import ClaudeAdapter
 from agentlog.ingest.codex import CodexAdapter
 from agentlog.ingest.cursor import CursorAdapter
+from agentlog.ingest.hermes import HermesAdapter
+from agentlog.ingest.t3code import T3CodeAdapter
+from agentlog.ingest.warp import WarpAdapter
 
 log = logging.getLogger("agentlog.ingest")
 
@@ -26,10 +34,28 @@ class IngestStats:
     failed: int = 0
     warnings: list[str] = field(default_factory=list)
     sessions_upserted: int = 0
+    sessions_added: int = 0
+    sessions_updated: int = 0
+    messages_added: int = 0
 
 
 def adapters() -> list[TranscriptAdapter]:
-    return [CodexAdapter(), ClaudeAdapter(), CursorAdapter()]
+    return [
+        CodexAdapter(),
+        ClaudeAdapter(),
+        CursorAdapter(),
+        WarpAdapter(),
+        HermesAdapter(),
+        T3CodeAdapter(),
+    ]
+
+
+def adapter_for(harness: str) -> TranscriptAdapter | None:
+    key = harness.lower()
+    for adapter in adapters():
+        if adapter.harness.value == key:
+            return adapter
+    return None
 
 
 def ingest_all(repo: Repository, console: Console | None = None) -> IngestStats:
@@ -69,6 +95,34 @@ def ingest_all(repo: Repository, console: Console | None = None) -> IngestStats:
     return stats
 
 
+def ingest_harness(repo: Repository, harness: str) -> IngestStats:
+    """Run incremental ingest for a single harness."""
+    stats = IngestStats()
+    adapter = adapter_for(harness)
+    if adapter is None:
+        stats.warnings.append(f"unknown harness: {harness}")
+        return stats
+    for path in adapter.discover():
+        try:
+            _ingest_one(repo, adapter, path, stats)
+            repo.conn.commit()
+        except Exception as exc:  # noqa: BLE001 - keep ingest going
+            repo.conn.rollback()
+            stats.failed += 1
+            msg = f"{path}: {exc}"
+            stats.warnings.append(msg)
+            log.exception("ingest failed for %s", path)
+    return stats
+
+
+def _session_message_count(repo: Repository, session_id: str) -> int:
+    row = repo.conn.execute(
+        "SELECT COUNT(*) AS c FROM messages WHERE session_id = ?",
+        (session_id,),
+    ).fetchone()
+    return int(row["c"]) if row else 0
+
+
 def _ingest_one(
     repo: Repository,
     adapter: TranscriptAdapter,
@@ -80,10 +134,26 @@ def _ingest_one(
         stats.skipped += 1
         return
 
-    data = read_slice(path, decision.start_offset)
-    # If file ends mid-line on a prior parse, start_offset should be at a newline boundary.
-    result = adapter.parse_chunk(path, data, start_offset=decision.start_offset)
-    stats.warnings.extend(result.warnings)
+    if (
+        decision.action == IngestAction.APPEND
+        and not adapter.supports_byte_append
+    ):
+        decision = CheckpointDecision(
+            action=IngestAction.REPARSE,
+            artifact=decision.artifact,
+            size=decision.size,
+            mtime_ns=decision.mtime_ns,
+            start_offset=0,
+        )
+
+    data = (
+        read_slice(path, decision.start_offset)
+        if adapter.supports_byte_append
+        else b""
+    )
+    results = adapter.parse_path(path, data, start_offset=decision.start_offset)
+    for result in results:
+        stats.warnings.extend(result.warnings)
 
     append = decision.action == IngestAction.APPEND
     artifact_id = (
@@ -92,20 +162,38 @@ def _ingest_one(
         else None
     )
 
+    prior_sessions: dict[str, int] = {}
+    for result in results:
+        if result.session.external_id == "empty" and not result.messages:
+            continue
+        session_key = f"{adapter.harness.value}:{result.session.external_id}"
+        existed = (
+            repo.conn.execute(
+                "SELECT 1 FROM sessions WHERE id = ?", (session_key,)
+            ).fetchone()
+            is not None
+        )
+        prior_sessions[session_key] = _session_message_count(repo, session_key)
+        if not existed:
+            prior_sessions[session_key] = -1  # sentinel: did not exist
+
     if not append and artifact_id is not None:
         repo.delete_sessions_for_artifact(artifact_id)
 
-    parsed_offset = result.bytes_consumed
-    # Align to absolute file offset
-    if append:
-        parsed_offset = decision.start_offset + len(data)
-        # Prefer parser-reported absolute offset when provided
-        if result.bytes_consumed >= decision.start_offset:
-            parsed_offset = result.bytes_consumed
-    else:
-        parsed_offset = result.bytes_consumed if result.bytes_consumed else len(data)
+    parsed_offset = decision.size
+    if results:
+        reported = max(r.bytes_consumed for r in results)
+        if append:
+            parsed_offset = decision.start_offset + len(data)
+            if reported >= decision.start_offset:
+                parsed_offset = reported
+        elif adapter.supports_byte_append:
+            # Byte-framed adapters report the last safely framed offset; an
+            # unparsed trailing line must stay unconsumed.
+            parsed_offset = reported
+        else:
+            parsed_offset = reported if reported else decision.size
 
-    # content_hash covers the parsed prefix for future append checks
     content_hash = hash_prefix(path, parsed_offset)
 
     artifact_id = repo.upsert_artifact(
@@ -118,23 +206,44 @@ def _ingest_one(
         parser_version=PARSER_VERSION,
     )
 
-    session_key = f"{adapter.harness.value}:{result.session.external_id}"
-    base_seq = repo.max_message_seq(session_key) if append else 0
-    base_tool = repo.max_tool_seq(session_key) if append else 0
+    if not results:
+        if append:
+            stats.appended += 1
+        else:
+            stats.parsed += 1
+        return
 
-    session_id = repo.save_parse_result(
-        artifact_id=artifact_id,
-        result=result,
-        append=append,
-        base_seq=base_seq,
-        base_tool_seq=base_tool,
-    )
+    for result in results:
+        if result.session.external_id == "empty" and not result.messages:
+            continue
+        session_key = f"{adapter.harness.value}:{result.session.external_id}"
+        base_seq = repo.max_message_seq(session_key) if append else 0
+        base_tool = repo.max_tool_seq(session_key) if append else 0
+        base_token = repo.max_token_seq(session_key) if append else 0
+        prior = prior_sessions.get(session_key, -1)
+        existed = prior >= 0
+        msg_before = max(prior, 0)
 
-    messages = repo.list_messages(session_id)
-    windows = build_exchange_windows(messages)
-    repo.replace_exchange_windows(session_id, windows)
+        session_id = repo.save_parse_result(
+            artifact_id=artifact_id,
+            result=result,
+            append=append,
+            base_seq=base_seq,
+            base_tool_seq=base_tool,
+            base_token_seq=base_token,
+        )
 
-    stats.sessions_upserted += 1
+        messages = repo.list_messages(session_id)
+        windows = build_exchange_windows(messages)
+        repo.replace_exchange_windows(session_id, windows)
+        stats.sessions_upserted += 1
+        if existed:
+            stats.sessions_updated += 1
+        else:
+            stats.sessions_added += 1
+        msg_after = _session_message_count(repo, session_id)
+        stats.messages_added += max(0, msg_after - msg_before)
+
     if append:
         stats.appended += 1
     else:

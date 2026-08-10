@@ -41,6 +41,21 @@ class ContentIsToolPlumbingTests(unittest.TestCase):
         self.assertFalse(content_is_tool_plumbing([]))
         self.assertFalse(content_is_tool_plumbing(None))
 
+    def test_server_tool_use_is_plumbing(self) -> None:
+        content = [
+            {
+                "type": "server_tool_use",
+                "id": "srv_1",
+                "name": "web_search",
+                "input": {},
+            },
+        ]
+        self.assertTrue(content_is_tool_plumbing(content))
+
+    def test_empty_thinking_only_is_plumbing(self) -> None:
+        content = [{"type": "thinking", "thinking": "", "signature": "x"}]
+        self.assertTrue(content_is_tool_plumbing(content))
+
 
 class ClaudeToolPlumbingAdapterTests(unittest.TestCase):
     def test_tool_result_user_row_flagged_and_tool_event_once(self) -> None:
@@ -258,7 +273,7 @@ class ExchangeWindowPlumbingTests(unittest.TestCase):
             messages = repo.list_messages(sid)
             windows = build_exchange_windows(messages)
             self.assertEqual(len(windows), 1)
-            req_id, resp_id, _ = windows[0]
+            req_id, resp_id = windows[0][0], windows[0][1]
             by_id = {m["id"]: m for m in messages}
             self.assertEqual(by_id[req_id]["text"], "real ask")
             self.assertEqual(by_id[resp_id]["text"], "done")

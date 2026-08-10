@@ -17,7 +17,10 @@ from agentlog.analysis.extractors.audit import (
 from agentlog.analysis.extractors.deterministic import run_deterministic
 from agentlog.analysis.extractors.llm_client import ChatClient
 from agentlog.analysis.extractors.storage import (
+    PURPOSE_AUDIT,
+    PURPOSE_FULL_CORPUS,
     finish_ux_run,
+    publish_ux_run,
     start_ux_run,
     write_ux_observations,
 )
@@ -107,6 +110,7 @@ def run_audit_phase(
         batch_size=1,
         window_count=len(ordered),
         gated=True,
+        purpose=PURPOSE_AUDIT,
     )
     observations = extractor.extract_many(ordered, batch_size=1)
     write_ux_observations(conn, run_id, observations)
@@ -134,6 +138,7 @@ def run_audit_phase(
         run_id,
         status="completed_audit" if gate.passed else "audit_gate_failed",
         meta=meta,
+        gate_passed=gate.passed,
     )
     return gate, run_id, meta
 
@@ -151,6 +156,7 @@ def run_full_ux_extract(
     batch_size: int = DEFAULT_BATCH_SIZE,
     owner_authorized: bool = False,
     gate: AuditGateResult | None = None,
+    publish: bool = True,
 ) -> str:
     if gate is None or not authorize_full_ux_run(gate, owner_authorized=owner_authorized):
         raise RuntimeError(
@@ -167,6 +173,7 @@ def run_full_ux_extract(
         batch_size=batch_size,
         window_count=len(ux_contexts),
         gated=False,
+        purpose=PURPOSE_FULL_CORPUS,
     )
     try:
         obs = extractor.extract_many(ux_contexts, batch_size=batch_size)
@@ -176,10 +183,20 @@ def run_full_ux_extract(
             run_id,
             status="completed",
             meta={"window_count": len(obs), "batch_size": batch_size},
+            gate_passed=True,
         )
     except Exception as exc:
-        finish_ux_run(conn, run_id, status="failed", meta={"error": str(exc)})
+        finish_ux_run(
+            conn, run_id, status="failed", meta={"error": str(exc)}, gate_passed=False
+        )
         raise
+    if publish:
+        publish_ux_run(
+            conn,
+            run_id,
+            published_by="run_full_ux_extract",
+            note="Audit gate passed and owner authorized the full-corpus run.",
+        )
     return run_id
 
 

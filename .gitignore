@@ -7,3 +7,7 @@ build/
 .research/
 web/node_modules/
 web/dist/
+scratch_*.py
+docs/_skills-audit-raw.json
+docs/ui-screenshots/
+docs/ui-screenshots-v2/

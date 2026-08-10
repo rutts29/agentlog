@@ -9,15 +9,18 @@ from agentlog.ingest.base import (
     content_hash_text,
     content_is_tool_plumbing,
     extract_text,
+    flag_parent_authored_prompt,
     iter_jsonl_bytes,
     parse_ts,
 )
+from agentlog.normalize.effort import normalize_effort
 from agentlog.normalize.models import (
     Harness,
     NormalizedMessage,
     NormalizedSession,
     ParseResult,
     SkillExposure,
+    TokenUsage,
     ToolEvent,
 )
 
@@ -25,6 +28,60 @@ UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
     re.I,
 )
+
+
+def _int_or_none(value: object) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _usage_from_claude_message(
+    usage: object,
+    *,
+    seq: int,
+    message_seq: int,
+    model: str | None,
+    timestamp,
+) -> TokenUsage | None:
+    if not isinstance(usage, dict):
+        return None
+    input_tokens = _int_or_none(usage.get("input_tokens"))
+    output_tokens = _int_or_none(usage.get("output_tokens"))
+    cache_creation = _int_or_none(usage.get("cache_creation_input_tokens"))
+    cache_read = _int_or_none(usage.get("cache_read_input_tokens"))
+    if all(
+        v is None
+        for v in (input_tokens, output_tokens, cache_creation, cache_read)
+    ):
+        return None
+    extras: dict = {}
+    for key in (
+        "service_tier",
+        "inference_geo",
+        "speed",
+        "server_tool_use",
+        "cache_creation",
+        "iterations",
+    ):
+        if key in usage and usage[key] not in (None, "", [], {}):
+            extras[key] = usage[key]
+    return TokenUsage(
+        seq=seq,
+        message_seq=message_seq,
+        granularity="message",
+        usage_source="claude_message_usage",
+        model=model,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cache_creation_input_tokens=cache_creation,
+        cache_read_input_tokens=cache_read,
+        timestamp=timestamp,
+        extras=extras,
+    )
 
 
 def _project_slug(path: Path) -> str | None:
@@ -52,6 +109,11 @@ def _external_id(path: Path) -> str:
         slug = _project_slug(path) or "unknown"
         return f"skills:{slug}"
     return stem
+
+
+def external_id_from_path(path: Path) -> str:
+    """Public path → external_id helper (used by live presence)."""
+    return _external_id(path)
 
 
 class ClaudeAdapter(TranscriptAdapter):
@@ -134,13 +196,16 @@ class ClaudeAdapter(TranscriptAdapter):
         messages: list[NormalizedMessage] = []
         tools: list[ToolEvent] = []
         skills: list[SkillExposure] = []
+        token_usages: list[TokenUsage] = []
         external_id = _external_id(path)
         parent = _parent_session_id(path)
         is_subagent = path.name.startswith("agent-") or parent is not None
         cwd: str | None = None
         branch: str | None = None
         model: str | None = None
+        agent_profile: str | None = None
         effort: str | None = None
+        effort_source: str | None = None
         started_at = None
         ended_at = None
         msg_seq = 0
@@ -160,8 +225,9 @@ class ClaudeAdapter(TranscriptAdapter):
                 ended_at = ts
             cwd = obj.get("cwd") or cwd
             branch = obj.get("gitBranch") or branch
+            # Claude JSONL exposes gitBranch only — no commit/sha field in corpus.
             if obj.get("effort") is not None:
-                effort = str(obj["effort"])
+                effort, effort_source = normalize_effort(str(obj["effort"]))
             if is_subagent:
                 if obj.get("agentId"):
                     external_id = f"agent-{obj['agentId']}"
@@ -169,6 +235,9 @@ class ClaudeAdapter(TranscriptAdapter):
                     parent = str(obj["sessionId"])
             elif obj.get("sessionId"):
                 external_id = str(obj["sessionId"])
+            agent_type = obj.get("agentType") or obj.get("agent_type")
+            if agent_type not in (None, "") and agent_profile is None:
+                agent_profile = str(agent_type)
 
             etype = obj.get("type")
             if etype in ("user", "assistant"):
@@ -176,7 +245,11 @@ class ClaudeAdapter(TranscriptAdapter):
                 role = str(msg.get("role") or etype)
                 msg_model = msg.get("model")
                 if msg_model:
-                    model = str(msg_model)
+                    raw_model = str(msg_model)
+                    if raw_model != "<synthetic>":
+                        model = raw_model
+                    elif model is None:
+                        model = raw_model
                 content = msg.get("content")
                 text = extract_text(content)
                 plumbing = content_is_tool_plumbing(content)
@@ -188,11 +261,23 @@ class ClaudeAdapter(TranscriptAdapter):
                         timestamp=ts,
                         model=str(msg_model) if msg_model else None,
                         effort=effort if role == "assistant" else None,
+                        effort_source=(
+                            effort_source if role == "assistant" else None
+                        ),
                         text=text,
                         content_hash=content_hash_text(text),
                         is_tool_plumbing=plumbing,
                     )
                 )
+                usage_row = _usage_from_claude_message(
+                    msg.get("usage"),
+                    seq=len(token_usages) + 1,
+                    message_seq=msg_seq,
+                    model=str(msg_model) if msg_model else None,
+                    timestamp=ts,
+                )
+                if usage_row is not None:
+                    token_usages.append(usage_row)
                 if isinstance(content, list):
                     for block in content:
                         if not isinstance(block, dict):
@@ -265,6 +350,9 @@ class ClaudeAdapter(TranscriptAdapter):
             if etype == "attachment":
                 continue
 
+        if is_subagent and start_offset == 0:
+            flag_parent_authored_prompt(messages)
+
         session = NormalizedSession(
             harness=Harness.CLAUDE,
             external_id=external_id,
@@ -274,7 +362,9 @@ class ClaudeAdapter(TranscriptAdapter):
             cwd=cwd,
             branch=branch,
             model=model,
+            agent_profile=agent_profile,
             effort=effort,
+            effort_source=effort_source,
             repo=_project_slug(path),
         )
         return ParseResult(
@@ -282,6 +372,7 @@ class ClaudeAdapter(TranscriptAdapter):
             messages=messages,
             tool_events=tools,
             skill_exposures=skills,
+            token_usages=token_usages,
             warnings=warnings,
             bytes_consumed=start_offset + bytes_consumed,
         )

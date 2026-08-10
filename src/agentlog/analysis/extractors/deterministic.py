@@ -16,10 +16,107 @@ from agentlog.analysis.extractors.window_context import (
     structural_features,
 )
 
+KIND_DETERMINISTIC = "deterministic"
+
 
 def _run_id(kind: str, started_at: str) -> str:
     raw = f"{kind}:{EXTRACTOR_NAME_DET}:{EXTRACTOR_VERSION}:{started_at}"
     return hashlib.sha1(raw.encode()).hexdigest()[:24]
+
+
+def classification_row_id(window_id: str) -> str:
+    """Stable primary key so re-derive replaces rather than stacks rows."""
+    return hashlib.sha1(f"det:{window_id}".encode()).hexdigest()[:24]
+
+
+def window_input_fingerprint(
+    *,
+    window_content_hash: str,
+    request_content_hash: str,
+    authored_by_agent: bool,
+    is_tool_plumbing: bool,
+) -> str:
+    raw = (
+        f"{EXTRACTOR_VERSION}|{window_content_hash}|{request_content_hash}|"
+        f"{int(authored_by_agent)}|{int(is_tool_plumbing)}"
+    )
+    return hashlib.sha1(raw.encode()).hexdigest()[:16]
+
+
+def iter_window_input_rows(
+    conn: sqlite3.Connection,
+) -> list[tuple[str, str]]:
+    """Return (window_id, input_fp) for every exchange window."""
+    rows = conn.execute(
+        """
+        SELECT w.id AS window_id,
+               COALESCE(w.content_hash, '') AS wch,
+               COALESCE(m.content_hash, '') AS mch,
+               COALESCE(m.authored_by_agent, 0) AS aba,
+               COALESCE(m.is_tool_plumbing, 0) AS plumb
+        FROM exchange_windows w
+        LEFT JOIN messages m ON m.id = w.request_message_id
+        ORDER BY w.id
+        """
+    ).fetchall()
+    out: list[tuple[str, str]] = []
+    for row in rows:
+        fp = window_input_fingerprint(
+            window_content_hash=str(row["wch"] or ""),
+            request_content_hash=str(row["mch"] or ""),
+            authored_by_agent=bool(row["aba"]),
+            is_tool_plumbing=bool(row["plumb"]),
+        )
+        out.append((str(row["window_id"]), fp))
+    return out
+
+
+def corpus_fingerprint(window_fps: list[tuple[str, str]]) -> str:
+    h = hashlib.sha1()
+    h.update(EXTRACTOR_VERSION.encode())
+    h.update(f"|{len(window_fps)}|".encode())
+    for wid, fp in window_fps:
+        h.update(f"{wid}:{fp}\n".encode())
+    return h.hexdigest()
+
+
+def existing_classification_fps(conn: sqlite3.Connection) -> dict[str, str]:
+    out: dict[str, str] = {}
+    if not conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name = 'window_det_classifications'"
+    ).fetchone():
+        return out
+    for row in conn.execute(
+        "SELECT window_id, features_json, extractor_version "
+        "FROM window_det_classifications"
+    ):
+        wid = str(row["window_id"])
+        try:
+            features = json.loads(row["features_json"] or "{}")
+        except json.JSONDecodeError:
+            features = {}
+        fp = features.get("input_fp")
+        if (
+            isinstance(fp, str)
+            and fp
+            and str(row["extractor_version"] or "") == EXTRACTOR_VERSION
+        ):
+            out[wid] = fp
+        else:
+            out[wid] = ""
+    return out
+
+
+def stale_window_ids(
+    conn: sqlite3.Connection,
+) -> tuple[list[str], list[tuple[str, str]], str]:
+    """Windows needing classify, full (id, fp) list, and corpus fingerprint."""
+    window_fps = iter_window_input_rows(conn)
+    global_fp = corpus_fingerprint(window_fps)
+    have = existing_classification_fps(conn)
+    stale = [wid for wid, fp in window_fps if have.get(wid) != fp]
+    return stale, window_fps, global_fp
 
 
 def run_deterministic(
@@ -27,12 +124,36 @@ def run_deterministic(
     *,
     window_ids: list[str] | None = None,
 ) -> tuple[TriageReport, str]:
-    """Classify all (or selected) windows; write det rows; return triage report + run_id."""
+    """Classify all (or selected) windows; write det rows; return triage + run_id."""
     started = datetime.now(timezone.utc).isoformat()
     run_id = _run_id("deterministic", started)
     contexts = load_window_contexts(conn, window_ids=window_ids)
     report = triage_windows(contexts)
     ctx_by_id = {c.window_id: c for c in contexts}
+
+    input_fp_by_id: dict[str, str] = {}
+    if contexts:
+        ids = [c.window_id for c in contexts]
+        placeholders = ",".join("?" * len(ids))
+        for row in conn.execute(
+            f"""
+            SELECT w.id AS window_id,
+                   COALESCE(w.content_hash, '') AS wch,
+                   COALESCE(m.content_hash, '') AS mch,
+                   COALESCE(m.authored_by_agent, 0) AS aba,
+                   COALESCE(m.is_tool_plumbing, 0) AS plumb
+            FROM exchange_windows w
+            LEFT JOIN messages m ON m.id = w.request_message_id
+            WHERE w.id IN ({placeholders})
+            """,
+            ids,
+        ):
+            input_fp_by_id[str(row["window_id"])] = window_input_fingerprint(
+                window_content_hash=str(row["wch"] or ""),
+                request_content_hash=str(row["mch"] or ""),
+                authored_by_agent=bool(row["aba"]),
+                is_tool_plumbing=bool(row["plumb"]),
+            )
 
     conn.execute(
         """
@@ -43,7 +164,7 @@ def run_deterministic(
         """,
         (
             run_id,
-            "deterministic",
+            KIND_DETERMINISTIC,
             EXTRACTOR_NAME_DET,
             EXTRACTOR_VERSION,
             started,
@@ -52,18 +173,13 @@ def run_deterministic(
         ),
     )
 
-    meta = ExtractorMeta(
-        name=EXTRACTOR_NAME_DET,
-        version=EXTRACTOR_VERSION,
-        model=None,
-        prompt_hash=None,
-    )
     now = datetime.now(timezone.utc).isoformat()
     for result in report.results:
         ctx = ctx_by_id[result.window_id]
         features = structural_features(ctx)
         features["matched_rules"] = list(result.matched_rules)
-        row_id = hashlib.sha1(f"{run_id}:{result.window_id}".encode()).hexdigest()[:24]
+        features["input_fp"] = input_fp_by_id.get(result.window_id, "")
+        row_id = classification_row_id(result.window_id)
         conn.execute(
             """
             INSERT OR REPLACE INTO window_det_classifications (
@@ -121,7 +237,8 @@ def _route_stub(conn: sqlite3.Connection, result, run_id: str, now: str) -> None
         "worker_task": "worker_task_v1",
         "skill_compliance": "skill_compliance_v1",
     }[route]
-    row_id = hashlib.sha1(f"{table}:{run_id}:{result.window_id}".encode()).hexdigest()[
+    # Stable id so re-derive replaces the stub instead of stacking run rows.
+    row_id = hashlib.sha1(f"{table}:det:{result.window_id}".encode()).hexdigest()[
         :24
     ]
     payload = {
@@ -132,6 +249,15 @@ def _route_stub(conn: sqlite3.Connection, result, run_id: str, now: str) -> None
         "status": "routed_deterministic",
         "note": "Dedicated schema stub; full pipeline deferred.",
     }
+    # Drop prior deterministic stubs for this window (unique is window_id+run_id).
+    conn.execute(
+        f"""
+        DELETE FROM {table}
+        WHERE window_id = ?
+          AND json_extract(payload_json, '$.status') = 'routed_deterministic'
+        """,
+        (result.window_id,),
+    )
     conn.execute(
         f"""
         INSERT OR REPLACE INTO {table} (

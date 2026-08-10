@@ -12,6 +12,7 @@ from agentlog.analysis.extractors.models import UxObservation, WindowContext
 from agentlog.analysis.extractors.taxonomy import AUDIT_GATES
 from agentlog.analysis.extractors.ux_extractor import UxExtractor
 from agentlog.analysis.extractors.window_context import truncate_for_ux
+from agentlog.safety.write_guard import assert_writable
 
 
 @dataclass
@@ -105,6 +106,7 @@ def emit_audit_pack(
 ) -> list[WindowContext]:
     """Write reviewable JSONL for hand labeling. Does not include model labels as gold."""
     sample = stratified_sample(contexts, n=n, seed=seed)
+    path = assert_writable(path, purpose="audit pack")
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         for ctx in sample:

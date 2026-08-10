@@ -16,6 +16,7 @@ from agentlog.analysis.extractors.models import (
 )
 from agentlog.analysis.extractors.prompt import PROMPT_PATH, load_ux_prompt, ux_prompt_hash
 from agentlog.analysis.extractors.storage import (
+    PURPOSE_FULL_CORPUS,
     finish_ux_run,
     start_ux_run,
     write_ux_observations,
@@ -31,6 +32,8 @@ from agentlog.analysis.extractors.taxonomy import (
     UserStance,
 )
 from agentlog.analysis.extractors.window_context import load_window_contexts, truncate_for_ux
+from agentlog.safety.redaction import REDACTION_VERSION
+from agentlog.safety.write_guard import assert_writable
 
 # Packet sizing: after §6 truncation, median ~1k chars and p90 ~4.5k; p99 outliers
 # hit field caps (~10k). Default to a few windows per packet with a hard char budget
@@ -156,6 +159,21 @@ def pack_windows(
     return packets
 
 
+def labeled_window_ids(conn: sqlite3.Connection) -> set[str]:
+    """Window ids that already carry a live (non-orphaned) ux_observations row."""
+    cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(ux_observations)")}
+    if "link_status" in cols:
+        sql = (
+            "SELECT DISTINCT window_id FROM ux_observations "
+            "WHERE window_id IS NOT NULL AND link_status = 'linked'"
+        )
+    else:
+        sql = (
+            "SELECT DISTINCT window_id FROM ux_observations WHERE window_id IS NOT NULL"
+        )
+    return {str(r[0]) for r in conn.execute(sql)}
+
+
 def _run_paths(run_dir: Path) -> dict[str, Path]:
     return {
         "manifest": run_dir / "manifest.json",
@@ -174,7 +192,7 @@ def load_manifest(run_dir: Path) -> dict[str, Any]:
 
 
 def save_manifest(run_dir: Path, manifest: dict[str, Any]) -> None:
-    path = _run_paths(run_dir)["manifest"]
+    path = assert_writable(_run_paths(run_dir)["manifest"], purpose="packet manifest")
     path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
@@ -207,6 +225,7 @@ def emit_packet_run(
     model: str = "grok-4.5",
     ux_only: bool = True,
     window_ids: list[str] | None = None,
+    skip_labeled: bool = False,
     resume: bool = True,
 ) -> dict[str, Any]:
     """
@@ -220,6 +239,9 @@ def emit_packet_run(
         return load_manifest(run_dir)
 
     contexts = load_window_contexts(conn, window_ids=window_ids)
+    if skip_labeled:
+        already = labeled_window_ids(conn)
+        contexts = [c for c in contexts if c.window_id not in already]
     if ux_only:
         from agentlog.analysis.extractors.triage import triage_window
 
@@ -231,6 +253,7 @@ def emit_packet_run(
         max_chars_per_packet=max_chars_per_packet,
     )
 
+    assert_writable(run_dir, purpose="packet run dir")
     run_dir.mkdir(parents=True, exist_ok=True)
     for key in ("packets", "results", "rejects"):
         paths[key].mkdir(parents=True, exist_ok=True)
@@ -246,6 +269,7 @@ def emit_packet_run(
         batch_size=1,
         window_count=len(payloads),
         gated=True,
+        purpose=PURPOSE_FULL_CORPUS,
     )
     row = conn.execute(
         "SELECT meta_json FROM derivation_runs WHERE id = ?", (db_run_id,)
@@ -297,6 +321,7 @@ def emit_packet_run(
         "created_at": _utc_now(),
         "model": model,
         "prompt_hash": phash,
+        "redaction_version": REDACTION_VERSION,
         "prompt_repo_path": str(PROMPT_PATH),
         "windows_per_packet": windows_per_packet,
         "max_chars_per_packet": max_chars_per_packet,
@@ -477,6 +502,7 @@ def raw_to_observation(
     model: str,
     prompt_hash: str,
     packet_id: str,
+    redaction_version: str | None = None,
 ) -> UxObservation:
     flags_raw = raw.get("flags") or {}
     flags = ProcessFlags(
@@ -516,6 +542,7 @@ def raw_to_observation(
             prompt_hash=prompt_hash,
             packet_id=packet_id,
             provider=PacketExtractionProvider.name,
+            redaction_version=redaction_version or REDACTION_VERSION,
         ),
         turn_kind=[str(x) for x in (raw.get("turn_kind") or [])],
         user_stance=str(us) if us is not None else None,
@@ -605,9 +632,14 @@ def ingest_packet_result(
 
     use_model = model or str(manifest.get("model") or "grok-4.5")
     phash = str(manifest.get("prompt_hash") or ux_prompt_hash())
+    rver = str(manifest.get("redaction_version") or REDACTION_VERSION)
     observations = [
         raw_to_observation(
-            r, model=use_model, prompt_hash=phash, packet_id=packet_id
+            r,
+            model=use_model,
+            prompt_hash=phash,
+            packet_id=packet_id,
+            redaction_version=rver,
         )
         for r in accepted_raw
     ]
