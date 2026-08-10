@@ -6,11 +6,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from agentlog.analysis.coach.preprocess import _window_rows
 from agentlog.analysis.windows import build_exchange_windows
 from agentlog.db.repository import Repository
 from agentlog.db.schema import init_db
 from agentlog.ingest.base import content_is_tool_plumbing
 from agentlog.ingest.claude import ClaudeAdapter
+from agentlog.safety.redaction import RedactionReport
 
 
 def _line(obj: dict) -> bytes:
@@ -184,6 +186,101 @@ class ClaudeToolPlumbingAdapterTests(unittest.TestCase):
             Path("/tmp/seq.jsonl"), data, start_offset=0
         )
         self.assertEqual([m.seq for m in result.messages], [1, 2])
+
+    def test_structural_user_context_is_persisted_and_excluded_from_coach(self) -> None:
+        structural = (
+            ("isMeta", True, "metadata context"),
+            ("sourceToolUseID", "toolu_context", "tool context"),
+            ("isCompactSummary", True, "compaction summary"),
+        )
+        records: list[dict] = []
+        for field, value, text in structural:
+            records.append(
+                {
+                    "type": "user",
+                    "timestamp": "2026-08-01T12:00:00Z",
+                    "sessionId": "structural-context",
+                    field: value,
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": text}],
+                    },
+                }
+            )
+        records.extend(
+            [
+                {
+                    "type": "user",
+                    "timestamp": "2026-08-01T12:00:01Z",
+                    "sessionId": "structural-context",
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "real request"}],
+                    },
+                },
+                {
+                    "type": "assistant",
+                    "timestamp": "2026-08-01T12:00:02Z",
+                    "sessionId": "structural-context",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "real response"}],
+                    },
+                },
+            ]
+        )
+        data = b"".join(_line(record) for record in records)
+        parsed = ClaudeAdapter().parse_chunk(
+            Path("/tmp/structural-context.jsonl"), data, start_offset=0
+        )
+        self.assertEqual(
+            [message.text for message in parsed.messages[:3]],
+            [text for _, _, text in structural],
+        )
+        self.assertTrue(
+            all(
+                message.is_tool_plumbing and message.authored_by_agent
+                for message in parsed.messages[:3]
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "agentlog.db"
+            conn = sqlite3.connect(str(db_path))
+            conn.row_factory = sqlite3.Row
+            init_db(conn)
+            repo = Repository(conn)
+            artifact_id = repo.upsert_artifact(
+                harness="claude",
+                path="/tmp/structural-context.jsonl",
+                size=len(data),
+                mtime_ns=1,
+                content_hash="structural-context",
+                parsed_offset=len(data),
+                parser_version="13",
+            )
+            session_id = repo.save_parse_result(
+                artifact_id=artifact_id, result=parsed, append=False
+            )
+            stored = repo.list_messages(session_id)
+            self.assertEqual(
+                [row["text"] for row in stored[:3]],
+                [text for _, _, text in structural],
+            )
+            self.assertTrue(
+                all(
+                    row["is_tool_plumbing"] and row["authored_by_agent"]
+                    for row in stored[:3]
+                )
+            )
+            repo.replace_exchange_windows(
+                session_id, build_exchange_windows(stored)
+            )
+            eligible, _, meta = _window_rows(conn, RedactionReport())
+            self.assertEqual(len(eligible), 1)
+            self.assertEqual(eligible[0]["user"], "real request")
+            self.assertEqual(meta["scanned"], 1)
+            conn.close()
 
 
 class ExchangeWindowPlumbingTests(unittest.TestCase):

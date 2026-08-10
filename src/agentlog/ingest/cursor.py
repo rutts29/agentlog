@@ -25,8 +25,15 @@ from agentlog.normalize.models import (
     NormalizedMessage,
     NormalizedSession,
     ParseResult,
+    SkillExposure,
     ToolEvent,
 )
+from agentlog.normalize.synthetic import (
+    flag_synthetic_user_messages,
+    is_cursor_subagent_followup,
+    synthetic_skill_exposures,
+)
+from agentlog.normalize.tool_ops import classify_operation
 
 log = logging.getLogger("agentlog.ingest.cursor")
 
@@ -35,9 +42,54 @@ _USER_QUERY_RE = re.compile(
     re.S,
 )
 _TIMESTAMP_ONLY_RE = re.compile(r"<timestamp>(.*?)</timestamp>", re.S)
+_MANUALLY_ATTACHED_SKILLS_RE = re.compile(
+    r"<manually_attached_skills\b.*?</manually_attached_skills\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
+_SKILL_NAME_RE = re.compile(
+    r"^\s*Skill\s+Name:\s*(?P<name>[^\r\n]+?)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 
 _UNKNOWN_REPOS = frozenset({"", "unknown", "empty-window"})
+
+
+def _strip_cursor_skill_injection(text: str) -> tuple[str, list[str]]:
+    """Remove Cursor's inlined skill bodies and return their declared names."""
+    matches = list(_MANUALLY_ATTACHED_SKILLS_RE.finditer(text or ""))
+    if not matches:
+        return text, []
+    names: list[str] = []
+    seen: set[str] = set()
+    for match in matches:
+        for name_match in _SKILL_NAME_RE.finditer(match.group(0)):
+            name = name_match.group("name").strip()
+            if name and name not in seen:
+                seen.add(name)
+                names.append(name)
+    cleaned = _MANUALLY_ATTACHED_SKILLS_RE.sub("", text)
+    return cleaned, names
+
+
+def _cursor_owner_text(text: str) -> str:
+    match = _USER_QUERY_RE.search(text or "")
+    if match:
+        return match.group(2).strip()
+    text = re.sub(r"<timestamp>.*?</timestamp>\s*", "", text or "", flags=re.DOTALL)
+    text = re.sub(r"</?user_query>\s*", "", text, flags=re.IGNORECASE)
+    return text.strip()
+
+
+def _tool_detail(block: dict[str, Any]) -> str | None:
+    raw_input = block.get("input")
+    if not isinstance(raw_input, dict):
+        return None
+    for key in ("command", "cmd"):
+        value = raw_input.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
 
 
 def canonical_external_id(external_id: str) -> str:
@@ -123,13 +175,7 @@ def _effort_from_model_config(model_config: dict[str, Any]) -> str | None:
 
 
 def _normalize_user_key(text: str) -> str:
-    text = text.strip()
-    m = _USER_QUERY_RE.search(text)
-    if m:
-        return m.group(2).strip()[:120]
-    text = re.sub(r"<timestamp>.*?</timestamp>\s*", "", text, flags=re.S)
-    text = re.sub(r"</?user_query>\s*", "", text)
-    return text.strip()[:120]
+    return _cursor_owner_text(text)[:120]
 
 
 @dataclass(frozen=True)
@@ -407,7 +453,8 @@ def _first_user_content_hash(path_str: str) -> str | None:
             continue
         msg = obj.get("message") if isinstance(obj.get("message"), dict) else {}
         text = extract_text(msg.get("content"))
-        return content_hash_text(text)
+        text, _ = _strip_cursor_skill_injection(text)
+        return content_hash_text(_cursor_owner_text(text))
     return None
 
 
@@ -445,6 +492,9 @@ class CursorAdapter(TranscriptAdapter):
         warnings: list[str] = []
         messages: list[NormalizedMessage] = []
         tools: list[ToolEvent] = []
+        skills: list[SkillExposure] = []
+        tool_operations: dict[str, str] = {}
+        tool_names: dict[str, str] = {}
         external_id = _external_id(path)
         parent = None
         if path.parent.name == "subagents":
@@ -481,6 +531,9 @@ class CursorAdapter(TranscriptAdapter):
             msg = obj.get("message") if isinstance(obj.get("message"), dict) else {}
             content = msg.get("content")
             text = extract_text(content)
+            skill_names: list[str] = []
+            if role == "user":
+                text, skill_names = _strip_cursor_skill_injection(text)
             ts = _message_timestamp(obj, text)
             if role == "user":
                 idx, turn = _match_user_turn(text, meta.user_turns, turn_scan_idx)
@@ -501,6 +554,7 @@ class CursorAdapter(TranscriptAdapter):
             msg_model = current_gen_model if role == "assistant" else None
             msg_effort = effort if role == "assistant" else None
             msg_effort_source = effort_source if role == "assistant" else None
+            stored_text = _cursor_owner_text(text) if role == "user" else text
 
             msg_seq += 1
             messages.append(
@@ -511,11 +565,21 @@ class CursorAdapter(TranscriptAdapter):
                     model=msg_model,
                     effort=msg_effort,
                     effort_source=msg_effort_source,
-                    text=text,
-                    content_hash=content_hash_text(text),
+                    text=stored_text,
+                    content_hash=content_hash_text(stored_text),
                     is_tool_plumbing=content_is_tool_plumbing(content),
+                    authored_by_agent=is_cursor_subagent_followup(text),
                 )
             )
+
+            for skill_name in skill_names:
+                skills.append(
+                    SkillExposure(
+                        message_seq=msg_seq,
+                        skill_name=skill_name,
+                        exposure_type="attached",
+                    )
+                )
 
             if isinstance(content, list):
                 for block in content:
@@ -523,30 +587,46 @@ class CursorAdapter(TranscriptAdapter):
                         continue
                     if block.get("type") == "tool_use":
                         tool_seq += 1
+                        name = str(block.get("name") or "tool")
+                        tool_id = str(block.get("id") or block.get("tool_use_id") or "")
+                        operation_kind = str(
+                            classify_operation(name, _tool_detail(block))
+                        )
+                        if tool_id:
+                            tool_operations[tool_id] = operation_kind
+                            tool_names[tool_id] = name
                         tools.append(
                             ToolEvent(
                                 seq=tool_seq,
                                 message_seq=msg_seq,
-                                tool_name=str(block.get("name") or "tool"),
+                                tool_name=name,
                                 action="call",
+                                operation_kind=operation_kind,
                             )
                         )
                     elif block.get("type") == "tool_result":
                         tool_seq += 1
+                        tool_id = str(block.get("tool_use_id") or block.get("id") or "")
+                        result_name = block.get("name")
+                        name = str(
+                            result_name
+                            or tool_names.get(tool_id)
+                            or tool_id
+                            or "tool"
+                        )
                         tools.append(
                             ToolEvent(
                                 seq=tool_seq,
                                 message_seq=msg_seq,
-                                tool_name=str(
-                                    block.get("name")
-                                    or block.get("tool_use_id")
-                                    or "tool"
-                                ),
+                                tool_name=name,
                                 action="result",
                                 success=(
                                     not bool(block.get("is_error"))
                                     if "is_error" in block
                                     else None
+                                ),
+                                operation_kind=tool_operations.get(
+                                    tool_id, str(classify_operation(name))
                                 ),
                             )
                         )
@@ -561,6 +641,8 @@ class CursorAdapter(TranscriptAdapter):
         if parent is not None and start_offset == 0:
             flag_parent_authored_prompt(messages)
             _clear_flag_if_copied_parent_history(path, messages)
+        flag_synthetic_user_messages(messages)
+        skills.extend(synthetic_skill_exposures(messages))
 
         session = NormalizedSession(
             harness=Harness.CURSOR,
@@ -580,6 +662,7 @@ class CursorAdapter(TranscriptAdapter):
             session=session,
             messages=messages,
             tool_events=tools,
+            skill_exposures=skills,
             warnings=warnings,
             bytes_consumed=start_offset + bytes_consumed,
         )

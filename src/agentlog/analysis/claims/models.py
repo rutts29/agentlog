@@ -21,6 +21,7 @@ ScopeType = Literal[
     "repo",
     "skill",
     "harness",
+    "model",
     "user_rules",
 ]
 

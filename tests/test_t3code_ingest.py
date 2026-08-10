@@ -5,9 +5,14 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from agentlog.ingest.t3code import T3CodeAdapter, discover_t3code_dbs
-from agentlog.normalize.models import Harness
+from agentlog.ingest.t3code import ModelSelection, T3CodeAdapter, discover_t3code_dbs
+from agentlog.ingest.base import TranscriptAdapter, file_stat, hash_prefix, sqlite_fingerprint
+from agentlog.db.repository import Repository
+from agentlog.db.schema import connect, init_db
+from agentlog.ingest.pipeline import IngestStats, _ingest_one
+from agentlog.normalize.models import Harness, NormalizedMessage, NormalizedSession, ParseResult
 
 PLAN_THREAD = "11111111-1111-4111-8111-111111111111"
 MAIN_THREAD = "22222222-2222-4222-8222-222222222222"
@@ -332,6 +337,678 @@ class T3CodeAdapterTests(unittest.TestCase):
         self.assertEqual(plan.agent_profile, "claudeAgent")
         self.assertEqual(plan.provider, "anthropic")
         self.assertEqual(plan.effort, "high")
+
+    def test_live_reasoning_effort_option_list_is_normalized(self) -> None:
+        selection = ModelSelection(
+            json.dumps(
+                {
+                    "instanceId": "codex",
+                    "model": "gpt-5.6-sol",
+                    "options": [
+                        {"id": "reasoningEffort", "value": "high"},
+                        {"id": "serviceTier", "value": "default"},
+                    ],
+                }
+            )
+        )
+        self.assertEqual(selection.agent_profile, "codex")
+        self.assertEqual(selection.provider, "openai")
+        self.assertEqual(selection.model, "gpt-5.6-sol")
+        self.assertEqual(selection.effort, "high")
+
+    def test_task_activity_exports_provider_backing_evidence(self) -> None:
+        provider_id = "019febdf-eb13-7ee0-8110-26c0bb81a177"
+        root_provider_id = "019febd9-95f2-7ea3-82c7-f13290099c71"
+        conn = sqlite3.connect(self.db)
+        conn.execute(
+            "UPDATE projection_thread_sessions SET provider_name = 'codex', "
+            "provider_instance_id = 'codex' WHERE thread_id = ?",
+            (MAIN_THREAD,),
+        )
+        conn.execute(
+            """INSERT INTO projection_thread_activities
+               (activity_id, thread_id, turn_id, tone, kind, summary,
+                payload_json, created_at, sequence)
+               VALUES ('provider-root', ?, NULL, 'info', 'tool.completed',
+                       'provider', ?, '2026-08-09T10:06:10.000Z', 6)""",
+            (
+                MAIN_THREAD,
+                json.dumps({"data": {"threadId": root_provider_id}}),
+            ),
+        )
+        conn.execute(
+            """INSERT INTO projection_thread_activities
+               (activity_id, thread_id, turn_id, tone, kind, summary,
+                payload_json, created_at, sequence)
+               VALUES ('provider-task', ?, NULL, 'info', 'task.started',
+                       'worker', ?, '2026-08-09T10:06:11.000Z', 7)""",
+            (MAIN_THREAD, json.dumps({"taskId": provider_id, "agentKind": "agent"})),
+        )
+        conn.commit()
+        conn.close()
+        result = {
+            r.session.external_id: r
+            for r in T3CodeAdapter().parse_path(self.db, b"", start_offset=0)
+        }[MAIN_THREAD]
+        self.assertEqual(
+            result.extras["session_links"],
+            [
+                {
+                    "link_type": "provider_backing",
+                    "target_harness": "codex",
+                    "target_external_id": root_provider_id,
+                    "link_role": "root",
+                    "evidence": {
+                        "source": "t3code.projection_thread_activities",
+                        "activity_id": "provider-root",
+                        "field": "data.threadId",
+                    },
+                },
+                {
+                    "link_type": "provider_backing",
+                    "target_harness": "codex",
+                    "target_external_id": provider_id,
+                    "link_role": "worker",
+                    "evidence": {
+                        "source": "t3code.projection_thread_activities",
+                        "activity_id": "provider-task",
+                        "field": "taskId",
+                    },
+                }
+            ],
+        )
+
+    def test_provider_switch_uses_activity_history_and_ordering(self) -> None:
+        codex_root = "019febd9-95f2-7ea3-82c7-f13290099c71"
+        codex_worker = "019febdf-eb13-7ee0-8110-26c0bb81a177"
+        grok_worker = "019febef-eb13-7ee0-8110-26c0bb81a177"
+        conn = sqlite3.connect(self.db)
+        conn.execute(
+            "UPDATE projection_thread_sessions SET provider_name = 'grok', "
+            "provider_instance_id = 'grok' WHERE thread_id = ?",
+            (MAIN_THREAD,),
+        )
+        conn.execute(
+            """INSERT INTO orchestration_events
+               (event_id, aggregate_kind, stream_id, stream_version,
+                event_type, occurred_at, actor_kind, payload_json, metadata_json)
+               VALUES ('codex-selection', 'thread', ?, 7, 'thread.turn-started',
+                       '2026-08-09T10:06:02.000Z', 'client', ?, '{}')""",
+            (MAIN_THREAD, json.dumps({"modelSelection": {"instanceId": "codex"}})),
+        )
+        conn.executemany(
+            """INSERT INTO projection_thread_activities
+               (activity_id, thread_id, turn_id, tone, kind, summary,
+                payload_json, created_at, sequence)
+               VALUES (?, ?, NULL, 'info', 'task.started', 'worker', ?, ?, ?)""",
+            [
+                (
+                    "codex-root-before-fallback",
+                    MAIN_THREAD,
+                    json.dumps({"data": {"threadId": codex_root}}),
+                    "2026-08-09T10:06:10.000Z",
+                    20,
+                ),
+                (
+                    "grok-worker-after-fallback",
+                    MAIN_THREAD,
+                    json.dumps({"taskId": grok_worker}),
+                    "2026-08-09T10:08:31.000Z",
+                    1,
+                ),
+                (
+                    "codex-worker-before-fallback",
+                    MAIN_THREAD,
+                    json.dumps({"taskId": codex_worker}),
+                    "2026-08-09T10:06:11.000Z",
+                    2,
+                ),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        result = {
+            r.session.external_id: r
+            for r in T3CodeAdapter().parse_path(self.db, b"", start_offset=0)
+        }[MAIN_THREAD]
+        self.assertCountEqual(
+            [link["target_external_id"] for link in result.extras["session_links"]],
+            [codex_root, codex_worker],
+        )
+
+    def test_provider_switch_reparse_keeps_observed_links(self) -> None:
+        provider_id = "019febdf-eb13-7ee0-8110-26c0bb81a177"
+        conn = sqlite3.connect(self.db)
+        conn.execute(
+            "UPDATE projection_thread_sessions SET provider_name = 'codex', "
+            "provider_instance_id = 'codex' WHERE thread_id = ?",
+            (MAIN_THREAD,),
+        )
+        conn.execute(
+            """INSERT INTO projection_thread_activities
+               (activity_id, thread_id, turn_id, tone, kind, summary,
+                payload_json, created_at, sequence)
+               VALUES ('codex-history', ?, NULL, 'info', 'task.started',
+                       'worker', ?, '2026-08-09T10:06:10.000Z', 7)""",
+            (MAIN_THREAD, json.dumps({"taskId": provider_id})),
+        )
+        conn.commit()
+        conn.close()
+
+        ledger = connect(Path(self._tmp.name) / "ledger.db")
+        init_db(ledger)
+        repo = Repository(ledger)
+        first = {
+            r.session.external_id: r
+            for r in T3CodeAdapter().parse_path(self.db, b"", start_offset=0)
+        }[MAIN_THREAD]
+        artifact = repo.upsert_artifact(
+            harness="t3code", path="t3.sqlite", size=1, mtime_ns=1,
+            content_hash="t3", parsed_offset=1, parser_version="test",
+        )
+        repo.save_parse_result(artifact_id=artifact, result=first, append=False)
+
+        conn = sqlite3.connect(self.db)
+        conn.execute(
+            "UPDATE projection_thread_sessions SET provider_name = 'grok', "
+            "provider_instance_id = 'grok' WHERE thread_id = ?",
+            (MAIN_THREAD,),
+        )
+        conn.execute(
+            """INSERT INTO projection_thread_activities
+               (activity_id, thread_id, turn_id, tone, kind, summary,
+                payload_json, created_at, sequence)
+               VALUES ('grok-after-fallback', ?, NULL, 'info', 'task.started',
+                       'worker', ?, '2026-08-09T10:08:31.000Z', 8)""",
+            (MAIN_THREAD, json.dumps({"taskId": "019febef-eb13-7ee0-8110-26c0bb81a177"})),
+        )
+        conn.commit()
+        conn.close()
+        second = {
+            r.session.external_id: r
+            for r in T3CodeAdapter().parse_path(self.db, b"", start_offset=0)
+        }[MAIN_THREAD]
+        self.assertEqual(second.extras["session_links"], [])
+        repo.save_parse_result(artifact_id=artifact, result=second, append=False)
+        rows = ledger.execute(
+            "SELECT target_external_id FROM session_links "
+            "WHERE source_session_id = ? ORDER BY target_external_id",
+            (f"t3code:{MAIN_THREAD}",),
+        ).fetchall()
+        self.assertEqual([row[0] for row in rows], [provider_id])
+
+    def test_non_codex_t3_provider_does_not_emit_provider_backings(self) -> None:
+        provider_id = "019febdf-eb13-7ee0-8110-26c0bb81a177"
+        conn = sqlite3.connect(self.db)
+        try:
+            for provider in ("grok", "claude"):
+                conn.execute(
+                    "UPDATE projection_thread_sessions SET provider_name = ?, "
+                    "provider_instance_id = ? WHERE thread_id = ?",
+                    (provider, provider, MAIN_THREAD),
+                )
+                conn.execute(
+                    """INSERT INTO projection_thread_activities
+                       (activity_id, thread_id, turn_id, tone, kind, summary,
+                        payload_json, created_at, sequence)
+                       VALUES (?, ?, NULL, 'info', 'task.started',
+                               'worker', ?, '2026-08-09T10:06:11.000Z', ?)""",
+                    (
+                        f"{provider}-task",
+                        MAIN_THREAD,
+                        json.dumps({"taskId": provider_id}),
+                        7 if provider == "grok" else 8,
+                    ),
+                )
+                conn.commit()
+                result = {
+                    r.session.external_id: r
+                    for r in T3CodeAdapter().parse_path(
+                        self.db, b"", start_offset=0
+                    )
+                }[MAIN_THREAD]
+                self.assertEqual(result.extras["session_links"], [])
+        finally:
+            conn.close()
+
+    def test_ambiguous_provider_session_does_not_emit_provider_backings(self) -> None:
+        provider_id = "019febdf-eb13-7ee0-8110-26c0bb81a177"
+        conn = sqlite3.connect(self.db)
+        conn.execute(
+            "UPDATE projection_thread_sessions SET provider_name = 'codex', "
+            "provider_instance_id = 'grok' WHERE thread_id = ?",
+            (MAIN_THREAD,),
+        )
+        conn.execute(
+            "UPDATE projection_threads SET model_selection_json = ? "
+            "WHERE thread_id = ?",
+            (_sel("codex", "gpt-5.6-sol"), MAIN_THREAD),
+        )
+        conn.execute(
+            """INSERT INTO projection_thread_activities
+               (activity_id, thread_id, turn_id, tone, kind, summary,
+                payload_json, created_at, sequence)
+               VALUES ('ambiguous-provider', ?, NULL, 'info', 'task.started',
+                       'worker', ?, '2026-08-09T10:06:11.000Z', 7)""",
+            (MAIN_THREAD, json.dumps({"taskId": provider_id})),
+        )
+        conn.commit()
+        conn.close()
+        result = {
+            r.session.external_id: r
+            for r in T3CodeAdapter().parse_path(self.db, b"", start_offset=0)
+        }[MAIN_THREAD]
+        self.assertEqual(result.extras["session_links"], [])
+
+    def test_current_runtime_overrides_stale_codex_provider_session(self) -> None:
+        provider_id = "019febdf-eb13-7ee0-8110-26c0bb81a177"
+        conn = sqlite3.connect(self.db)
+        conn.execute(
+            """CREATE TABLE provider_session_runtime (
+                thread_id TEXT PRIMARY KEY,
+                provider_name TEXT,
+                provider_instance_id TEXT
+            )"""
+        )
+        conn.execute(
+            """INSERT INTO provider_session_runtime
+               (thread_id, provider_name, provider_instance_id)
+               VALUES (?, 'grok', 'grok')""",
+            (MAIN_THREAD,),
+        )
+        conn.execute(
+            "UPDATE projection_thread_sessions SET provider_name = 'codex', "
+            "provider_instance_id = 'codex' WHERE thread_id = ?",
+            (MAIN_THREAD,),
+        )
+        conn.execute(
+            "UPDATE projection_threads SET model_selection_json = ? "
+            "WHERE thread_id = ?",
+            (_sel("codex", "gpt-5.6-sol"), MAIN_THREAD),
+        )
+        conn.execute(
+            """INSERT INTO projection_thread_activities
+               (activity_id, thread_id, turn_id, tone, kind, summary,
+                payload_json, created_at, sequence)
+               VALUES ('runtime-provider', ?, NULL, 'info', 'task.started',
+                       'worker', ?, '2026-08-09T10:06:11.000Z', 7)""",
+            (MAIN_THREAD, json.dumps({"taskId": provider_id})),
+        )
+        conn.commit()
+        conn.close()
+        result = {
+            r.session.external_id: r
+            for r in T3CodeAdapter().parse_path(self.db, b"", start_offset=0)
+        }[MAIN_THREAD]
+        self.assertEqual(result.extras["session_links"], [])
+
+    def test_codex_model_selection_establishes_provider_without_runtime_row(self) -> None:
+        provider_id = "019febdf-eb13-7ee0-8110-26c0bb81a177"
+        conn = sqlite3.connect(self.db)
+        conn.execute(
+            "UPDATE projection_threads SET model_selection_json = ? "
+            "WHERE thread_id = ?",
+            (_sel("codex", "gpt-5.6-sol"), IMPL_THREAD),
+        )
+        conn.execute(
+            """INSERT INTO projection_thread_activities
+               (activity_id, thread_id, turn_id, tone, kind, summary,
+                payload_json, created_at, sequence)
+               VALUES ('selection-provider', ?, NULL, 'info', 'task.started',
+                       'worker', ?, '2026-08-09T10:21:11.000Z', 7)""",
+            (IMPL_THREAD, json.dumps({"taskId": provider_id})),
+        )
+        conn.commit()
+        conn.close()
+        result = {
+            r.session.external_id: r
+            for r in T3CodeAdapter().parse_path(self.db, b"", start_offset=0)
+        }[IMPL_THREAD]
+        self.assertEqual(len(result.extras["session_links"]), 1)
+        self.assertEqual(
+            result.extras["session_links"][0]["target_external_id"], provider_id
+        )
+
+    def test_t3_thread_id_is_not_a_codex_provider_backing(self) -> None:
+        conn = sqlite3.connect(self.db)
+        conn.execute(
+            "UPDATE projection_thread_sessions SET provider_name = 'codex', "
+            "provider_instance_id = 'codex' WHERE thread_id = ?",
+            (MAIN_THREAD,),
+        )
+        conn.execute(
+            """INSERT INTO projection_thread_activities
+               (activity_id, thread_id, turn_id, tone, kind, summary,
+                payload_json, created_at, sequence)
+               VALUES ('t3-task', ?, NULL, 'info', 'task.started',
+                       'worker', ?, '2026-08-09T10:06:11.000Z', 7)""",
+                (
+                    MAIN_THREAD,
+                    json.dumps(
+                        {
+                            "data": {"threadId": PLAN_THREAD},
+                            "receiverThreadIds": [PLAN_THREAD],
+                        }
+                    ),
+                ),
+        )
+        conn.commit()
+        conn.close()
+        result = {
+            r.session.external_id: r
+            for r in T3CodeAdapter().parse_path(self.db, b"", start_offset=0)
+        }[MAIN_THREAD]
+        self.assertEqual(result.extras["session_links"], [])
+
+    def test_worker_evidence_wins_when_root_and_worker_share_id(self) -> None:
+        shared_id = "019febdf-eb13-7ee0-8110-26c0bb81a177"
+        conn = sqlite3.connect(self.db)
+        conn.execute(
+            "UPDATE projection_thread_sessions SET provider_name = 'codex', "
+            "provider_instance_id = 'codex' WHERE thread_id = ?",
+            (MAIN_THREAD,),
+        )
+        conn.executemany(
+            """INSERT INTO projection_thread_activities
+               (activity_id, thread_id, turn_id, tone, kind, summary,
+                payload_json, created_at, sequence)
+               VALUES (?, ?, NULL, 'info', 'task.started', 'worker', ?, ?, ?)""",
+            [
+                (
+                    "root-after-worker",
+                    MAIN_THREAD,
+                    json.dumps({"data": {"threadId": shared_id}}),
+                    "2026-08-09T10:06:12.000Z",
+                    8,
+                ),
+                (
+                    "worker-before-root",
+                    MAIN_THREAD,
+                    json.dumps({"taskId": shared_id}),
+                    "2026-08-09T10:06:11.000Z",
+                    7,
+                ),
+            ],
+        )
+        conn.commit()
+        conn.close()
+        result = {
+            r.session.external_id: r
+            for r in T3CodeAdapter().parse_path(self.db, b"", start_offset=0)
+        }[MAIN_THREAD]
+        links = result.extras["session_links"]
+        self.assertEqual(len(links), 1)
+        self.assertEqual(links[0]["target_external_id"], shared_id)
+        self.assertEqual(links[0]["link_role"], "worker")
+        self.assertEqual(links[0]["evidence"]["field"], "taskId")
+
+    def test_current_non_codex_provider_overrides_stale_codex_selection(self) -> None:
+        provider_id = "019febdf-eb13-7ee0-8110-26c0bb81a177"
+        conn = sqlite3.connect(self.db)
+        conn.execute(
+            "UPDATE projection_thread_sessions SET provider_name = 'grok', "
+            "provider_instance_id = 'grok' WHERE thread_id = ?",
+            (MAIN_THREAD,),
+        )
+        conn.execute(
+            "UPDATE projection_threads SET model_selection_json = ? "
+            "WHERE thread_id = ?",
+            (_sel("codex", "gpt-5.6-sol"), MAIN_THREAD),
+        )
+        conn.execute(
+            """INSERT INTO projection_thread_activities
+               (activity_id, thread_id, turn_id, tone, kind, summary,
+                payload_json, created_at, sequence)
+               VALUES ('stale-codex', ?, NULL, 'info', 'task.started',
+                       'worker', ?, '2026-08-09T10:06:11.000Z', 7)""",
+            (MAIN_THREAD, json.dumps({"taskId": provider_id})),
+        )
+        conn.commit()
+        conn.close()
+        result = {
+            r.session.external_id: r
+            for r in T3CodeAdapter().parse_path(self.db, b"", start_offset=0)
+        }[MAIN_THREAD]
+        self.assertEqual(result.extras["session_links"], [])
+
+    def test_provider_backing_link_resolves_without_merging_rows(self) -> None:
+        provider_id = "019febdf-eb13-7ee0-8110-26c0bb81a177"
+        conn = connect(Path(self._tmp.name) / "agentlog.db")
+        init_db(conn)
+        repo = Repository(conn)
+        t3_result = {
+            r.session.external_id: r
+            for r in T3CodeAdapter().parse_path(self.db, b"", start_offset=0)
+        }[MAIN_THREAD]
+        t3_result.extras["session_links"] = [
+            {
+                "link_type": "provider_backing",
+                "target_harness": "codex",
+                "target_external_id": provider_id,
+                "evidence": {"source": "test"},
+            }
+        ]
+        t3_artifact = repo.upsert_artifact(
+            harness="t3code", path="t3.sqlite", size=1, mtime_ns=1,
+            content_hash="t3", parsed_offset=1, parser_version="test",
+        )
+        repo.save_parse_result(
+            artifact_id=t3_artifact, result=t3_result, append=False
+        )
+        self.assertIsNone(
+            conn.execute(
+                "SELECT target_session_id FROM session_links"
+            ).fetchone()["target_session_id"]
+        )
+        provider_result = ParseResult(
+            session=NormalizedSession(
+                harness=Harness.CODEX,
+                external_id=provider_id,
+                model="gpt-5.6-terra",
+            )
+        )
+        provider_artifact = repo.upsert_artifact(
+            harness="codex", path="provider.jsonl", size=1, mtime_ns=1,
+            content_hash="provider", parsed_offset=1, parser_version="test",
+        )
+        repo.save_parse_result(
+            artifact_id=provider_artifact,
+            result=provider_result,
+            append=False,
+        )
+        row = conn.execute(
+            "SELECT source_session_id, target_session_id, target_harness, "
+            "target_external_id, link_type FROM session_links"
+        ).fetchone()
+        self.assertEqual(row["source_session_id"], f"t3code:{MAIN_THREAD}")
+        self.assertEqual(row["target_session_id"], f"codex:{provider_id}")
+        self.assertEqual(row["target_harness"], "codex")
+        self.assertEqual(row["target_external_id"], provider_id)
+        self.assertEqual(row["link_type"], "provider_backing")
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0], 2
+        )
+        conn.close()
+
+    def test_wal_revision_changes_when_main_database_stat_does_not(self) -> None:
+        wal = Path(f"{self.db}-wal")
+        main_size, main_revision = file_stat(self.db)
+        before_hash = hash_prefix(self.db, main_size)
+        wal.write_bytes(b"uncheckpointed state")
+        try:
+            size, revision = file_stat(self.db)
+            after_hash = hash_prefix(self.db, size)
+        finally:
+            wal.unlink()
+        self.assertEqual(size, main_size)
+        self.assertNotEqual(revision, main_revision)
+        self.assertNotEqual(after_hash, before_hash)
+
+    def test_logical_fast_skip_retries_when_commit_follows_fingerprint(self) -> None:
+        source = Path(self._tmp.name) / "logical.sqlite"
+        writer = sqlite3.connect(source)
+        writer.execute("PRAGMA journal_mode = WAL")
+        writer.execute("PRAGMA wal_autocheckpoint = 1000000")
+        writer.execute("CREATE TABLE entries (id INTEGER PRIMARY KEY, value TEXT)")
+        writer.execute("INSERT INTO entries(value) VALUES ('old')")
+        writer.commit()
+        ledger = connect(Path(self._tmp.name) / "ledger.db")
+        init_db(ledger)
+        repo = Repository(ledger)
+
+        class Adapter(TranscriptAdapter):
+            harness = Harness.T3CODE
+            supports_byte_append = False
+
+            def discover(self) -> list[Path]:
+                return []
+
+            def parse_chunk(self, path, data, *, start_offset):
+                raise NotImplementedError
+
+            def parse_path(self, path, data, *, start_offset):
+                with sqlite3.connect(path) as conn:
+                    values = conn.execute(
+                        "SELECT value FROM entries ORDER BY id"
+                    ).fetchall()
+                return [
+                    ParseResult(
+                        session=NormalizedSession(
+                            harness=self.harness, external_id="logical"
+                        ),
+                        messages=[
+                            NormalizedMessage(
+                                seq=i,
+                                role="user",
+                                text=row[0],
+                                content_hash=f"h{i}",
+                            )
+                            for i, row in enumerate(values, 1)
+                        ],
+                        bytes_consumed=path.stat().st_size,
+                    )
+                ]
+
+        try:
+            first = IngestStats()
+            _ingest_one(repo, Adapter(), source, first)
+            ledger.commit()
+            writer.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            real_fingerprint = sqlite_fingerprint
+            calls = {"n": 0}
+
+            def commit_after_fingerprint(path: Path) -> str:
+                result = real_fingerprint(path)
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    writer.execute(
+                        "INSERT INTO entries(value) VALUES ('fast-new')"
+                    )
+                    writer.commit()
+                return result
+
+            stats = IngestStats()
+            with mock.patch(
+                "agentlog.ingest.pipeline.sqlite_fingerprint",
+                commit_after_fingerprint,
+            ):
+                _ingest_one(repo, Adapter(), source, stats)
+            ledger.commit()
+            values = [
+                row[0]
+                for row in ledger.execute(
+                    "SELECT text FROM messages ORDER BY seq"
+                )
+            ]
+            self.assertEqual(stats.parsed, 1)
+            self.assertEqual(values, ["old", "fast-new"])
+        finally:
+            writer.close()
+            ledger.close()
+
+    def test_logical_parse_retries_when_commit_follows_fingerprint(self) -> None:
+        source = Path(self._tmp.name) / "logical-parse.sqlite"
+        writer = sqlite3.connect(source)
+        writer.execute("PRAGMA journal_mode = WAL")
+        writer.execute("PRAGMA wal_autocheckpoint = 1000000")
+        writer.execute("CREATE TABLE entries (id INTEGER PRIMARY KEY, value TEXT)")
+        writer.execute("INSERT INTO entries(value) VALUES ('old')")
+        writer.commit()
+        ledger = connect(Path(self._tmp.name) / "parse-ledger.db")
+        init_db(ledger)
+        repo = Repository(ledger)
+
+        class Adapter(TranscriptAdapter):
+            harness = Harness.T3CODE
+            supports_byte_append = False
+
+            def discover(self) -> list[Path]:
+                return []
+
+            def parse_chunk(self, path, data, *, start_offset):
+                raise NotImplementedError
+
+            def parse_path(self, path, data, *, start_offset):
+                with sqlite3.connect(path) as conn:
+                    values = conn.execute(
+                        "SELECT value FROM entries ORDER BY id"
+                    ).fetchall()
+                return [
+                    ParseResult(
+                        session=NormalizedSession(
+                            harness=self.harness, external_id="logical"
+                        ),
+                        messages=[
+                            NormalizedMessage(
+                                seq=i,
+                                role="user",
+                                text=row[0],
+                                content_hash=f"h{i}",
+                            )
+                            for i, row in enumerate(values, 1)
+                        ],
+                        bytes_consumed=path.stat().st_size,
+                    )
+                ]
+
+        try:
+            first = IngestStats()
+            _ingest_one(repo, Adapter(), source, first)
+            ledger.commit()
+            writer.execute("INSERT INTO entries(value) VALUES ('parse-new')")
+            writer.commit()
+            real_fingerprint = sqlite_fingerprint
+            calls = {"n": 0}
+
+            def commit_after_parse_fingerprint(path: Path) -> str:
+                result = real_fingerprint(path)
+                calls["n"] += 1
+                if calls["n"] == 2:
+                    writer.execute(
+                        "INSERT INTO entries(value) VALUES ('parse-race')"
+                    )
+                    writer.commit()
+                return result
+
+            stats = IngestStats()
+            with mock.patch(
+                "agentlog.ingest.pipeline.sqlite_fingerprint",
+                commit_after_parse_fingerprint,
+            ):
+                _ingest_one(repo, Adapter(), source, stats)
+            ledger.commit()
+            values = [
+                row[0]
+                for row in ledger.execute(
+                    "SELECT text FROM messages ORDER BY seq"
+                )
+            ]
+            self.assertEqual(stats.parsed, 1)
+            self.assertEqual(values, ["old", "parse-new", "parse-race"])
+        finally:
+            writer.close()
+            ledger.close()
 
     def test_per_message_model_follows_mid_session_switch(self) -> None:
         by_text = {m.text: m for m in self.results[MAIN_THREAD].messages}

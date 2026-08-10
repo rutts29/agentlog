@@ -23,11 +23,27 @@ from agentlog.normalize.models import (
     TokenUsage,
     ToolEvent,
 )
+from agentlog.normalize.synthetic import (
+    flag_synthetic_user_messages,
+    synthetic_skill_exposures,
+)
+from agentlog.normalize.tool_ops import classify_operation
 
 UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
     re.I,
 )
+
+
+def _tool_detail(block: dict) -> str | None:
+    raw_input = block.get("input")
+    if not isinstance(raw_input, dict):
+        return None
+    for key in ("command", "cmd"):
+        value = raw_input.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
 
 
 def _int_or_none(value: object) -> int | None:
@@ -116,6 +132,16 @@ def external_id_from_path(path: Path) -> str:
     return _external_id(path)
 
 
+def _is_structural_user_context(record: dict[str, object], *, role: str) -> bool:
+    if role != "user":
+        return False
+    return bool(
+        record.get("isMeta")
+        or record.get("sourceToolUseID")
+        or record.get("isCompactSummary")
+    )
+
+
 class ClaudeAdapter(TranscriptAdapter):
     harness = Harness.CLAUDE
 
@@ -195,6 +221,8 @@ class ClaudeAdapter(TranscriptAdapter):
         warnings: list[str] = []
         messages: list[NormalizedMessage] = []
         tools: list[ToolEvent] = []
+        tool_operations: dict[str, str] = {}
+        tool_names: dict[str, str] = {}
         skills: list[SkillExposure] = []
         token_usages: list[TokenUsage] = []
         external_id = _external_id(path)
@@ -252,7 +280,10 @@ class ClaudeAdapter(TranscriptAdapter):
                         model = raw_model
                 content = msg.get("content")
                 text = extract_text(content)
-                plumbing = content_is_tool_plumbing(content)
+                structural_context = _is_structural_user_context(
+                    obj, role=role
+                ) or _is_structural_user_context(msg, role=role)
+                plumbing = content_is_tool_plumbing(content) or structural_context
                 msg_seq += 1
                 messages.append(
                     NormalizedMessage(
@@ -267,6 +298,7 @@ class ClaudeAdapter(TranscriptAdapter):
                         text=text,
                         content_hash=content_hash_text(text),
                         is_tool_plumbing=plumbing,
+                        authored_by_agent=structural_context,
                     )
                 )
                 usage_row = _usage_from_claude_message(
@@ -286,12 +318,20 @@ class ClaudeAdapter(TranscriptAdapter):
                         if btype == "tool_use":
                             tool_seq += 1
                             name = str(block.get("name") or "tool")
+                            tool_id = str(block.get("id") or block.get("tool_use_id") or "")
+                            operation_kind = str(
+                                classify_operation(name, _tool_detail(block))
+                            )
+                            if tool_id:
+                                tool_operations[tool_id] = operation_kind
+                                tool_names[tool_id] = name
                             tools.append(
                                 ToolEvent(
                                     seq=tool_seq,
                                     message_seq=msg_seq,
                                     tool_name=name,
                                     action="call",
+                                    operation_kind=operation_kind,
                                 )
                             )
                             if name == "Skill":
@@ -309,20 +349,27 @@ class ClaudeAdapter(TranscriptAdapter):
                                     )
                         elif btype == "tool_result":
                             tool_seq += 1
+                            tool_id = str(block.get("tool_use_id") or block.get("id") or "")
+                            result_name = block.get("name")
+                            name = str(
+                                result_name
+                                or tool_names.get(tool_id)
+                                or tool_id
+                                or "tool"
+                            )
                             tools.append(
                                 ToolEvent(
                                     seq=tool_seq,
                                     message_seq=msg_seq,
-                                    tool_name=str(
-                                        block.get("name")
-                                        or block.get("tool_use_id")
-                                        or "tool"
-                                    ),
+                                    tool_name=name,
                                     action="result",
                                     success=(
                                         not bool(block.get("is_error"))
                                         if "is_error" in block
                                         else None
+                                    ),
+                                    operation_kind=tool_operations.get(
+                                        tool_id, str(classify_operation(name))
                                     ),
                                 )
                             )
@@ -352,6 +399,8 @@ class ClaudeAdapter(TranscriptAdapter):
 
         if is_subagent and start_offset == 0:
             flag_parent_authored_prompt(messages)
+        flag_synthetic_user_messages(messages)
+        skills.extend(synthetic_skill_exposures(messages))
 
         session = NormalizedSession(
             harness=Harness.CLAUDE,

@@ -21,6 +21,11 @@ from agentlog.normalize.models import (
     ParseResult,
     ToolEvent,
 )
+from agentlog.normalize.synthetic import (
+    flag_synthetic_user_messages,
+    synthetic_skill_exposures,
+)
+from agentlog.normalize.tool_ops import classify_operation
 
 log = logging.getLogger("agentlog.ingest.warp")
 
@@ -140,6 +145,9 @@ class WarpAdapter(TranscriptAdapter):
 
         if results and warnings:
             results[0].warnings = list(warnings) + list(results[0].warnings)
+        for result in results:
+            flag_synthetic_user_messages(result.messages)
+            result.skill_exposures.extend(synthetic_skill_exposures(result.messages))
         return results
 
     def _parse_conversation(
@@ -226,6 +234,7 @@ class WarpAdapter(TranscriptAdapter):
                             message_seq=msg_seq if msg_seq else None,
                             tool_name=tool_name,
                             action="result",
+                            operation_kind=classify_operation(tool_name),
                         )
                     )
 

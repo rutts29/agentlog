@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
-from typing import Optional
+from typing import Any, Mapping, Optional
 
 import typer
 from rich.console import Console
@@ -30,15 +31,109 @@ propose_app = typer.Typer(
     help="Reviewable LLM proposals (packet subagents; never auto-applied).",
     invoke_without_command=True,
 )
+coach_app = typer.Typer(
+    help="Local-only, file-handoff harness coaching (Luna and Terra)."
+)
 app.add_typer(session_app, name="session")
 app.add_typer(extract_app, name="extract")
 app.add_typer(experiment_app, name="experiment")
 app.add_typer(service_app, name="service")
 app.add_typer(propose_app, name="propose")
+app.add_typer(coach_app, name="coach")
 
 console = Console()
 
 ASSIGNMENT_CARD_PATH = Path.home() / ".agentlog" / "current_assignment.json"
+
+
+def _coach_json(value: Any) -> None:
+    typer.echo(json.dumps(value, indent=2, sort_keys=True, default=str))
+
+
+def _coach_result_paths(run_dir: Path, supplied: Optional[Path]) -> list[Path]:
+    root = (supplied or (run_dir / "results")).expanduser()
+    if root.is_dir():
+        return sorted(path for path in root.glob("**/*.json") if path.is_file())
+    return [root] if root.is_file() else []
+
+
+def _coach_json_input(path: Path, label: str) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid {label} JSON: {exc}") from exc
+
+
+def _coach_config_inventory(path: Optional[Path]) -> list[dict[str, str]]:
+    if path is not None:
+        value = _coach_json_input(path, "config inventory")
+        if isinstance(value, Mapping):
+            value = value.get("configs", value.get("items", value))
+        if not isinstance(value, list):
+            raise ValueError("config inventory must be a JSON list or an object with configs/items")
+        return [dict(item) for item in value if isinstance(item, Mapping)]
+
+    from agentlog.analysis.claims.scope import discover_config_inventory
+
+    inventory = discover_config_inventory()
+    entries: list[dict[str, str]] = []
+    for item in inventory.files:
+        if not item.exists or not item.content_hash:
+            continue
+        try:
+            content = item.path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        target_kind = {
+            "agents_md": "instruction_file",
+            "claude_md": "instruction_file",
+            "cursor_rule": "harness_rule",
+        }.get(item.kind, item.kind)
+        entries.append(
+            {
+                "path": str(item.path),
+                "content": content,
+                "fingerprint": item.content_hash,
+                "target_kind": target_kind,
+            }
+        )
+    return entries
+
+
+def _coach_truncated_message_count(run_dir: Path, manifest: Mapping[str, Any]) -> int:
+    truncated = 0
+    for entry in manifest.get("packets", []):
+        if not isinstance(entry, Mapping):
+            continue
+        path = run_dir / str(entry.get("path") or "")
+        try:
+            packet = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        for window in packet.get("windows", []) if isinstance(packet, Mapping) else []:
+            if not isinstance(window, Mapping):
+                continue
+            truncated += sum(
+                1
+                for message in window.get("messages", [])
+                if isinstance(message, Mapping) and message.get("source_truncated") is True
+            )
+    return truncated
+
+
+def _coach_cli_metadata(run_dir: Path) -> dict[str, Any]:
+    path = run_dir / "coach_cli_metadata.json"
+    if not path.is_file():
+        return {}
+    value = _coach_json_input(path, "coach CLI metadata")
+    if not isinstance(value, dict):
+        raise ValueError("coach CLI metadata must be a JSON object")
+    return value
+
+
+def _coach_failure(phase: str, reason: str, **extra: Any) -> None:
+    _coach_json({"phase": phase, "complete": False, "failures": [{"reason": reason, **extra}]})
+    raise typer.Exit(code=1)
 
 
 def _repo(db: Path) -> Repository:
@@ -590,6 +685,488 @@ def propose_packets_status_cmd(
 
     status = packet_run_status(run_dir)
     console.print_json(__import__("json").dumps(status, default=str))
+
+
+def _coach_db(ctx: typer.Context):
+    db = ctx.obj["db"]
+    ensure_db_parent(db)
+    conn = connect(db)
+    init_db(conn)
+    conn.execute("PRAGMA busy_timeout = 30000")
+    return conn
+
+
+@coach_app.command("prepare")
+def coach_prepare_cmd(
+    ctx: typer.Context,
+    run_dir: Path = typer.Option(
+        Path(".research/coach-run-001"),
+        "--run-dir",
+        help="Run directory for redacted Luna packets and results.",
+    ),
+    full: bool = typer.Option(
+        True,
+        "--full/--sampled",
+        help="Packetize every eligible window by default; sampled runs are not publishable.",
+    ),
+    max_windows_per_root: Optional[int] = typer.Option(
+        None,
+        "--max-windows-per-root",
+        help="Optional per-root bound; any bound makes full mode non-publishable if it truncates.",
+    ),
+    max_windows_per_packet: Optional[int] = typer.Option(
+        None,
+        "--max-windows-per-packet",
+        help="Optional packet-size bound (does not truncate coverage).",
+    ),
+    max_packet_chars: Optional[int] = typer.Option(
+        None,
+        "--max-packet-chars",
+        help="Optional UTF-8 serialized packet-byte bound; oversized local evidence fails instead of truncating.",
+    ),
+    max_quote_chars: Optional[int] = typer.Option(
+        None,
+        "--max-quote-chars",
+        help="Optional redacted message quote bound; full mode defaults to unbounded.",
+    ),
+    max_packets: Optional[int] = typer.Option(
+        None,
+        "--max-packets",
+        help="Optional packet-count bound; truncation is non-publishable.",
+    ),
+) -> None:
+    """Prepare redacted Luna packets without calling a model."""
+    from agentlog.analysis.coach import CoachPreprocessConfig, emit_coach_packets
+
+    conn = _coach_db(ctx)
+    if (
+        (max_windows_per_root is not None and max_windows_per_root < 1)
+        or (max_windows_per_packet is not None and max_windows_per_packet < 1)
+        or (max_packet_chars is not None and max_packet_chars < 1)
+        or (max_quote_chars is not None and max_quote_chars < 1)
+        or (max_packets is not None and max_packets < 0)
+    ):
+        conn.close()
+        _coach_failure("prepare", "coach_prepare_bounds_must_be_positive")
+    default_config = CoachPreprocessConfig()
+    root_bound = max_windows_per_root
+    packet_bound = (
+        max_windows_per_packet
+        if max_windows_per_packet is not None
+        else default_config.max_windows_per_packet
+    )
+    quote_bound = max_quote_chars
+    config = CoachPreprocessConfig(
+        publication_mode="full" if full else "sampled",
+        max_windows_per_root=root_bound,
+        max_windows_per_packet=packet_bound,
+        max_packet_chars=(
+            max_packet_chars
+            if max_packet_chars is not None
+            else default_config.max_packet_chars
+        ),
+        max_quote_chars=quote_bound,
+        max_packets=max_packets,
+    )
+    try:
+        manifest = emit_coach_packets(conn, run_dir, config=config)
+    except (OSError, ValueError, PermissionError) as exc:
+        _coach_failure("prepare", str(exc))
+    finally:
+        conn.close()
+    packet_count = len(manifest.get("packets", []))
+    coverage = manifest.get("coverage") or {}
+    eligible_windows = int(coverage.get("eligible_windows") or coverage.get("eligible") or 0)
+    packetized_windows = int(coverage.get("packetized_windows") or coverage.get("packetized") or 0)
+    eligible_roots = int(coverage.get("eligible_roots") or 0)
+    packetized_roots = int(coverage.get("packetized_roots") or 0)
+    source_truncated_messages = _coach_truncated_message_count(
+        Path(run_dir).expanduser().resolve(), manifest
+    )
+    full_coverage = (
+        full
+        and packetized_windows == eligible_windows
+        and packetized_roots == eligible_roots
+        and source_truncated_messages == 0
+        and (max_windows_per_root is None or packetized_windows == eligible_windows)
+        and (max_packets is None or packet_count <= max_packets)
+    )
+    readiness_reason = (
+        "full_eligible_coverage"
+        if full_coverage
+        else "sampled_mode_is_not_publishable"
+        if not full
+        else "full_mode_contains_truncated_messages"
+        if source_truncated_messages
+        else "prepare_bounds_truncated_eligible_coverage"
+    )
+    metadata = {
+        "schema_version": "coach.cli.v1",
+        "mode": "full" if full else "sampled",
+        "publishable": full_coverage,
+        "reason": readiness_reason,
+        "coverage": {
+            "eligible_windows": eligible_windows,
+            "packetized_windows": packetized_windows,
+            "eligible_roots": eligible_roots,
+            "packetized_roots": packetized_roots,
+            "source_truncated_messages": source_truncated_messages,
+        },
+    }
+    try:
+        from agentlog.safety.write_guard import assert_writable, write_text
+
+        metadata_path = Path(run_dir).expanduser().resolve() / "coach_cli_metadata.json"
+        assert_writable(metadata_path, purpose="coach CLI preparation metadata")
+        write_text(
+            metadata_path,
+            json.dumps(metadata, indent=2, sort_keys=True) + "\n",
+        )
+    except (OSError, PermissionError, ValueError) as exc:
+        _coach_failure("prepare", str(exc))
+    _coach_json(
+        {
+            "phase": "prepare",
+            "run_dir": str(Path(run_dir).expanduser().resolve()),
+            "luna_packets": {"expected": packet_count, "emitted": packet_count},
+            "luna_results": {"present": 0, "complete": packet_count == 0},
+            "coverage": {
+                "eligible_windows": eligible_windows,
+                "packetized_windows": packetized_windows,
+                "eligible_roots": eligible_roots,
+                "packetized_roots": packetized_roots,
+                "source_truncated_messages": source_truncated_messages,
+            },
+            "sampling": {
+                "mode": "full" if full else "sampled",
+                "publishable": full_coverage,
+                "bounds": {
+                    "max_windows_per_root": config.max_windows_per_root,
+                    "max_windows_per_packet": config.max_windows_per_packet,
+                    "max_packet_chars": config.max_packet_chars,
+                    "max_quote_chars": config.max_quote_chars,
+                    "max_packets": config.max_packets,
+                },
+            },
+            "proposal_readiness": {
+                "publishable": full_coverage,
+                "reason": readiness_reason,
+            },
+            "source_truncated_messages": source_truncated_messages,
+            "complete": packet_count == 0 or full_coverage,
+            "failures": [],
+        }
+    )
+
+
+@coach_app.command("synthesize")
+def coach_synthesize_cmd(
+    ctx: typer.Context,
+    run_dir: Path = typer.Option(
+        Path(".research/coach-run-001"),
+        "--run-dir",
+        help="Prepared coach run directory.",
+    ),
+    luna_results: Optional[Path] = typer.Option(
+        None,
+        "--luna-results",
+        help="Run-local results directory or one exact Luna result JSON file.",
+    ),
+    terra_results: Optional[Path] = typer.Option(
+        None,
+        "--terra-results",
+        help="Exact Terra result JSON (optional until Terra has replied).",
+    ),
+    second_review: Optional[Path] = typer.Option(
+        None,
+        "--second-review",
+        help="Exact reviewed Terra catalog JSON (optional until review is complete).",
+    ),
+    config_inventory: Optional[Path] = typer.Option(
+        None,
+        "--config-inventory",
+        help="Read a JSON config inventory instead of scanning current config files.",
+    ),
+) -> None:
+    """Build Terra packets and validate exact Luna/Terra/review handoffs."""
+    from agentlog.analysis.coach import (
+        run_synthesis_pipeline,
+        summarize_result_processing_coverage,
+    )
+
+    root = run_dir.expanduser().resolve()
+    try:
+        cli_metadata = _coach_cli_metadata(root)
+    except (OSError, ValueError) as exc:
+        _coach_failure("synthesize", str(exc))
+    sampling_mode = str(cli_metadata.get("mode") or "unknown")
+    sampling_publishable = cli_metadata.get("publishable") is not False
+    # Keep the selected database as the command's explicit corpus boundary;
+    # replay verification later rechecks its snapshot before any apply.
+    _coach_db(ctx).close()
+    manifest_path = root / "manifest.json"
+    if not manifest_path.is_file():
+        _coach_failure("synthesize", "coach_preprocess_manifest_missing")
+    try:
+        manifest = _coach_json_input(manifest_path, "coach preprocess manifest")
+        if luna_results is not None:
+            result_root = (root / "results").resolve()
+            supplied_root = luna_results.expanduser().resolve()
+            if not supplied_root.is_relative_to(result_root):
+                _coach_failure("synthesize", "luna_results_must_be_under_run_results")
+        paths = _coach_result_paths(root, luna_results)
+        coverage, coverage_failures = summarize_result_processing_coverage(
+            root, manifest=manifest, result_paths=paths
+        )
+    except (OSError, ValueError) as exc:
+        _coach_failure("synthesize", str(exc))
+
+    expected_luna = len(
+        [item for item in manifest.get("packets", []) if isinstance(item, Mapping)]
+    )
+    luna_failures = [failure.to_dict() for failure in coverage_failures]
+    valid_luna = int(coverage.get("processed_packets") or 0)
+    if valid_luna != expected_luna:
+        luna_failures.append(
+            {
+                "reason": "missing_luna_result_packets",
+                "expected": expected_luna,
+                "validated": valid_luna,
+            }
+        )
+    if luna_failures:
+        _coach_json(
+            {
+                "phase": "synthesize",
+                "run_dir": str(root),
+                "luna_results": {
+                    "expected": expected_luna,
+                    "validated": valid_luna,
+                    "complete": False,
+                },
+                "complete": False,
+                "failures": luna_failures,
+            }
+        )
+        raise typer.Exit(code=1)
+
+    if second_review is not None and terra_results is None:
+        _coach_failure("synthesize", "second_review_requires_terra_results")
+    try:
+        inventory = _coach_config_inventory(config_inventory)
+        terra_value = (
+            _coach_json_input(terra_results, "Terra results")
+            if terra_results is not None
+            else None
+        )
+        review_value = (
+            _coach_json_input(second_review, "second review")
+            if second_review is not None
+            else None
+        )
+        summary = run_synthesis_pipeline(
+            root,
+            config_inventory=inventory,
+            terra_results=terra_value,
+            second_review=review_value,
+        )
+    except (OSError, ValueError, PermissionError) as exc:
+        _coach_failure("synthesize", str(exc))
+
+    synthesis_manifest = summary.get("synthesis_manifest") or {}
+    validation_failures = list(summary.get("validation_failures") or [])
+    terra_expected = len(
+        [item for item in synthesis_manifest.get("packets", []) if isinstance(item, Mapping)]
+    )
+    terra_validated = len(summary.get("validated_results") or [])
+    terra_complete = (
+        terra_results is not None
+        and terra_validated == terra_expected
+        and not validation_failures
+    )
+    catalog_created = summary.get("catalog") is not None
+    review_validated = summary.get("second_review") is not None
+    bundle_created = summary.get("run_bundle") is not None
+    bundle_verified = False
+    if terra_complete and catalog_created and review_validated and bundle_created:
+        from agentlog.analysis.coach import verify_coach_run
+
+        verify_conn = _coach_db(ctx)
+        try:
+            verify_coach_run(verify_conn, root)
+            bundle_verified = True
+        except (OSError, ValueError, PermissionError) as exc:
+            validation_failures.append(
+                {"reason": "coach_run_bundle_verification_failed", "detail": str(exc)}
+            )
+        finally:
+            verify_conn.close()
+    if validation_failures:
+        stage = "failed"
+    elif not sampling_publishable:
+        stage = "sampled_run_not_publishable"
+    elif terra_results is None:
+        stage = "awaiting_terra"
+    elif not terra_complete or not catalog_created:
+        stage = "awaiting_terra_results"
+    elif not review_validated:
+        stage = "awaiting_review"
+    elif not bundle_verified:
+        stage = "awaiting_verified_bundle"
+    else:
+        stage = "ready"
+    materialization_ready = stage == "ready"
+    _coach_json(
+        {
+            "phase": "synthesize",
+            "run_dir": str(root),
+            "luna_results": {
+                "expected": expected_luna,
+                "validated": valid_luna,
+                "complete": True,
+            },
+            "terra_packets": {"expected": terra_expected, "emitted": terra_expected},
+            "terra_results": {
+                "supplied": terra_results is not None,
+                "validated": terra_validated,
+                "complete": terra_complete,
+            },
+            "catalog": {"created": catalog_created},
+            "second_review": {
+                "supplied": second_review is not None,
+                "validated": review_validated,
+            },
+            "run_bundle": {"created": bundle_created, "verified": bundle_verified},
+            "sampling": {
+                "mode": sampling_mode,
+                "publishable": sampling_publishable,
+            },
+            "stage": stage,
+            "materialization_ready": materialization_ready,
+            "proposal_readiness": {
+                "publishable": materialization_ready,
+                "reason": stage,
+            },
+            "complete": materialization_ready,
+            "failures": validation_failures,
+        }
+    )
+    if validation_failures:
+        raise typer.Exit(code=1)
+
+
+def _coach_materialize_cmd(
+    ctx: typer.Context, run_dir: Path, apply: bool, phase: str = "materialize"
+) -> None:
+    from agentlog.analysis.coach import apply_materialization_plan, plan_materialization
+
+    conn = _coach_db(ctx)
+    try:
+        metadata = _coach_cli_metadata(run_dir.expanduser().resolve())
+        if metadata.get("publishable") is False:
+            _coach_failure(
+                phase,
+                "coach_run_not_publishable",
+                mode=str(metadata.get("mode") or "unknown"),
+                readiness_reason=str(metadata.get("reason") or "sampling_or_truncation"),
+            )
+        plan = plan_materialization(conn, run_dir)
+        report = apply_materialization_plan(conn, plan, dry_run=not apply)
+    except (OSError, ValueError, PermissionError) as exc:
+        _coach_failure(phase, str(exc))
+    finally:
+        conn.close()
+    _coach_json(
+        {
+            "phase": phase,
+            "run_dir": str(run_dir.expanduser().resolve()),
+            "mode": "apply" if apply else "dry-run",
+            "complete": True,
+            "failures": [],
+            "report": report,
+        }
+    )
+
+
+@coach_app.command("materialize")
+def coach_materialize_cmd(
+    ctx: typer.Context,
+    run_dir: Path = typer.Option(Path(".research/coach-run-001"), "--run-dir"),
+    apply: bool = typer.Option(
+        False,
+        "--apply",
+        help="Apply the reviewed plan to the selected database; default is verification/dry-run.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Explicitly request the non-mutating plan (the default).",
+    ),
+) -> None:
+    """Verify a reviewed run and optionally apply its materialization plan."""
+    if apply and dry_run:
+        _coach_failure("materialize", "apply_and_dry_run_are_mutually_exclusive")
+    _coach_materialize_cmd(ctx, run_dir, apply)
+
+
+@coach_app.command("verify")
+def coach_verify_cmd(
+    ctx: typer.Context,
+    run_dir: Path = typer.Option(Path(".research/coach-run-001"), "--run-dir"),
+) -> None:
+    """Verify a reviewed run and show its non-mutating materialization plan."""
+    _coach_materialize_cmd(ctx, run_dir, False, phase="verify")
+
+
+@coach_app.command("quarantine")
+def coach_quarantine_cmd(
+    ctx: typer.Context,
+    apply: bool = typer.Option(
+        False,
+        "--apply",
+        help="Quarantine legacy records in the selected database; default is dry-run.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Explicitly request the non-mutating plan (the default).",
+    ),
+) -> None:
+    """Plan legacy quarantine, applying it only when explicitly confirmed."""
+    from agentlog.analysis.coach import plan_legacy_quarantine, quarantine_legacy_records
+
+    if apply and dry_run:
+        _coach_failure("quarantine", "apply_and_dry_run_are_mutually_exclusive")
+    conn = _coach_db(ctx)
+    try:
+        plan = plan_legacy_quarantine(conn)
+        report = quarantine_legacy_records(conn, plan=plan, dry_run=not apply)
+    except (OSError, ValueError, PermissionError) as exc:
+        _coach_failure("quarantine", str(exc))
+    finally:
+        conn.close()
+    _coach_json(
+        {
+            "phase": "quarantine",
+            "mode": "apply" if apply else "dry-run",
+            "complete": True,
+            "failures": [],
+            "report": report,
+        }
+    )
+
+
+@coach_app.command("legacy-quarantine")
+def coach_legacy_quarantine_cmd(
+    ctx: typer.Context,
+    apply: bool = typer.Option(
+        False,
+        "--apply",
+        help="Quarantine legacy records in the selected database; default is dry-run.",
+    ),
+) -> None:
+    """Alias for the guarded legacy quarantine workflow."""
+    coach_quarantine_cmd(ctx, apply=apply, dry_run=False)
 
 
 @app.command("config-ledger")

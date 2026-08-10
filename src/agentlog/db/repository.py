@@ -204,6 +204,90 @@ class Repository:
             "DELETE FROM sessions WHERE artifact_id = ?", (artifact_id,)
         )
 
+    def replace_session_links(
+        self, source_session_id: str, links: Iterable[dict[str, Any]]
+    ) -> None:
+        links = list(links)
+        if not links:
+            return
+        for link in links:
+            link_type = str(link.get("link_type") or "").strip()
+            target_harness = str(link.get("target_harness") or "").strip()
+            target_external_id = str(
+                link.get("target_external_id") or ""
+            ).strip()
+            if not link_type or not target_harness or not target_external_id:
+                continue
+            target_id = _sid(target_harness, target_external_id)
+            exists = self.conn.execute(
+                "SELECT 1 FROM sessions WHERE id = ?", (target_id,)
+            ).fetchone()
+            evidence = link.get("evidence")
+            self.conn.execute(
+                """
+                INSERT INTO session_links (
+                    source_session_id, target_session_id, link_type,
+                    target_harness, target_external_id, link_role,
+                    confidence, evidence_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (
+                    source_session_id, link_type, target_harness,
+                    target_external_id
+                ) DO UPDATE SET
+                    target_session_id = excluded.target_session_id,
+                    link_role = excluded.link_role,
+                    confidence = excluded.confidence,
+                    evidence_json = excluded.evidence_json
+                """,
+                (
+                    source_session_id,
+                    target_id if exists else None,
+                    link_type,
+                    target_harness,
+                    target_external_id,
+                    str(link.get("link_role") or "unknown"),
+                    str(link.get("confidence") or "observed"),
+                    json.dumps(evidence or {}, separators=(",", ":")),
+                ),
+            )
+
+    def _session_link_payloads(self, source_session_id: str) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for row in self.conn.execute(
+            "SELECT link_type, target_harness, target_external_id, link_role, "
+            "confidence, evidence_json FROM session_links "
+            "WHERE source_session_id = ?",
+            (source_session_id,),
+        ):
+            try:
+                evidence = json.loads(row["evidence_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                evidence = {}
+            out.append(
+                {
+                    "link_type": row["link_type"],
+                    "target_harness": row["target_harness"],
+                    "target_external_id": row["target_external_id"],
+                    "link_role": row["link_role"],
+                    "confidence": row["confidence"],
+                    "evidence": evidence,
+                }
+            )
+        return out
+
+    def resolve_session_links(
+        self, target_harness: str, target_external_id: str
+    ) -> None:
+        target_id = _sid(target_harness, target_external_id)
+        self.conn.execute(
+            """
+            UPDATE session_links
+            SET target_session_id = ?
+            WHERE target_harness = ? AND target_external_id = ?
+            """,
+            (target_id, target_harness, target_external_id),
+        )
+
     def _merge_session_metadata(
         self,
         session_id: str,
@@ -379,6 +463,11 @@ class Repository:
             provider_hint=session.provider,
             agent_profile_hint=session.agent_profile,
         )
+        previous_links = (
+            self._session_link_payloads(session_id) if not append else []
+        )
+        incoming_links = list(result.extras.get("session_links", []))
+        links = previous_links + incoming_links
 
         if not append:
             existing_n = self.max_message_seq(session_id)
@@ -392,6 +481,13 @@ class Repository:
                     session_id,
                     result,
                     artifact_id=None,
+                )
+                self.replace_session_links(
+                    session_id,
+                    links,
+                )
+                self.resolve_session_links(
+                    session.harness.value, session.external_id
                 )
                 return session_id
             self.conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
@@ -430,6 +526,12 @@ class Repository:
                 result,
                 artifact_id=artifact_id,
             )
+
+        self.replace_session_links(
+            session_id,
+            links,
+        )
+        self.resolve_session_links(session.harness.value, session.external_id)
 
         msg_id_by_seq: dict[int, str] = {}
         for msg in result.messages:
@@ -490,8 +592,9 @@ class Repository:
             self.conn.execute(
                 """
                 INSERT OR REPLACE INTO tool_events (
-                    id, session_id, message_id, seq, tool_name, action, success, duration_ms
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    id, session_id, message_id, seq, tool_name, action, success,
+                    duration_ms, operation_kind
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     _tid(session_id, seq),
@@ -502,6 +605,7 @@ class Repository:
                     te.action,
                     None if te.success is None else int(te.success),
                     te.duration_ms,
+                    te.operation_kind,
                 ),
             )
 

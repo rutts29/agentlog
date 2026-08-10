@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from agentlog.ingest.codex import CodexAdapter
+from agentlog.normalize.models import Harness
 from agentlog.normalize.model_identity import resolve_model_identity
 
 
@@ -14,6 +15,75 @@ def _line(kind: str, payload: dict, ts: str = "2026-06-20T12:00:00Z") -> bytes:
 
 
 class CodexModelIdentityIngestTests(unittest.TestCase):
+    def test_t3code_originator_keeps_harness_separate_from_execution_identity(self) -> None:
+        data = b"".join(
+            [
+                _line(
+                    "session_meta",
+                    {
+                        "id": "t3-root",
+                        "originator": "t3code_desktop",
+                        "model_provider": "openai",
+                    },
+                ),
+                _line(
+                    "turn_context",
+                    {"model": "gpt-5.6-terra", "effort": "high"},
+                    ts="2026-06-20T12:00:01Z",
+                ),
+                _line(
+                    "event_msg",
+                    {"type": "user_message", "message": "root request"},
+                    ts="2026-06-20T12:00:01Z",
+                ),
+                _line(
+                    "event_msg",
+                    {"type": "agent_message", "message": "worker done"},
+                    ts="2026-06-20T12:00:02Z",
+                ),
+            ]
+        )
+        result = CodexAdapter().parse_chunk(
+            Path("/tmp/t3code-root.jsonl"), data, start_offset=0
+        )
+        self.assertEqual(result.session.harness, Harness.CODEX)
+        self.assertEqual(result.session.provider, "openai")
+        self.assertIsNone(result.session.agent_profile)
+        self.assertEqual(result.session.model, "gpt-5.6-terra")
+        self.assertEqual(result.extras["originator"], "t3code_desktop")
+        self.assertFalse(result.messages[0].authored_by_agent)
+
+    def test_t3code_worker_brief_is_agent_authored_without_role_metadata(self) -> None:
+        data = b"".join(
+            [
+                _line(
+                    "session_meta",
+                    {
+                        "id": "worker-1",
+                        "originator": "t3code_desktop",
+                        "thread_source": "subagent",
+                        "source": {
+                            "subagent": {
+                                "thread_spawn": {
+                                    "agent_nickname": "Bacon",
+                                }
+                            }
+                        },
+                    },
+                ),
+                _line(
+                    "event_msg",
+                    {"type": "user_message", "message": "inspect this slice"},
+                    ts="2026-06-20T12:00:01Z",
+                ),
+            ]
+        )
+        result = CodexAdapter().parse_chunk(
+            Path("/tmp/t3code-worker.jsonl"), data, start_offset=0
+        )
+        self.assertTrue(result.messages[0].authored_by_agent)
+        self.assertEqual(result.session.agent_profile, "Bacon")
+
     def test_model_provider_not_used_as_model(self) -> None:
         data = b"".join(
             [

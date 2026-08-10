@@ -24,6 +24,11 @@ from agentlog.normalize.models import (
     TokenUsage,
     ToolEvent,
 )
+from agentlog.normalize.synthetic import (
+    flag_synthetic_user_messages,
+    synthetic_skill_exposures,
+)
+from agentlog.normalize.tool_ops import classify_operation
 
 log = logging.getLogger("agentlog.ingest.hermes")
 
@@ -205,6 +210,7 @@ class HermesAdapter(TranscriptAdapter):
                             message_seq=msg_seq,
                             tool_name=_tool_name(call),
                             action="call",
+                            operation_kind=classify_operation(_tool_name(call)),
                         )
                     )
                 if role == "tool":
@@ -215,6 +221,9 @@ class HermesAdapter(TranscriptAdapter):
                             message_seq=msg_seq,
                             tool_name=str(row["tool_name"] or "tool"),
                             action="result",
+                            operation_kind=classify_operation(
+                                str(row["tool_name"] or "tool")
+                            ),
                         )
                     )
 
@@ -305,6 +314,9 @@ class HermesAdapter(TranscriptAdapter):
                     bytes_consumed=size,
                 )
             )
+        for result in results:
+            flag_synthetic_user_messages(result.messages)
+            result.skill_exposures.extend(synthetic_skill_exposures(result.messages))
         return results
 
     def _parse_kanban_db(self, conn, path: Path, size: int) -> list[ParseResult]:
@@ -441,4 +453,7 @@ class HermesAdapter(TranscriptAdapter):
                     extras={"kanban_status": task["status"], "board": board},
                 )
             )
+        for result in results:
+            flag_synthetic_user_messages(result.messages)
+            result.skill_exposures.extend(synthetic_skill_exposures(result.messages))
         return results

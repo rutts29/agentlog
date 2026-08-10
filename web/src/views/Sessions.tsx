@@ -1,10 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useOutletContext, useSearchParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
-import { fetchFacets, fetchSessions } from "@/lib/api";
+import { fetchFacets, fetchSessions, logicalHarness, runtimeHarness } from "@/lib/api";
 import { PanelCard } from "@/components/ui/card";
 import { EmptyState } from "@/components/EmptyState";
-import { HarnessTag, ModelBadge } from "@/components/ui/badges";
+import { HarnessTag, ModelBadge, RuntimeHarnessLabel } from "@/components/ui/badges";
 import { cn, formatDuration, formatFullTime, harnessColor } from "@/lib/utils";
 import { useViewShortcuts } from "@/lib/keyboard";
 
@@ -279,7 +279,7 @@ export function Sessions() {
                     )}
                     style={
                       selected === i
-                        ? { boxShadow: `inset 2px 0 0 ${harnessColor(s.harness)}` }
+                        ? { boxShadow: `inset 2px 0 0 ${harnessColor(logicalHarness(s))}` }
                         : undefined
                     }
                   >
@@ -293,10 +293,20 @@ export function Sessions() {
                       </Link>
                     </td>
                     <td className="py-1.5">
-                      <HarnessTag harness={s.harness} />
+                      <div className="flex flex-col items-start gap-1">
+                        <HarnessTag harness={logicalHarness(s)} />
+                        <RuntimeHarnessLabel
+                          logicalHarness={logicalHarness(s)}
+                          runtimeHarness={runtimeHarness(s)}
+                        />
+                      </div>
                     </td>
                     <td className="max-w-[220px] py-1.5 pr-2">
-                      <ModelBadge model={s.model} harness={s.harness} effort={s.effort} />
+                      <ModelBadge
+                        model={s.model}
+                        harness={runtimeHarness(s)}
+                        effort={s.effort}
+                      />
                     </td>
                     <td className="max-w-[160px] truncate py-1.5 pr-2 text-muted-foreground">
                       {s.project}

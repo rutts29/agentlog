@@ -103,10 +103,56 @@ def _has_link_status(conn: sqlite3.Connection) -> bool:
     }
 
 
+def _logical_metric_session_ids(
+    conn: sqlite3.Connection, tr: TimeRange
+) -> tuple[list[str], dict[str, str]]:
+    from agentlog.api.identity_aggregates import visible_logical_sessions
+
+    where, params = session_time_clause(tr)
+    physical_rows = conn.execute(
+        f"SELECT s.id AS id, s.harness AS harness FROM sessions s WHERE {where}",
+        params,
+    ).fetchall()
+    visible = visible_logical_sessions(conn, physical_rows)
+    metric_to_logical = {
+        item.metric_session_id: item.session_id for item in visible
+    }
+    return sorted(metric_to_logical), metric_to_logical
+
+
+def _label_window_rows(
+    rows: list[sqlite3.Row], metric_to_logical: dict[str, str]
+) -> list[dict[str, Any]]:
+    labeled: list[dict[str, Any]] = []
+    for row in rows:
+        physical_id = str(row["session_id"])
+        item = dict(row)
+        item["physical_session_id"] = physical_id
+        item["transcript_session_id"] = physical_id
+        item["session_id"] = metric_to_logical.get(physical_id, physical_id)
+        labeled.append(item)
+    return labeled
+
+
+def _window_session_clause(
+    session_ids: list[str], params: dict[str, Any]
+) -> str:
+    names = []
+    for index, session_id in enumerate(session_ids):
+        name = f"logical_session_{index}"
+        params[name] = session_id
+        names.append(f":{name}")
+    return f"w.session_id IN ({', '.join(names)})"
+
+
 def eligible_windows(
     conn: sqlite3.Connection, tr: TimeRange, *, model: str | None = None
 ) -> list[sqlite3.Row]:
-    where, params = session_time_clause(tr)
+    session_ids, metric_to_logical = _logical_metric_session_ids(conn, tr)
+    if not session_ids:
+        return []
+    params: dict[str, Any] = {}
+    session_clause = _window_session_clause(session_ids, params)
     model_clause = ""
     if model is not None:
         params = {**params, "model": model}
@@ -114,17 +160,18 @@ def eligible_windows(
             "AND "
             f"{strict_message_model_sql(message_alias='response')} = :model"
         )
-    return conn.execute(
+    rows = conn.execute(
         f"""
         SELECT w.id AS window_id, w.session_id AS session_id
         FROM exchange_windows w
         JOIN sessions s ON s.id = w.session_id
         JOIN messages response ON response.id = w.response_message_id
         JOIN window_det_classifications d ON d.window_id = w.id
-        WHERE {where} AND {_eligible_clause()} {model_clause}
+        WHERE {session_clause} AND {_eligible_clause()} {model_clause}
         """,
         params,
     ).fetchall()
+    return _label_window_rows(rows, metric_to_logical)
 
 
 def observed_windows(
@@ -134,8 +181,11 @@ def observed_windows(
     *,
     model: str | None = None,
 ) -> list[sqlite3.Row]:
-    where, params = session_time_clause(tr)
-    params = {**params, "run_id": run_id}
+    session_ids, metric_to_logical = _logical_metric_session_ids(conn, tr)
+    if not session_ids:
+        return []
+    params: dict[str, Any] = {"run_id": run_id}
+    session_clause = _window_session_clause(session_ids, params)
     model_clause = ""
     if model is not None:
         params = {**params, "model": model}
@@ -144,7 +194,7 @@ def observed_windows(
             f"{strict_message_model_sql(message_alias='response')} = :model"
         )
     link_clause = "AND u.link_status = 'linked'" if _has_link_status(conn) else ""
-    return conn.execute(
+    rows = conn.execute(
         f"""
         SELECT
             u.window_id AS window_id,
@@ -159,13 +209,14 @@ def observed_windows(
         JOIN messages response ON response.id = w.response_message_id
         JOIN window_det_classifications d ON d.window_id = u.window_id
         WHERE u.run_id = :run_id
-          AND {where}
+          AND {session_clause}
           AND {_eligible_clause()}
           {link_clause}
           {model_clause}
         """,
         params,
     ).fetchall()
+    return _label_window_rows(rows, metric_to_logical)
 
 
 def _coverage_payload(observed: int, eligible: int, hits: int = 0) -> dict[str, Any]:

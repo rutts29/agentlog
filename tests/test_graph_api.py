@@ -182,6 +182,99 @@ class GraphApiTests(unittest.TestCase):
         self.assertEqual(body["counts"]["sessions"], 0)
         self.assertEqual(body["nodes"], [])
 
+    def test_linked_t3_root_rewires_backing_without_hiding_workers(self) -> None:
+        conn = connect(self.path)
+        conn.executescript(
+            """
+            INSERT INTO sessions
+              (id, harness, external_id, parent_session_id, started_at, ended_at,
+               cwd, model, model_canonical)
+            VALUES
+              ('t3code:root', 't3code', 'root', NULL,
+               '2026-07-01T00:00:00+00:00', '2026-07-01T00:10:00+00:00',
+               '/tmp/alpha', 't3-model', 't3-model'),
+              ('codex:backing', 'codex', 'backing', NULL,
+               '2026-07-01T00:00:01+00:00', '2026-07-01T00:09:00+00:00',
+               '/tmp/alpha', 'backing-model', 'backing-model'),
+              ('codex:worker', 'codex', 'worker', 'backing',
+               '2026-07-01T00:02:00+00:00', '2026-07-01T00:08:00+00:00',
+               '/tmp/alpha', 'worker-model', 'worker-model'),
+              ('codex:grandchild', 'codex', 'grandchild', 'worker',
+               '2026-07-01T00:03:00+00:00', '2026-07-01T00:07:00+00:00',
+               '/tmp/alpha', 'grandchild-model', 'grandchild-model'),
+              ('codex:link-worker', 'codex', 'link-worker', NULL,
+               '2026-07-01T00:04:00+00:00', '2026-07-01T00:06:00+00:00',
+               '/tmp/alpha', 'link-model', 'link-model');
+
+            INSERT INTO messages
+              (id, session_id, seq, role, text, model_canonical)
+            VALUES
+              ('t3-g-u', 't3code:root', 1, 'user', 'orchestrate', 't3-model'),
+              ('back-g-u', 'codex:backing', 1, 'user', 'request', 'backing-model'),
+              ('back-g-a', 'codex:backing', 2, 'assistant', 'response', 'backing-model');
+
+            INSERT INTO tool_events
+              (id, session_id, message_id, seq, tool_name, action)
+            VALUES ('back-g-tool', 'codex:backing', 'back-g-a', 1, 'exec', 'call');
+
+            INSERT INTO session_links
+              (source_session_id, target_session_id, link_type,
+               target_harness, target_external_id, link_role,
+               confidence, evidence_json)
+            VALUES ('t3code:root', 'codex:backing', 'provider_backing',
+                    'codex', 'backing', 'root', 'observed', '{}'),
+                   ('t3code:root', 'codex:link-worker', 'provider_backing',
+                    'codex', 'link-worker', 'worker', 'observed', '{}');
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        body = self._get()
+        sessions = {
+            node["id"]: node
+            for node in body["nodes"]
+            if node["kind"] == "session"
+        }
+        self.assertNotIn("codex:backing", sessions)
+        root = sessions["t3code:root"]
+        self.assertEqual(root["harness"], "t3code")
+        self.assertEqual(root["logical_harness"], "t3code")
+        self.assertEqual(root["runtime_harness"], "codex")
+        self.assertEqual(root["orchestrator_session_id"], "t3code:root")
+        self.assertEqual(root["transcript_session_id"], "codex:backing")
+        self.assertEqual(root["model"], "backing-model")
+        self.assertEqual(root["messages"], 2)
+        self.assertEqual(root["tools"], 1)
+        self.assertEqual(root["children"], 2)
+
+        worker = sessions["codex:worker"]
+        self.assertEqual(worker["harness"], "codex")
+        self.assertEqual(worker["logical_harness"], "t3code")
+        self.assertEqual(worker["runtime_harness"], "codex")
+        self.assertEqual(worker["orchestrator_session_id"], "t3code:root")
+        self.assertEqual(worker["parent_id"], "t3code:root")
+        self.assertEqual(sessions["codex:grandchild"]["parent_id"], "codex:worker")
+        link_worker = sessions["codex:link-worker"]
+        self.assertEqual(link_worker["logical_harness"], "t3code")
+        self.assertEqual(link_worker["parent_id"], "t3code:root")
+
+        orchestration = {
+            (edge["source"], edge["target"])
+            for edge in body["edges"]
+            if edge["kind"] == "orchestration"
+        }
+        self.assertIn(("t3code:root", "codex:worker"), orchestration)
+        self.assertIn(("codex:worker", "codex:grandchild"), orchestration)
+        self.assertIn(("t3code:root", "codex:link-worker"), orchestration)
+        self.assertFalse(any("codex:backing" in edge for edge in orchestration))
+        self.assertEqual(body["counts"]["sessions"], 8)
+
+        alpha = next(node for node in body["nodes"] if node["id"] == "repo:alpha")
+        self.assertEqual(alpha["sessions"], 7)
+        self.assertEqual(alpha["messages"], 5)
+        self.assertEqual(alpha["tools"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

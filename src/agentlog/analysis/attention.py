@@ -78,6 +78,7 @@ class AttentionItem:
     reason: str
     last_activity_at: str | None
     harness: str | None = None
+    runtime_harness: str | None = None
     lane: Lane = "urgent"
     repo: str | None = None
     branch: str | None = None
@@ -90,6 +91,7 @@ class AttentionItem:
             "reason": self.reason,
             "last_activity_at": self.last_activity_at,
             "harness": self.harness,
+            "runtime_harness": self.runtime_harness,
             "lane": self.lane,
             "repo": self.repo,
             "branch": self.branch,
@@ -125,6 +127,7 @@ class _Candidate:
     last_activity_at: datetime | None
     harness: str | None
     lane: Lane
+    runtime_harness: str | None = None
     repo: str | None = None
     branch: str | None = None
     rank: int = field(init=False)
@@ -216,6 +219,7 @@ def _session_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
         conn.execute(
             """
             SELECT
+                s.id AS id,
                 s.id AS session_id,
                 s.harness AS harness,
                 s.started_at AS started_at,
@@ -251,6 +255,53 @@ def _session_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
             FROM sessions s
             """
         )
+    )
+
+
+def _logical_attention_rows(
+    conn: sqlite3.Connection,
+    rows: list[sqlite3.Row],
+) -> tuple[
+    list[dict[str, Any]],
+    dict[str, str],
+    dict[str, str],
+    dict[str, str],
+    dict[str, str],
+]:
+    """Project physical sessions onto the inbox's logical navigation grain."""
+    from agentlog.api.identity_aggregates import visible_logical_sessions
+
+    visible = visible_logical_sessions(conn, rows)
+    physical = {str(row["id"]): row for row in rows}
+    projected: list[dict[str, Any]] = []
+    display_by_physical: dict[str, str] = {}
+    harness_by_display: dict[str, str] = {}
+    runtime_harness_by_display: dict[str, str] = {}
+    metric_by_display: dict[str, str] = {}
+    for item in visible:
+        metric_id = item.metric_session_id
+        metric_row = physical.get(metric_id) or physical.get(item.session_id)
+        if metric_row is None:
+            continue
+        display_id = item.session_id
+        row = dict(metric_row)
+        row["id"] = display_id
+        row["session_id"] = display_id
+        row["harness"] = item.logical_harness
+        row["runtime_harness"] = item.runtime_harness
+        row["metric_session_id"] = metric_id
+        projected.append(row)
+        display_by_physical[item.session_id] = display_id
+        display_by_physical[metric_id] = display_id
+        harness_by_display[display_id] = item.logical_harness
+        runtime_harness_by_display[display_id] = item.runtime_harness
+        metric_by_display[display_id] = metric_id
+    return (
+        projected,
+        display_by_physical,
+        harness_by_display,
+        runtime_harness_by_display,
+        metric_by_display,
     )
 
 
@@ -407,6 +458,44 @@ def _load_presence_by_session(
     return out
 
 
+def _logical_presence(
+    raw_presence: dict[str, dict[str, Any]],
+    display_by_physical: dict[str, str],
+    harness_by_display: dict[str, str],
+    runtime_harness_by_display: dict[str, str],
+) -> dict[str, dict[str, Any]]:
+    state_rank = {
+        "waiting": 3,
+        "tool_running": 2,
+        "streaming": 1,
+    }
+    out: dict[str, dict[str, Any]] = {}
+    for physical_id, raw in raw_presence.items():
+        display_id = display_by_physical.get(physical_id, physical_id)
+        entry = dict(raw)
+        entry["session_id"] = display_id
+        logical_harness = harness_by_display.get(display_id)
+        if logical_harness:
+            entry["harness"] = logical_harness
+        runtime_harness = runtime_harness_by_display.get(display_id)
+        if runtime_harness:
+            entry["runtime_harness"] = runtime_harness
+        previous = out.get(display_id)
+        if previous is None:
+            out[display_id] = entry
+            continue
+        old_state = state_rank.get(str(previous.get("state") or ""), 0)
+        new_state = state_rank.get(str(entry.get("state") or ""), 0)
+        old_at = _parse_ts(previous.get("last_activity_at"))
+        new_at = _parse_ts(entry.get("last_activity_at"))
+        if (new_state, new_at or datetime.min.replace(tzinfo=timezone.utc)) > (
+            old_state,
+            old_at or datetime.min.replace(tzinfo=timezone.utc),
+        ):
+            out[display_id] = entry
+    return out
+
+
 def _candidate_to_item(c: _Candidate) -> AttentionItem:
     return AttentionItem(
         session_id=c.session_id,
@@ -415,6 +504,7 @@ def _candidate_to_item(c: _Candidate) -> AttentionItem:
         reason=c.reason,
         last_activity_at=c.last_activity_at.isoformat() if c.last_activity_at else None,
         harness=c.harness,
+        runtime_harness=c.runtime_harness,
         lane=c.lane,
         repo=c.repo,
         branch=c.branch,
@@ -466,9 +556,21 @@ def derive_attention(
     resumable_max = timedelta(days=thresholds.resumable_max_days)
     recent_error_delta = timedelta(minutes=thresholds.recent_error_minutes)
 
-    rows = _session_rows(conn)
+    physical_rows = _session_rows(conn)
+    (
+        rows,
+        display_by_physical,
+        harness_by_display,
+        runtime_harness_by_display,
+        metric_by_display,
+    ) = _logical_attention_rows(conn, physical_rows)
     successors = _build_successor_index(rows)
-    presence = _load_presence_by_session(conn, presence_path=presence_path)
+    presence = _logical_presence(
+        _load_presence_by_session(conn, presence_path=presence_path),
+        display_by_physical,
+        harness_by_display,
+        runtime_harness_by_display,
+    )
 
     stats = AttentionStats()
     per_session: dict[str, list[_Candidate]] = {}
@@ -480,7 +582,11 @@ def derive_attention(
     # Live presence signals (highest priority).
     for sid, entry in presence.items():
         pstate = str(entry.get("state") or "unknown")
-        harness = entry.get("harness")
+        harness = harness_by_display.get(sid) or entry.get("harness")
+        runtime_harness = runtime_harness_by_display.get(sid) or entry.get(
+            "runtime_harness"
+        )
+        metric_session_id = metric_by_display.get(sid, sid)
         last_at = _parse_ts(entry.get("last_activity_at")) or now
         repo = entry.get("repo")
         if pstate == "waiting":
@@ -501,12 +607,15 @@ def derive_attention(
                     ),
                     last_activity_at=last_at,
                     harness=str(harness) if harness else None,
+                    runtime_harness=(
+                        str(runtime_harness) if runtime_harness else None
+                    ),
                     lane="urgent",
                     repo=str(repo) if repo else None,
                 )
             )
         recent_fails = _recent_known_failures(
-            conn, sid, since=now - recent_error_delta
+            conn, metric_session_id, since=now - recent_error_delta
         )
         if recent_fails and pstate in {"streaming", "tool_running", "waiting", "unknown"}:
             names = ", ".join(recent_fails[:3])
@@ -521,6 +630,9 @@ def derive_attention(
                     ),
                     last_activity_at=last_at,
                     harness=str(harness) if harness else None,
+                    runtime_harness=(
+                        str(runtime_harness) if runtime_harness else None
+                    ),
                     lane="urgent",
                     repo=str(repo) if repo else None,
                 )
@@ -528,7 +640,9 @@ def derive_attention(
 
     for row in rows:
         session_id = str(row["session_id"])
+        metric_session_id = str(row.get("metric_session_id") or session_id)
         harness = row["harness"]
+        runtime_harness = row.get("runtime_harness")
         repo = row["repo"]
         branch = row["branch"]
         last_at = _last_activity(row)
@@ -578,6 +692,7 @@ def derive_attention(
                         ),
                         last_activity_at=last_at,
                         harness=harness,
+                        runtime_harness=runtime_harness,
                         lane="resumable",
                         repo=repo,
                         branch=branch,
@@ -598,6 +713,7 @@ def derive_attention(
                             ),
                             last_activity_at=last_at,
                             harness=harness,
+                            runtime_harness=runtime_harness,
                             lane="urgent",
                             repo=repo,
                             branch=branch,
@@ -622,13 +738,14 @@ def derive_attention(
                             ),
                             last_activity_at=last_at,
                             harness=harness,
+                            runtime_harness=runtime_harness,
                             lane="urgent",
                             repo=repo,
                             branch=branch,
                         )
                     )
 
-        streak = _trailing_known_error_streak(conn, session_id)
+        streak = _trailing_known_error_streak(conn, metric_session_id)
         if len(streak) >= thresholds.error_streak_n:
             if superseded:
                 stats.candidates += 1
@@ -651,6 +768,7 @@ def derive_attention(
                         ),
                         last_activity_at=last_at,
                         harness=harness,
+                        runtime_harness=runtime_harness,
                         lane="urgent",
                         repo=repo,
                         branch=branch,
@@ -679,6 +797,7 @@ def derive_attention(
                         ),
                         last_activity_at=last_at,
                         harness=harness,
+                        runtime_harness=runtime_harness,
                         lane="urgent",
                         repo=repo,
                         branch=branch,

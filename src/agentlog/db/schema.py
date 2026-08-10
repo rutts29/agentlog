@@ -69,6 +69,7 @@ CREATE TABLE IF NOT EXISTS tool_events (
     action TEXT NOT NULL,
     success INTEGER,
     duration_ms INTEGER,
+    operation_kind TEXT NOT NULL DEFAULT 'unknown',
     UNIQUE (session_id, seq)
 );
 

@@ -1,12 +1,17 @@
 import { Link, useOutletContext, useParams, useSearchParams } from "react-router-dom";
 import { useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { fetchSessionDetail, type TimelineMessage } from "@/lib/api";
+import {
+  fetchSessionDetail,
+  logicalHarness,
+  runtimeHarness,
+  type TimelineMessage,
+} from "@/lib/api";
 import { CopyPath } from "@/components/CopyPath";
 import { EmptyState } from "@/components/EmptyState";
 import { Transcript } from "@/components/Transcript";
 import { Card, CardTitle, PanelCard } from "@/components/ui/card";
-import { HarnessTag, ModelBadge } from "@/components/ui/badges";
+import { HarnessTag, ModelBadge, RuntimeHarnessLabel } from "@/components/ui/badges";
 import { classifySpeaker, SPEAKER_LEGEND, type SpeakerKind } from "@/lib/speaker";
 import { formatDuration, formatDayTime, harnessColor } from "@/lib/utils";
 
@@ -84,6 +89,10 @@ export function SessionDetail() {
   }
 
   const { session, timeline, anatomy, children, skills } = q.data;
+  const transcriptId = session.transcript_session_id ?? q.data.transcript?.id ?? session.id;
+  const orchestratorId = session.orchestrator_session_id;
+  const isBackingSession = Boolean(orchestratorId && orchestratorId !== session.id);
+  const hasSeparateBackingTranscript = transcriptId !== session.id;
   const backSearch = (() => {
     const p = new URLSearchParams(params);
     p.delete("msg");
@@ -104,10 +113,14 @@ export function SessionDetail() {
           <h1 className="font-mono text-[15px] font-semibold tracking-tight">
             {session.id}
           </h1>
-          <HarnessTag harness={session.harness} />
+          <HarnessTag harness={logicalHarness(session)} />
+          <RuntimeHarnessLabel
+            logicalHarness={logicalHarness(session)}
+            runtimeHarness={runtimeHarness(session)}
+          />
           <ModelBadge
             model={session.model}
-            harness={session.harness}
+            harness={runtimeHarness(session)}
             effort={session.effort}
           />
         </div>
@@ -303,11 +316,17 @@ export function SessionDetail() {
                       <span
                         aria-hidden
                         className="inline-block h-[5px] w-[5px] shrink-0 rounded-full"
-                        style={{ background: harnessColor(c.harness) }}
+                        style={{ background: harnessColor(logicalHarness(c)) }}
                       />
                       <span className="min-w-0 truncate font-mono text-muted-foreground">
                         {c.id}
                       </span>
+                      <HarnessTag harness={logicalHarness(c)} muted className="shrink-0" />
+                      <RuntimeHarnessLabel
+                        logicalHarness={logicalHarness(c)}
+                        runtimeHarness={runtimeHarness(c)}
+                        className="shrink-0"
+                      />
                       <span className="tabular ml-auto shrink-0 text-faint-foreground">
                         {c.message_count} msgs
                       </span>
@@ -326,8 +345,51 @@ export function SessionDetail() {
 
           <Card>
             <CardTitle>Source</CardTitle>
-            <div className="mt-2">
-              <CopyPath path={session.artifact_path} />
+            <div className="mt-2 space-y-2">
+              {isBackingSession ? (
+                <div>
+                  <div className="microlabel text-[10px] text-faint-foreground">
+                    Orchestrator session
+                  </div>
+                  <Link
+                    to={`/sessions/${encodeURIComponent(orchestratorId!)}?${backSearch}`}
+                    className="mt-1 block font-mono text-[11px] text-muted-foreground hover:text-foreground"
+                  >
+                    {orchestratorId}
+                  </Link>
+                </div>
+              ) : null}
+              <div>
+                <div className="microlabel text-[10px] text-faint-foreground">
+                  {isBackingSession
+                    ? "Backing transcript"
+                    : hasSeparateBackingTranscript
+                      ? "Orchestrator session"
+                      : "Session source"}
+                </div>
+                <div className="mt-1 font-mono text-[11px] text-muted-foreground">
+                  {session.id}
+                </div>
+                <div className="mt-1">
+                  <CopyPath path={session.artifact_path} />
+                </div>
+              </div>
+              {!isBackingSession && hasSeparateBackingTranscript ? (
+                <div className="border-t border-border-faint pt-2">
+                  <div className="microlabel text-[10px] text-faint-foreground">
+                    Backing transcript
+                  </div>
+                  <Link
+                    to={`/sessions/${encodeURIComponent(transcriptId)}?${backSearch}`}
+                    className="mt-1 block font-mono text-[11px] text-muted-foreground hover:text-foreground"
+                  >
+                    {transcriptId}
+                  </Link>
+                  <div className="mt-1">
+                    <CopyPath path={q.data.transcript?.artifact_path} />
+                  </div>
+                </div>
+              ) : null}
             </div>
             {session.cwd ? (
               <div className="mt-2 break-all font-mono text-[10px] leading-[1.4] text-faint-foreground">

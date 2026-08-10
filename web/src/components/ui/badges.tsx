@@ -1,5 +1,24 @@
 import { harnessColor, shortModel, cn } from "@/lib/utils";
 
+export function harnessDisplayName(harness: string): string {
+  switch (harness.toLowerCase()) {
+    case "t3code":
+      return "T3 Code";
+    case "codex":
+      return "Codex";
+    case "claude":
+      return "Claude Code";
+    case "cursor":
+      return "Cursor";
+    case "warp":
+      return "Warp";
+    case "hermes":
+      return "Hermes";
+    default:
+      return harness || "other";
+  }
+}
+
 /** Harness identity: 6px dot + lowercase name in the harness hue. */
 export function HarnessTag({
   harness,
@@ -24,7 +43,26 @@ export function HarnessTag({
         className="inline-block h-[6px] w-[6px] shrink-0 rounded-full"
         style={{ background: color }}
       />
-      {harness || "other"}
+      {harnessDisplayName(harness)}
+    </span>
+  );
+}
+
+export function RuntimeHarnessLabel({
+  logicalHarness,
+  runtimeHarness,
+  className,
+}: {
+  logicalHarness: string;
+  runtimeHarness: string;
+  className?: string;
+}) {
+  if (!runtimeHarness || logicalHarness.toLowerCase() === runtimeHarness.toLowerCase()) {
+    return null;
+  }
+  return (
+    <span className={cn("text-[10px] text-faint-foreground", className)}>
+      runs on {harnessDisplayName(runtimeHarness)}
     </span>
   );
 }

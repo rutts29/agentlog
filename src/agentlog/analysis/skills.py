@@ -18,6 +18,12 @@ from typing import Any, Iterable
 
 import xxhash
 
+from agentlog.session_identity import (
+    build_identity_context,
+    logical_projection,
+    provider_root_shadow_ids,
+)
+
 DEFAULT_MIN_SESSIONS = 5
 CONTENT_STORE_CAP = 512_000
 
@@ -781,11 +787,19 @@ def _rate_payload(
 
 
 def _session_outcomes(
-    conn: sqlite3.Connection, session_ids: list[str]
+    conn: sqlite3.Connection,
+    session_ids: list[str],
+    *,
+    metric_session_ids: dict[str, str] | None = None,
 ) -> dict[str, dict[str, Any]]:
     if not session_ids:
         return {}
-    placeholders = ",".join("?" for _ in session_ids)
+    metrics = {
+        session_id: (metric_session_ids or {}).get(session_id, session_id)
+        for session_id in session_ids
+    }
+    source_ids = sorted(set(metrics.values()))
+    placeholders = ",".join("?" for _ in source_ids)
     sessions = {
         str(r["id"]): dict(r)
         for r in conn.execute(
@@ -793,7 +807,7 @@ def _session_outcomes(
             SELECT id, started_at, ended_at FROM sessions
             WHERE id IN ({placeholders})
             """,
-            session_ids,
+            source_ids,
         ).fetchall()
     }
     msg_counts = {
@@ -804,7 +818,7 @@ def _session_outcomes(
             WHERE session_id IN ({placeholders})
             GROUP BY session_id
             """,
-            session_ids,
+            source_ids,
         ).fetchall()
     }
     tool_fail = {
@@ -815,7 +829,7 @@ def _session_outcomes(
             WHERE session_id IN ({placeholders}) AND success = 0
             GROUP BY session_id
             """,
-            session_ids,
+            source_ids,
         ).fetchall()
     }
     window_totals = {
@@ -826,7 +840,7 @@ def _session_outcomes(
             WHERE session_id IN ({placeholders})
             GROUP BY session_id
             """,
-            session_ids,
+            source_ids,
         ).fetchall()
     }
     ux_rows = conn.execute(
@@ -837,10 +851,10 @@ def _session_outcomes(
         JOIN ux_observations u ON u.window_id = w.id
         WHERE w.session_id IN ({placeholders})
         """,
-        session_ids,
+        source_ids,
     ).fetchall()
-    ux_by_session: dict[str, list[Any]] = {sid: [] for sid in session_ids}
-    labeled_windows: dict[str, set[str]] = {sid: set() for sid in session_ids}
+    ux_by_session: dict[str, list[Any]] = {sid: [] for sid in source_ids}
+    labeled_windows: dict[str, set[str]] = {sid: set() for sid in source_ids}
     for r in ux_rows:
         sid = str(r["session_id"])
         labeled_windows[sid].add(str(r["window_id"]))
@@ -848,22 +862,23 @@ def _session_outcomes(
 
     out: dict[str, dict[str, Any]] = {}
     for sid in session_ids:
-        s = sessions.get(sid, {})
+        metric_session_id = metrics[sid]
+        s = sessions.get(metric_session_id, {})
         kinds: set[str] = set()
         flag_redirect = False
-        for u in ux_by_session.get(sid, []):
+        for u in ux_by_session.get(metric_session_id, []):
             kinds |= _turn_kinds(u["turn_kinds_json"])
             flags = _flags(u["flags_json"])
             if flags.get("redirect_brake") or flags.get("had_redirect_brake"):
                 flag_redirect = True
-        windows_total = window_totals.get(sid, 0)
-        windows_labeled = len(labeled_windows.get(sid, set()))
+        windows_total = window_totals.get(metric_session_id, 0)
+        windows_labeled = len(labeled_windows.get(metric_session_id, set()))
         out[sid] = {
             "duration_seconds": _duration_seconds(
                 s.get("started_at"), s.get("ended_at")
             ),
-            "message_count": msg_counts.get(sid, 0),
-            "tool_failure_count": tool_fail.get(sid, 0),
+            "message_count": msg_counts.get(metric_session_id, 0),
+            "tool_failure_count": tool_fail.get(metric_session_id, 0),
             "windows_total": windows_total,
             "windows_labeled": windows_labeled,
             "has_redirect_or_brake": (
@@ -1049,6 +1064,29 @@ def _exposure_index(
         clauses.append("COALESCE(s.started_at, '') < ?")
         params.append(end_iso)
     where = " AND ".join(clauses)
+    identity = build_identity_context(conn)
+    shadow_ids = provider_root_shadow_ids(conn, context=identity)
+    bindings: dict[str, str] = {}
+    session_rows = conn.execute(
+        f"""
+        SELECT s.id, s.harness
+        FROM sessions s
+        WHERE {where}
+        """,
+        params,
+    ).fetchall()
+    for session in session_rows:
+        session_id = str(session["id"])
+        if session_id in shadow_ids:
+            continue
+        projection = logical_projection(
+            conn,
+            session_id,
+            str(session["harness"]),
+            context=identity,
+        )
+        metric_session_id = str(projection["transcript_session_id"] or session_id)
+        bindings[metric_session_id] = session_id
     rows = conn.execute(
         f"""
         SELECT se.skill_name, se.session_id, s.started_at
@@ -1060,13 +1098,23 @@ def _exposure_index(
     ).fetchall()
     out: dict[str, dict[str, Any]] = {}
     for r in rows:
+        metric_session_id = str(r["session_id"])
+        logical_session_id = bindings.get(metric_session_id)
+        if logical_session_id is None:
+            continue
         name = str(r["skill_name"])
         bucket = out.setdefault(
             name,
-            {"session_ids": set(), "exposure_count": 0, "last_fired": None},
+            {
+                "session_ids": set(),
+                "metric_session_ids": {},
+                "exposure_count": 0,
+                "last_fired": None,
+            },
         )
         bucket["exposure_count"] += 1
-        bucket["session_ids"].add(str(r["session_id"]))
+        bucket["session_ids"].add(logical_session_id)
+        bucket["metric_session_ids"][logical_session_id] = metric_session_id
         started = r["started_at"]
         if started and (
             bucket["last_fired"] is None or str(started) > str(bucket["last_fired"])
@@ -1077,8 +1125,9 @@ def _exposure_index(
 
 def _match_exposures(
     aliases: set[str], exposure_index: dict[str, dict[str, Any]]
-) -> tuple[set[str], int, str | None, list[str]]:
+) -> tuple[set[str], dict[str, str], int, str | None, list[str]]:
     session_ids: set[str] = set()
+    metric_session_ids: dict[str, str] = {}
     exposure_count = 0
     last_fired: str | None = None
     matched_names: list[str] = []
@@ -1089,12 +1138,19 @@ def _match_exposures(
         }:
             matched_names.append(exp_name)
             session_ids |= set(bucket["session_ids"])
+            metric_session_ids.update(bucket["metric_session_ids"])
             exposure_count += int(bucket["exposure_count"])
             if bucket["last_fired"] and (
                 last_fired is None or str(bucket["last_fired"]) > last_fired
             ):
                 last_fired = str(bucket["last_fired"])
-    return session_ids, exposure_count, last_fired, sorted(set(matched_names))
+    return (
+        session_ids,
+        metric_session_ids,
+        exposure_count,
+        last_fired,
+        sorted(set(matched_names)),
+    )
 
 
 def list_skill_profiles(
@@ -1118,21 +1174,27 @@ def list_skill_profiles(
     items: list[dict[str, Any]] = []
 
     all_session_ids: set[str] = set()
-    pending: list[tuple[dict[str, Any], set[str], int, str | None, list[str]]] = []
+    all_metric_session_ids: dict[str, str] = {}
+    pending: list[
+        tuple[dict[str, Any], set[str], dict[str, str], int, str | None, list[str]]
+    ] = []
     for skill in indexed:
         aliases = skill_aliases(
             str(skill["name"]),
             str(skill["source"]),
             Path(str(skill["source_path"])),
         )
-        session_ids, exposure_count, last_fired, matched = _match_exposures(
+        session_ids, metric_session_ids, exposure_count, last_fired, matched = _match_exposures(
             aliases, exposure_index
         )
         claimed_exposure_names.update(matched)
-        pending.append((skill, session_ids, exposure_count, last_fired, matched))
+        pending.append(
+            (skill, session_ids, metric_session_ids, exposure_count, last_fired, matched)
+        )
         all_session_ids |= session_ids
+        all_metric_session_ids.update(metric_session_ids)
 
-    unmatched_pending: list[tuple[str, set[str], int, str | None]] = []
+    unmatched_pending: list[tuple[str, set[str], dict[str, str], int, str | None]] = []
     if include_unmatched_exposures:
         for exp_name, bucket in exposure_index.items():
             if exp_name in claimed_exposure_names:
@@ -1142,15 +1204,21 @@ def list_skill_profiles(
                 (
                     exp_name,
                     sids,
+                    dict(bucket["metric_session_ids"]),
                     int(bucket["exposure_count"]),
                     bucket["last_fired"],
                 )
             )
             all_session_ids |= sids
+            all_metric_session_ids.update(bucket["metric_session_ids"])
 
-    session_meta = _session_outcomes(conn, sorted(all_session_ids))
+    session_meta = _session_outcomes(
+        conn,
+        sorted(all_session_ids),
+        metric_session_ids=all_metric_session_ids,
+    )
 
-    for skill, session_ids, exposure_count, last_fired, matched in pending:
+    for skill, session_ids, _metric_session_ids, exposure_count, last_fired, matched in pending:
         ordered = sorted(session_ids)
         profile = _aggregate_profile(
             skill_name=str(skill["name"]),
@@ -1184,7 +1252,7 @@ def list_skill_profiles(
             }
         )
 
-    for exp_name, session_ids, exposure_count, last_fired in unmatched_pending:
+    for exp_name, session_ids, _metric_session_ids, exposure_count, last_fired in unmatched_pending:
         ordered = sorted(session_ids)
         profile = _aggregate_profile(
             skill_name=exp_name,
@@ -1286,11 +1354,15 @@ def skill_detail(
         Path(str(skill["source_path"])),
     )
     exposure_index = _exposure_index(conn, start_iso=start_iso, end_iso=end_iso)
-    session_ids, exposure_count, last_fired, matched = _match_exposures(
+    session_ids, metric_session_ids, exposure_count, last_fired, matched = _match_exposures(
         aliases, exposure_index
     )
     ordered = sorted(session_ids)
-    session_meta = _session_outcomes(conn, ordered)
+    session_meta = _session_outcomes(
+        conn,
+        ordered,
+        metric_session_ids=metric_session_ids,
+    )
     profile = _aggregate_profile(
         skill_name=str(skill["name"]),
         session_ids=ordered,
@@ -1304,6 +1376,7 @@ def skill_detail(
         exposure_sessions.append(
             {
                 "session_id": sid,
+                "transcript_session_id": metric_session_ids.get(sid, sid),
                 "started_at": meta.get("started_at"),
                 "ended_at": meta.get("ended_at"),
                 "duration_seconds": meta.get("duration_seconds"),

@@ -18,6 +18,7 @@ import type {
   LiveSession,
   PresenceState,
 } from "@/lib/api";
+import { logicalHarness, runtimeHarness } from "@/lib/api";
 import {
   sessionPresenceKey,
   type PresenceSnapshot,
@@ -39,6 +40,8 @@ type GNode = NodeObject & {
   id: string;
   kind: "session" | "repo";
   harness?: string;
+  logical_harness?: string | null;
+  runtime_harness?: string | null;
   model?: string | null;
   repo?: string;
   started_at?: string | null;
@@ -461,8 +464,9 @@ export function ConstellationGraph({
         node.y = seed.y;
       } else {
         const sess = raw as GraphSessionNode;
-        const seed = seedOfSession(sess.repo, sess.harness);
-        const names = repoHarnesses.get(`repo:${sess.repo}`) ?? [sess.harness];
+        const logical = logicalHarness(sess);
+        const seed = seedOfSession(sess.repo, logical);
+        const names = repoHarnesses.get(`repo:${sess.repo}`) ?? [logical];
         const lobe =
           names.length <= 1
             ? 18 + Math.random() * 28
@@ -543,7 +547,10 @@ export function ConstellationGraph({
         const node = nodeMapRef.current.get(id);
         const t0 = now + i * 60;
         spawnRef.current.set(id, { t0 });
-        ringRef.current.set(id, { t0, color: harnessHex(node?.harness) });
+        ringRef.current.set(id, {
+          t0,
+          color: harnessHex(node ? logicalHarness(node) : undefined),
+        });
         const parent = (node as GraphSessionNode | undefined)?.parent_id;
         if (parent) edgeDrawRef.current.set(`${parent}→${id}`, { t0 });
       });
@@ -600,7 +607,7 @@ export function ConstellationGraph({
     );
     const targetOf = (n: GNode) => {
       if (n.kind === "repo") return seeds.get(n.id) ?? { x: 0, y: 0 };
-      return seedOfSession(n.repo, n.harness);
+      return seedOfSession(n.repo, logicalHarness(n));
     };
     /* Anchors near-pinned; multi-harness sessions pull harder to their lobe. */
     const gravity = (n: GNode) => {
@@ -676,12 +683,13 @@ export function ConstellationGraph({
           for (const n of nodeMapRef.current.values()) {
             if (n.kind === "session" && n.repo === node.label) ego.add(n.id);
           }
-        } else if (node.kind === "session" && node.harness && node.repo) {
+        } else if (node.kind === "session" && node.repo) {
+          const logical = logicalHarness(node);
           for (const n of nodeMapRef.current.values()) {
             if (
               n.kind === "session" &&
               n.repo === node.repo &&
-              n.harness === node.harness
+              logicalHarness(n) === logical
             )
               ego.add(n.id);
           }
@@ -900,7 +908,7 @@ export function ConstellationGraph({
         return;
       }
 
-      const hex = harnessHex(node.harness);
+      const hex = harnessHex(logicalHarness(node));
       const isHover = hoverRef.current?.id === node.id;
       const isSelected = selectedRef.current?.id === node.id;
       const pulse = pulseRef.current.get(node.id);
@@ -1058,7 +1066,7 @@ export function ConstellationGraph({
           x: pt.x,
           y: pt.y,
           harnessGroup:
-            node.kind === "session" ? (node.harness ?? null) : null,
+            node.kind === "session" ? logicalHarness(node) : null,
         });
       } else {
         setHoverTip(null);
@@ -1371,7 +1379,7 @@ export function ConstellationGraph({
           <div className="flex items-center gap-1.5">
             <span
               className="inline-block h-[6px] w-[6px] shrink-0 rounded-full"
-              style={{ background: harnessHex(hoverTip.node.harness) }}
+              style={{ background: harnessHex(logicalHarness(hoverTip.node)) }}
             />
             <span className="truncate font-mono text-[11px] text-foreground">
               {shortModel(hoverTip.node.model)}
@@ -1388,6 +1396,12 @@ export function ConstellationGraph({
               <span className="text-faint-foreground">
                 {" "}
                 · {hoverTip.harnessGroup} group
+              </span>
+            ) : null}
+            {runtimeHarness(hoverTip.node) !== logicalHarness(hoverTip.node) ? (
+              <span className="text-faint-foreground">
+                {" "}
+                · runtime {runtimeHarness(hoverTip.node)}
               </span>
             ) : null}
           </div>
@@ -1446,7 +1460,7 @@ export function ConstellationGraph({
           <div className="flex items-center gap-3 text-[11px]">
             <span
               className="inline-block h-[7px] w-[7px] shrink-0 rounded-full"
-              style={{ background: harnessHex(selSession.harness) }}
+              style={{ background: harnessHex(logicalHarness(selSession)) }}
             />
             <span className="min-w-0 truncate font-mono text-[11px] text-foreground">
               {selSession.id}
@@ -1461,12 +1475,13 @@ export function ConstellationGraph({
             </span>
             <span className="shrink-0 text-muted-foreground">
               {selSession.repo}
-              {selSession.harness ? (
-                <span className="text-faint-foreground">
-                  {" "}
-                  · {selSession.harness}
-                </span>
-              ) : null}
+              <span className="text-faint-foreground">
+                {" "}
+                · {logicalHarness(selSession)}
+                {runtimeHarness(selSession) !== logicalHarness(selSession)
+                  ? ` · runtime ${runtimeHarness(selSession)}`
+                  : ""}
+              </span>
             </span>
             <span className="tabular shrink-0 font-mono text-faint-foreground">
               {formatDayTime(selSession.started_at)} ·{" "}

@@ -39,7 +39,39 @@ export type AggregateCell = {
   bound_version: string;
 };
 
-export type SessionRow = {
+export type ProviderBacking = {
+  target_session_id?: string | null;
+  target_harness?: string | null;
+  target_external_id?: string | null;
+  link_role?: string | null;
+  confidence?: string | number | null;
+  evidence_json?: string | null;
+};
+
+/** Optional identity projection fields added after the physical ledger API. */
+export type SessionIdentityFields = {
+  logical_harness?: string | null;
+  runtime_harness?: string | null;
+  orchestrator_session_id?: string | null;
+  transcript_session_id?: string | null;
+  provider_backings?: ProviderBacking[] | null;
+};
+
+export type SessionIdentityLike = {
+  harness?: string | null;
+  logical_harness?: string | null;
+  runtime_harness?: string | null;
+};
+
+export function logicalHarness(item: SessionIdentityLike): string {
+  return item.logical_harness || item.harness || "other";
+}
+
+export function runtimeHarness(item: SessionIdentityLike): string {
+  return item.runtime_harness || item.harness || logicalHarness(item);
+}
+
+export type SessionRow = SessionIdentityFields & {
   id: string;
   harness: string;
   model: string;
@@ -377,7 +409,7 @@ export type TimelineItem = TimelineMessage | TimelineOrphanTool;
 
 export function fetchSessionDetail(sessionId: string) {
   return getJson<{
-    session: {
+    session: SessionIdentityFields & {
       id: string;
       harness: string;
       model: string | null;
@@ -395,9 +427,15 @@ export function fetchSessionDetail(sessionId: string) {
       artifact_path: string | null;
       external_id: string;
     };
+    transcript?: {
+      id: string;
+      harness: string;
+      artifact_id: number | null;
+      artifact_path: string | null;
+    } | null;
     timeline: TimelineItem[];
     skills: Array<{ skill_name: string; exposure_type: string; c: number }>;
-    children: Array<{
+    children: Array<SessionIdentityFields & {
       id: string;
       harness: string;
       model: string | null;
@@ -460,7 +498,7 @@ export function fetchOrchestration(range: string) {
     supervisor_roots: number;
     child_sessions: number;
     signals: Record<string, number>;
-    items: Array<{
+    items: Array<SessionIdentityFields & {
       id: string;
       harness: string;
       model: string;
@@ -483,7 +521,7 @@ export function fetchSessionTree(sessionId: string) {
   }>(`/api/sessions/${encodeURIComponent(sessionId)}/tree`);
 }
 
-export type TreeNode = {
+export type TreeNode = SessionIdentityFields & {
   id: string;
   harness: string;
   model: string;
@@ -493,6 +531,7 @@ export type TreeNode = {
   ended_at: string | null;
   message_count: number;
   tool_count: number;
+  relationship?: string | null;
   children: TreeNode[];
 };
 
@@ -542,6 +581,8 @@ export type GraphSessionNode = {
   id: string;
   kind: "session";
   harness: string;
+  logical_harness: string;
+  runtime_harness: string;
   model: string | null;
   repo: string;
   started_at: string | null;
@@ -717,15 +758,61 @@ export type IngestEvent = {
 export type InsightCard = {
   id: string;
   kind: "fact" | "coach" | "usage";
+  insight_type: "observed_instance" | "corpus_pattern" | "coach_proposal";
   title: string;
   body: string;
   confidence: "ok" | "insufficient" | "abstain";
+  review_state: string;
   sample_size: number;
+  denominator: number | null;
+  coverage: string | null;
+  supporting_roots: number | null;
+  processed_roots: number | null;
+  eligible_roots: number | null;
+  coverage_state: "partial" | "complete" | null;
+  processing_coverage_state: "partial" | "complete" | null;
+  selection_method: string | null;
+  selection_caveat: string | null;
+  sampling_gate: string | null;
+  proof_capability_by_harness: Record<
+    string,
+    {
+      level: "supported" | "partial" | "absent" | "unknown";
+      processed_roots: number | null;
+      eligible_roots: number | null;
+      proof_capable_roots: number | null;
+      levels: Record<string, number> | null;
+      capability: string | null;
+      capability_complete: boolean | null;
+    }
+  > | null;
+  proof_capability_caveat: string | null;
   does_not_prove: string;
   theme: string | null;
   source: "claim" | "proposal";
   source_id: string;
   origin: "session" | "corpus" | "proposal";
+  evidence_count: number;
+  provenance: {
+    derivation: string | null;
+    extractor: string | null;
+    extractor_version: string | null;
+    run_id: string | null;
+    model: string | null;
+    source: string | null;
+    catalog_id: string | null;
+    review_id: string | null;
+    synthesis_model: string | null;
+    synthesis_provider: string | null;
+    synthesis_worker_id: string | null;
+    review_model: string | null;
+    review_provider: string | null;
+    review_worker_id: string | null;
+    materializer_version: string | null;
+    source_packet_ids: string[];
+    source_result_ids: string[];
+    review_state: string;
+  };
   suggested_instruction?: string | null;
   href?: string | null;
 };
@@ -900,6 +987,7 @@ export type ProposalClaim = {
   kind: string;
   subject: string;
   predicate: string;
+  value?: Record<string, unknown>;
   derivation: string;
   support_status: string;
   sample_size: number;
@@ -917,6 +1005,39 @@ export type ProposalSupport = {
   denominator: number | null;
   evidence_count: number;
   language: string;
+  n: number;
+  processed: number | null;
+  eligible: number | null;
+  citations: number;
+  distribution: Record<string, unknown> | null;
+};
+
+export type ProposalProvenanceSummary = {
+  kind: "llm_derived" | "legacy_unverified" | "deterministic";
+  provider: string | null;
+  model: string | null;
+  synthesis_model: string | null;
+  synthesis_provider: string | null;
+  synthesis_worker_id: string | null;
+  review_model: string | null;
+  review_provider: string | null;
+  review_worker_id: string | null;
+  run_id: string | null;
+  packet_id: string | null;
+  source_packet_ids: string[];
+  source_result_ids: string[];
+  catalog_id: string | null;
+  review_id: string | null;
+  materializer_version: string | null;
+  prompt_hash: string | null;
+  evidence_pack_hash: string | null;
+  validator_version: string | null;
+  review_state: string;
+  eligible: number | null;
+  processed: number | null;
+  support_distribution: Record<string, unknown> | null;
+  semantic_identity: string | null;
+  luna_producers: Array<Record<string, unknown>>;
 };
 
 export type ProposalTargetState = {
@@ -951,6 +1072,9 @@ export type ProposalRow = {
   claims: ProposalClaim[];
   support: ProposalSupport;
   target_state: ProposalTargetState;
+  suggested_instruction: string | null;
+  provenance_summary: ProposalProvenanceSummary;
+  coalesced_duplicate_count: number;
   advisory_only: boolean;
 };
 
@@ -963,10 +1087,116 @@ export type ProposalsPayload = {
   note: string;
 };
 
+function optionalNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+export function normalizeProposalRow(raw: Partial<ProposalRow> & Record<string, unknown>): ProposalRow {
+  const claims = Array.isArray(raw.claims) ? (raw.claims as ProposalClaim[]) : [];
+  const legacySupport = (raw.support && typeof raw.support === "object"
+    ? raw.support
+    : {}) as Partial<ProposalSupport>;
+  const sampleSize = optionalNumber(legacySupport.sample_size) ?? optionalNumber(raw.sample_size) ?? 0;
+  const denominator = optionalNumber(legacySupport.denominator);
+  const evidenceCount = optionalNumber(legacySupport.evidence_count)
+    ?? claims.reduce((total, claim) => total + (Array.isArray(claim.evidence) ? claim.evidence.length : 0), 0);
+  const rawProvenance = (raw.provenance_summary && typeof raw.provenance_summary === "object"
+    ? raw.provenance_summary
+    : {}) as Partial<ProposalProvenanceSummary>;
+  const legacyLineage = (raw.provenance && typeof raw.provenance === "object"
+    ? raw.provenance
+    : {}) as Record<string, unknown>;
+  const model = typeof raw.model === "string" ? raw.model : typeof legacyLineage.model === "string" ? legacyLineage.model : null;
+  const runId = typeof raw.run_id === "string" ? raw.run_id : typeof legacyLineage.run_id === "string" ? legacyLineage.run_id : null;
+  const kind = rawProvenance.kind
+    ?? (model || runId || legacyLineage.provider ? "legacy_unverified" : "deterministic");
+  const provenance: ProposalProvenanceSummary = {
+    kind,
+    provider: rawProvenance.provider ?? (typeof legacyLineage.provider === "string" ? legacyLineage.provider : null),
+    model: rawProvenance.model ?? model,
+    synthesis_model: rawProvenance.synthesis_model ?? null,
+    synthesis_provider: rawProvenance.synthesis_provider ?? null,
+    synthesis_worker_id: rawProvenance.synthesis_worker_id ?? null,
+    review_model: rawProvenance.review_model ?? null,
+    review_provider: rawProvenance.review_provider ?? null,
+    review_worker_id: rawProvenance.review_worker_id ?? null,
+    run_id: rawProvenance.run_id ?? runId,
+    packet_id: rawProvenance.packet_id ?? null,
+    source_packet_ids: Array.isArray(rawProvenance.source_packet_ids) ? rawProvenance.source_packet_ids : [],
+    source_result_ids: Array.isArray(rawProvenance.source_result_ids) ? rawProvenance.source_result_ids : [],
+    catalog_id: rawProvenance.catalog_id ?? null,
+    review_id: rawProvenance.review_id ?? null,
+    materializer_version: rawProvenance.materializer_version ?? null,
+    prompt_hash: rawProvenance.prompt_hash ?? (typeof raw.prompt_hash === "string" ? raw.prompt_hash : null),
+    evidence_pack_hash: rawProvenance.evidence_pack_hash ?? (typeof raw.evidence_pack_hash === "string" ? raw.evidence_pack_hash : null),
+    validator_version: rawProvenance.validator_version ?? null,
+    review_state: rawProvenance.review_state
+      ?? (kind === "legacy_unverified" ? "legacy provenance; model/review unverified" : "deterministic ledger derivation"),
+    eligible: rawProvenance.eligible ?? denominator,
+    processed: rawProvenance.processed ?? null,
+    support_distribution: rawProvenance.support_distribution ?? null,
+    semantic_identity: rawProvenance.semantic_identity ?? null,
+    luna_producers: Array.isArray(rawProvenance.luna_producers) ? rawProvenance.luna_producers : [],
+  };
+  const claimInstruction = claims.find(
+    (claim) => typeof claim.value?.suggested_instruction === "string",
+  )?.value?.suggested_instruction;
+  const suggestedInstruction = typeof raw.suggested_instruction === "string"
+    ? raw.suggested_instruction
+    : typeof claimInstruction === "string" ? claimInstruction : null;
+  return {
+    ...(raw as ProposalRow),
+    id: String(raw.id ?? ""),
+    title: String(raw.title ?? "Untitled proposal"),
+    action: String(raw.action ?? "review"),
+    status: (raw.status as ProposalStatus) ?? "pending",
+    target_path: String(raw.target_path ?? ""),
+    target_kind: String(raw.target_kind ?? "unknown"),
+    scope_type: String(raw.scope_type ?? "global"),
+    scope_id: typeof raw.scope_id === "string" ? raw.scope_id : null,
+    claims,
+    sample_size: sampleSize,
+    support: {
+      tier: (legacySupport.tier ?? "unsupported") as ProposalSupport["tier"],
+      derivations: Array.isArray(legacySupport.derivations) ? legacySupport.derivations : [],
+      sample_size: sampleSize,
+      denominator,
+      evidence_count: evidenceCount,
+      language: String(legacySupport.language ?? "provenance is incomplete; review the linked evidence"),
+      n: optionalNumber(legacySupport.n) ?? sampleSize,
+      processed: optionalNumber(legacySupport.processed) ?? provenance.processed,
+      eligible: optionalNumber(legacySupport.eligible) ?? provenance.eligible,
+      citations: optionalNumber(legacySupport.citations) ?? evidenceCount,
+      distribution: legacySupport.distribution ?? provenance.support_distribution,
+    },
+    suggested_instruction: suggestedInstruction,
+    provenance_summary: provenance,
+    coalesced_duplicate_count: optionalNumber(raw.coalesced_duplicate_count) ?? 1,
+    target_state: (raw.target_state && typeof raw.target_state === "object"
+      ? raw.target_state
+      : { exists: false, current_content_hash: null, matches_proposed: false, changed_since_proposal: false }) as ProposalTargetState,
+    advisory_only: raw.advisory_only !== false,
+  };
+}
+
+export function normalizeProposalsPayload(raw: Partial<ProposalsPayload> & Record<string, unknown>): ProposalsPayload {
+  return {
+    ...(raw as ProposalsPayload),
+    items: Array.isArray(raw.items)
+      ? raw.items.map((item) => normalizeProposalRow(item as Partial<ProposalRow> & Record<string, unknown>))
+      : [],
+    count: optionalNumber(raw.count) ?? (Array.isArray(raw.items) ? raw.items.length : 0),
+    counts_by_status: raw.counts_by_status && typeof raw.counts_by_status === "object" ? raw.counts_by_status as Record<string, number> : {},
+    decisions: Array.isArray(raw.decisions) ? raw.decisions as ProposalDecision[] : ["accepted", "deferred", "rejected"],
+    advisory_only: raw.advisory_only !== false,
+    note: typeof raw.note === "string" ? raw.note : "agentlog proposes; apply changes manually",
+  };
+}
+
 export function fetchProposals(status?: string) {
-  return getJson<ProposalsPayload>("/api/proposals", {
+  return getJson<Record<string, unknown>>("/api/proposals", {
     status: status && status !== "all" ? status : undefined,
-  });
+  }).then(normalizeProposalsPayload);
 }
 
 export async function postProposalDecision(

@@ -13,8 +13,14 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from agentlog.api.deps import get_conn
+from agentlog.api.identity_aggregates import visible_logical_sessions
 from agentlog.api.queries import _project_label
 from agentlog.api.ranges import TimeRange, parse_range, range_params, session_time_clause
+from agentlog.session_identity import (
+    build_identity_context,
+    logical_projection,
+    provider_root_shadow_ids,
+)
 
 router = APIRouter(tags=["graph"])
 
@@ -84,24 +90,74 @@ def graph_payload(conn: sqlite3.Connection, tr: TimeRange) -> dict[str, Any]:
             WHERE c.parent_session_id IN
                 (s.id, s.external_id, s.harness || ':' || s.external_id)
         )"""
-        rows = conn.execute(
+        physical_rows = conn.execute(
             f"{_SESSION_SQL} WHERE {where}", params
         ).fetchall()
         truncated = {
-            "shown": len(rows),
-            "hidden": total - len(rows),
-            "note": f"showing 90d · {total - len(rows)} older sessions hidden",
+            "shown": len(physical_rows),
+            "hidden": total - len(physical_rows),
+            "note": f"showing 90d · {total - len(physical_rows)} older sessions hidden",
         }
     else:
-        rows = conn.execute(
+        physical_rows = conn.execute(
             f"{_SESSION_SQL} WHERE {where}", params
         ).fetchall()
 
+    identity = build_identity_context(conn)
+    root_shadows = provider_root_shadow_ids(conn, context=identity)
+    physical_ids = {str(row["id"]) for row in physical_rows}
+    owner_ids: set[str] = set()
+    for row in physical_rows:
+        if str(row["id"]) not in root_shadows:
+            continue
+        projection = logical_projection(
+            conn, str(row["id"]), str(row["harness"]), context=identity
+        )
+        owner_id = projection["orchestrator_session_id"]
+        if owner_id and str(owner_id) not in physical_ids:
+            owner_ids.add(str(owner_id))
+    for source_id, backings in identity.backings_by_source.items():
+        if source_id in physical_ids:
+            continue
+        for backing in backings:
+            target_id = backing["target_session_id"]
+            if (
+                backing.get("link_role") == "worker"
+                and target_id
+                and str(target_id) in physical_ids
+                and identity.owners_by_session.get(str(target_id), set())
+                == {source_id}
+            ):
+                owner_ids.add(source_id)
+                break
+    if owner_ids:
+        placeholders = ",".join("?" for _ in owner_ids)
+        physical_rows.extend(
+            conn.execute(
+                f"{_SESSION_SQL} WHERE s.id IN ({placeholders})",
+                sorted(owner_ids),
+            ).fetchall()
+        )
+
+    visible = visible_logical_sessions(conn, physical_rows, context=identity)
+    rows = [session.row for session in visible]
+    visible_by_id = {session.session_id: session for session in visible}
+
     by_key: dict[str, str] = {}
-    for r in rows:
-        by_key[r["id"]] = r["id"]
-        by_key.setdefault(str(r["external_id"]), r["id"])
-        by_key.setdefault(f"{r['harness']}:{r['external_id']}", r["id"])
+    presentation_by_physical: dict[str, str] = {}
+    for r in physical_rows:
+        session_id = str(r["id"])
+        projection = logical_projection(
+            conn, session_id, str(r["harness"]), context=identity
+        )
+        presentation_by_physical[session_id] = (
+            str(projection["orchestrator_session_id"])
+            if session_id in root_shadows and projection["orchestrator_session_id"]
+            else session_id
+        )
+        by_key[session_id] = session_id
+        by_key.setdefault(str(r["external_id"]), session_id)
+        by_key.setdefault(f"{r['harness']}:{r['external_id']}", session_id)
 
     child_counts: dict[str, int] = {}
     parent_of: dict[str, str] = {}
@@ -112,13 +168,81 @@ def graph_payload(conn: sqlite3.Connection, tr: TimeRange) -> dict[str, Any]:
         resolved = by_key.get(str(raw_parent))
         if resolved is None or resolved == r["id"]:
             continue
-        parent_of[r["id"]] = resolved
-        child_counts[resolved] = child_counts.get(resolved, 0) + 1
+        parent_id = presentation_by_physical.get(resolved, resolved)
+        if parent_id == r["id"] or parent_id not in visible_by_id:
+            continue
+        parent_of[r["id"]] = parent_id
+        child_counts[parent_id] = child_counts.get(parent_id, 0) + 1
+    for source_id, backings in identity.backings_by_source.items():
+        if source_id not in visible_by_id:
+            continue
+        for backing in backings:
+            target_id = backing["target_session_id"]
+            if (
+                backing.get("link_role") != "worker"
+                or not target_id
+                or str(target_id) not in visible_by_id
+            ):
+                continue
+            child_id = str(target_id)
+            if child_id in parent_of or child_id == source_id:
+                continue
+            if identity.owners_by_session.get(child_id, set()) != {source_id}:
+                continue
+            parent_of[child_id] = source_id
+            child_counts[source_id] = child_counts.get(source_id, 0) + 1
 
     nodes: list[dict[str, Any]] = []
     edges: list[dict[str, Any]] = []
     repo_counts: dict[str, int] = {}
-    harness_by_id = {r["id"]: r["harness"] for r in rows}
+    harness_by_id = {
+        session.session_id: session.logical_harness for session in visible
+    }
+    metric_ids = sorted({session.metric_session_id for session in visible})
+    session_by_metric = {
+        session.metric_session_id: session for session in visible
+    }
+    metric_models: dict[str, str] = {}
+    message_counts: dict[str, int] = {}
+    tool_counts: dict[str, int] = {}
+    if metric_ids:
+        placeholders = ",".join("?" for _ in metric_ids)
+        metric_models = {
+            str(row["id"]): str(row["model"])
+            for row in conn.execute(
+                f"""
+                SELECT id,
+                       COALESCE(NULLIF(model_canonical, ''), '(unknown)') AS model
+                FROM sessions
+                WHERE id IN ({placeholders})
+                """,
+                metric_ids,
+            ).fetchall()
+        }
+        message_counts = {
+            str(row["session_id"]): int(row["c"])
+            for row in conn.execute(
+                f"""
+                SELECT session_id, COUNT(*) AS c
+                FROM messages
+                WHERE session_id IN ({placeholders})
+                GROUP BY session_id
+                """,
+                metric_ids,
+            ).fetchall()
+        }
+        tool_counts = {
+            str(row["session_id"]): int(row["c"])
+            for row in conn.execute(
+                f"""
+                SELECT session_id, COUNT(*) AS c
+                FROM tool_events
+                WHERE session_id IN ({placeholders})
+                GROUP BY session_id
+                """,
+                metric_ids,
+            ).fetchall()
+        }
 
     # Per-repo composition: descriptive counts only, aggregated in Python
     # because the repo label is derived (_project_label) rather than stored.
@@ -128,6 +252,10 @@ def graph_payload(conn: sqlite3.Connection, tr: TimeRange) -> dict[str, Any]:
     repo_agg: dict[str, dict[str, Any]] = {}
 
     for r in rows:
+        session = visible_by_id[str(r["id"])]
+        projection = logical_projection(
+            conn, session.session_id, str(r["harness"]), context=identity
+        )
         repo = repo_of[r["id"]]
         repo_counts[repo] = repo_counts.get(repo, 0) + 1
         agg = repo_agg.setdefault(
@@ -140,9 +268,11 @@ def graph_payload(conn: sqlite3.Connection, tr: TimeRange) -> dict[str, Any]:
                 "last_at": None,
             },
         )
-        agg["harnesses"][r["harness"]] = agg["harnesses"].get(r["harness"], 0) + 1
-        agg["messages"] += int(r["message_count"])
-        agg["tools"] += int(r["tool_count"])
+        agg["harnesses"][session.logical_harness] = (
+            agg["harnesses"].get(session.logical_harness, 0) + 1
+        )
+        agg["messages"] += message_counts.get(session.metric_session_id, 0)
+        agg["tools"] += tool_counts.get(session.metric_session_id, 0)
         started = r["started_at"]
         ended = r["ended_at"] or r["started_at"]
         if started and (agg["first_at"] is None or started < agg["first_at"]):
@@ -155,13 +285,17 @@ def graph_payload(conn: sqlite3.Connection, tr: TimeRange) -> dict[str, Any]:
                 "id": r["id"],
                 "kind": "session",
                 "harness": r["harness"],
-                "model": r["model"],
+                "logical_harness": session.logical_harness,
+                "runtime_harness": session.runtime_harness,
+                "orchestrator_session_id": session.orchestrator_session_id,
+                "transcript_session_id": projection["transcript_session_id"],
+                "model": metric_models.get(session.metric_session_id, r["model"]),
                 "repo": repo,
                 "started_at": r["started_at"],
                 "ended_at": r["ended_at"],
                 "duration_seconds": r["duration_seconds"],
-                "messages": int(r["message_count"]),
-                "tools": int(r["tool_count"]),
+                "messages": message_counts.get(session.metric_session_id, 0),
+                "tools": tool_counts.get(session.metric_session_id, 0),
                 "parent_id": parent_id,
                 "children": child_counts.get(r["id"], 0),
             }
@@ -182,22 +316,26 @@ def graph_payload(conn: sqlite3.Connection, tr: TimeRange) -> dict[str, Any]:
     # Per-message model/effort mix (captures mid-session model switches).
     models_by_repo: dict[str, dict[str, int]] = {}
     efforts_by_repo: dict[str, dict[str, int]] = {}
-    comp_rows = conn.execute(
-        f"""
-        SELECT m.session_id AS sid,
-               COALESCE(NULLIF(m.model_canonical, ''), '(unknown)') AS model,
-               m.effort AS effort,
-               COUNT(*) AS n
-        FROM messages m JOIN sessions s ON s.id = m.session_id
-        WHERE ({where})
-        GROUP BY m.session_id,
-                 COALESCE(NULLIF(m.model_canonical, ''), '(unknown)'),
-                 m.effort
-        """,
-        params,
-    ).fetchall()
+    comp_rows: list[sqlite3.Row] = []
+    if metric_ids:
+        placeholders = ",".join("?" for _ in metric_ids)
+        comp_rows = conn.execute(
+            f"""
+            SELECT m.session_id AS sid,
+                   COALESCE(NULLIF(m.model_canonical, ''), '(unknown)') AS model,
+                   m.effort AS effort,
+                   COUNT(*) AS n
+            FROM messages m
+            WHERE m.session_id IN ({placeholders})
+            GROUP BY m.session_id,
+                     COALESCE(NULLIF(m.model_canonical, ''), '(unknown)'),
+                     m.effort
+            """,
+            metric_ids,
+        ).fetchall()
     for c in comp_rows:
-        repo = repo_of.get(c["sid"])
+        session = session_by_metric.get(str(c["sid"]))
+        repo = repo_of.get(session.session_id) if session is not None else None
         if repo is None:
             continue
         n = int(c["n"])

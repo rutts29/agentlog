@@ -10,6 +10,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from agentlog.api.deps import get_conn
+from agentlog.api.identity_aggregates import visible_logical_sessions
 from agentlog.api.model_rollup import (
     GRAIN_DESCRIPTIONS,
     MESSAGE_MODEL,
@@ -23,6 +24,7 @@ from agentlog.api.ranges import (
     range_params,
     session_time_clause as _session_time_clause,
 )
+from agentlog.api import tokens as token_metrics
 router = APIRouter(tags=["activity"])
 
 _CALENDAR_RANGES = frozenset({"90d", "365d"})
@@ -101,103 +103,44 @@ def _streaks(active_days: list[str], *, end: datetime) -> dict[str, int]:
 
 
 def activity_calendar(conn: sqlite3.Connection, tr: TimeRange) -> dict[str, Any]:
-    """GitHub-style daily activity matrix over the range (single grouped query)."""
+    """GitHub-style daily activity matrix over visible logical sessions."""
     time_sql, params = _session_time_clause(tr)
-    rows = list(
+    sessions = visible_logical_sessions(
+        conn,
         conn.execute(
             f"""
-            WITH bounded AS (
-                SELECT
-                    s.id AS session_id,
-                    s.harness AS harness,
-                    substr(s.started_at, 1, 10) AS day
-                FROM sessions s
-                WHERE s.started_at IS NOT NULL AND {time_sql}
-            ),
-            sess AS (
-                SELECT
-                    day,
-                    COUNT(*) AS sessions,
-                    GROUP_CONCAT(DISTINCT harness) AS harnesses
-                FROM bounded
-                GROUP BY day
-            ),
-            msgs AS (
-                SELECT b.day AS day, COUNT(*) AS messages
-                FROM messages m
-                JOIN bounded b ON b.session_id = m.session_id
-                GROUP BY b.day
-            ),
-            tools AS (
-                SELECT b.day AS day, COUNT(*) AS tool_events
-                FROM tool_events t
-                JOIN bounded b ON b.session_id = t.session_id
-                GROUP BY b.day
-            ),
-            tok_msg AS (
-                SELECT
-                    b.day AS day,
-                    b.session_id AS session_id,
-                    SUM(u.input_tokens) AS input_tokens,
-                    SUM(u.output_tokens) AS output_tokens,
-                    SUM(u.total_tokens) AS total_tokens
-                FROM token_usage u
-                JOIN bounded b ON b.session_id = u.session_id
-                WHERE u.granularity = 'message'
-                GROUP BY b.day, b.session_id
-            ),
-            tok_cum AS (
-                SELECT
-                    b.day AS day,
-                    u.session_id AS session_id,
-                    u.input_tokens AS input_tokens,
-                    u.output_tokens AS output_tokens,
-                    u.total_tokens AS total_tokens
-                FROM token_usage u
-                JOIN bounded b ON b.session_id = u.session_id
-                JOIN (
-                    SELECT u2.session_id AS session_id, MAX(u2.seq) AS max_seq
-                    FROM token_usage u2
-                    JOIN bounded b2 ON b2.session_id = u2.session_id
-                    WHERE u2.granularity = 'session_cumulative'
-                    GROUP BY u2.session_id
-                ) latest
-                  ON latest.session_id = u.session_id AND latest.max_seq = u.seq
-                WHERE u.granularity = 'session_cumulative'
-            ),
-            tok AS (
-                SELECT day,
-                       SUM(input_tokens) AS input_tokens,
-                       SUM(output_tokens) AS output_tokens,
-                       SUM(total_tokens) AS total_tokens,
-                       COUNT(*) AS sessions_with_tokens
-                FROM (
-                    SELECT * FROM tok_msg
-                    UNION ALL
-                    SELECT * FROM tok_cum
-                )
-                GROUP BY day
-            )
-            SELECT
-                sess.day AS day,
-                sess.sessions AS sessions,
-                sess.harnesses AS harnesses,
-                COALESCE(msgs.messages, 0) AS messages,
-                COALESCE(tools.tool_events, 0) AS tool_events,
-                tok.input_tokens AS input_tokens,
-                tok.output_tokens AS output_tokens,
-                tok.total_tokens AS total_tokens,
-                COALESCE(tok.sessions_with_tokens, 0) AS sessions_with_tokens
-            FROM sess
-            LEFT JOIN msgs ON msgs.day = sess.day
-            LEFT JOIN tools ON tools.day = sess.day
-            LEFT JOIN tok ON tok.day = sess.day
-            ORDER BY sess.day
+            SELECT s.id, s.harness, s.started_at
+            FROM sessions s
+            WHERE s.started_at IS NOT NULL AND {time_sql}
             """,
             params,
-        )
+        ).fetchall(),
     )
-    by_day = {str(r["day"]): r for r in rows}
+    by_metric = {session.metric_session_id: session for session in sessions}
+    by_day: dict[str, dict[str, Any]] = {}
+    for session in sessions:
+        day = str(session.row["started_at"])[:10]
+        entry = by_day.setdefault(
+            day, {"sessions": 0, "messages": 0, "tool_events": 0, "harnesses": set()}
+        )
+        entry["sessions"] += 1
+        entry["harnesses"].add(session.logical_harness)
+    metric_ids = sorted(by_metric)
+    if metric_ids:
+        placeholders = ",".join("?" for _ in metric_ids)
+        for table, key in (("messages", "messages"), ("tool_events", "tool_events")):
+            rows = conn.execute(
+                f"SELECT session_id, COUNT(*) AS c FROM {table} "
+                f"WHERE session_id IN ({placeholders}) GROUP BY session_id",
+                metric_ids,
+            ).fetchall()
+            for row in rows:
+                session = by_metric[str(row["session_id"])]
+                day = str(session.row["started_at"])[:10]
+                by_day[day][key] += int(row["c"])
+    token_days = {
+        item["day"]: item for item in token_metrics.timeseries_daily(conn, tr)["series"]
+    }
     days = _day_list(tr)
     if not days and by_day:
         days = sorted(by_day)
@@ -225,18 +168,13 @@ def activity_calendar(conn: sqlite3.Connection, tr: TimeRange) -> dict[str, Any]
                 "tokens_known": False,
             }
         else:
-            harnesses = sorted(
-                h for h in str(row["harnesses"] or "").split(",") if h
-            )
-            total_tokens = (
-                int(row["total_tokens"])
-                if row["total_tokens"] is not None
-                else None
-            )
+            token_row = token_days.get(day)
+            totals = token_row["totals"] if token_row else {}
+            total_tokens = totals.get("total_tokens")
             # Prefer total_tokens; if only input/output present, sum those.
             if total_tokens is None:
-                inp = row["input_tokens"]
-                out = row["output_tokens"]
+                inp = totals.get("input_tokens")
+                out = totals.get("output_tokens")
                 if inp is not None or out is not None:
                     total_tokens = int(inp or 0) + int(out or 0)
             cell = {
@@ -244,19 +182,21 @@ def activity_calendar(conn: sqlite3.Connection, tr: TimeRange) -> dict[str, Any]
                 "sessions": int(row["sessions"]),
                 "messages": int(row["messages"]),
                 "tool_events": int(row["tool_events"]),
-                "active_harnesses": harnesses,
+                "active_harnesses": sorted(row["harnesses"]),
                 "total_tokens": total_tokens,
                 "input_tokens": (
-                    int(row["input_tokens"])
-                    if row["input_tokens"] is not None
+                    int(totals["input_tokens"])
+                    if totals.get("input_tokens") is not None
                     else None
                 ),
                 "output_tokens": (
-                    int(row["output_tokens"])
-                    if row["output_tokens"] is not None
+                    int(totals["output_tokens"])
+                    if totals.get("output_tokens") is not None
                     else None
                 ),
-                "sessions_with_tokens": int(row["sessions_with_tokens"] or 0),
+                "sessions_with_tokens": int(
+                    token_row["sessions_with_usage"] if token_row else 0
+                ),
                 "tokens_known": total_tokens is not None,
             }
             if cell["sessions"] > 0:
@@ -592,7 +532,7 @@ def activity_rollup(conn: sqlite3.Connection, tr: TimeRange) -> dict[str, Any]:
             by_harness, by_session_start_model, by_message_model
         ),
         "note": (
-            "Descriptive activity rollup only. Model rows are split by grain: "
+            "Descriptive activity rollup only at physical-session grain. Model rows are split by grain: "
             "by_session_start_model counts sessions and their tool events; "
             "by_message_model counts messages and reconciles to the harness "
             "message total. by_agent_profile counts agent/profile identities "
@@ -600,6 +540,7 @@ def activity_rollup(conn: sqlite3.Connection, tr: TimeRange) -> dict[str, Any]:
             "resolved model differs. Mean duration uses sessions with both "
             "started_at and ended_at."
         ),
+        "identity_grain": "physical_sessions",
     }
 
 

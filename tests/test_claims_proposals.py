@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -464,6 +465,88 @@ class ProposalStateMachineTests(unittest.TestCase):
 
         claims = client.get("/api/claims?status=candidate")
         self.assertEqual(claims.status_code, 200)
+
+    def test_api_exposes_review_provenance_and_hides_superseded_duplicates(self) -> None:
+        from agentlog.analysis.claims.store import get_proposal, upsert_proposals
+
+        proposal_id = self._insert_llm_proposal()
+        original = get_proposal(self.conn, proposal_id, include_claims=True)
+        assert original is not None
+        original.provenance["semantic_identity"] = "global:wait-for-go-ahead"
+        upsert_proposals(self.conn, [original])
+        duplicate = replace(
+            original,
+            id="testllmproposalfixture0002",
+            updated_at="2026-08-02T00:00:00+00:00",
+            provenance=dict(original.provenance),
+        )
+        upsert_proposals(self.conn, [duplicate])
+        superseded = replace(
+            original,
+            id="testllmproposalfixture0003",
+            status="superseded",
+            updated_at="2026-08-03T00:00:00+00:00",
+            provenance=dict(original.provenance),
+        )
+        upsert_proposals(self.conn, [superseded])
+        self.conn.commit()
+
+        payload = TestClient(create_app(self.db_path)).get("/api/proposals").json()
+        assert payload["items"]
+        item = next(item for item in payload["items"] if item["id"] == duplicate.id)
+        self.assertEqual(item["coalesced_duplicate_count"], 2)
+        self.assertNotIn(superseded.id, {item["id"] for item in payload["items"]})
+        self.assertEqual(payload["counts_by_status"]["superseded"], 0)
+        self.assertEqual(item["provenance_summary"]["model"], original.model)
+        self.assertEqual(item["provenance_summary"]["run_id"], original.run_id)
+        self.assertEqual(item["provenance_summary"]["kind"], "legacy_unverified")
+        self.assertEqual(item["provenance_summary"]["review_state"], "legacy provenance; model/review unverified")
+        self.assertEqual(item["support"]["n"], original.sample_size)
+        self.assertIsNone(item["support"]["processed"])
+        self.assertEqual(item["support"]["citations"], 0)
+
+    def test_api_maps_verified_coach_replay_lineage(self) -> None:
+        from agentlog.analysis.claims.store import get_proposal
+        from agentlog.api.proposals import _proposal_provenance
+
+        proposal_id = self._insert_llm_proposal()
+        proposal = get_proposal(self.conn, proposal_id, include_claims=True)
+        assert proposal is not None
+        proposal.provenance.update(
+            {
+                "catalog_id": "catalog_123",
+                "review_id": "review_123",
+                "materializer_version": "coach-materialize.v2",
+                "eligible_roots": 42,
+                "processed_roots": 42,
+                "terra_synthesis_producer": {
+                    "provider": "openai",
+                    "model": "gpt-terra",
+                    "worker_id": "terra-synthesis",
+                },
+                "terra_review_producer": {
+                    "provider": "openai",
+                    "model": "gpt-review",
+                    "worker_id": "terra-review",
+                },
+                "run_replay": {
+                    "terra_review_id": "review_123",
+                    "terra_synthesis_results": [
+                        {"packet_id": "spkt_1", "result_id": "terra_1"}
+                    ],
+                },
+            }
+        )
+        summary = _proposal_provenance(proposal)
+        self.assertEqual(summary["kind"], "llm_derived")
+        self.assertEqual(summary["catalog_id"], "catalog_123")
+        self.assertEqual(summary["review_id"], "review_123")
+        self.assertEqual(summary["synthesis_model"], "gpt-terra")
+        self.assertEqual(summary["review_model"], "gpt-review")
+        self.assertEqual(summary["source_packet_ids"], ["spkt_1"])
+        self.assertEqual(summary["source_result_ids"], ["terra_1"])
+        self.assertEqual(summary["eligible"], 42)
+        self.assertEqual(summary["processed"], 42)
 
 
 if __name__ == "__main__":

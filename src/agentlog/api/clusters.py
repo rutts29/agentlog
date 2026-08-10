@@ -13,6 +13,8 @@ from __future__ import annotations
 import sqlite3
 from collections import defaultdict
 
+from agentlog.session_identity import build_identity_context, logical_orchestrator_id
+
 # Depth bound protects against a corrupt parent chain that never terminates
 # even after the visited-set check (defensive; real trees are 2-3 deep).
 MAX_ANCESTRY_DEPTH = 64
@@ -86,4 +88,9 @@ def resolve_session_roots(conn: sqlite3.Connection) -> dict[str, str]:
         assert root is not None
         for node in path:
             roots[node] = root
+    identity = build_identity_context(conn)
+    for session_id in roots:
+        owner = logical_orchestrator_id(conn, session_id, context=identity)
+        if owner is not None:
+            roots[session_id] = owner
     return roots

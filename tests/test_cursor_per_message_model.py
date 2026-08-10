@@ -108,12 +108,22 @@ class CursorPerMessageModelTests(unittest.TestCase):
             cursor_mod.CURSOR_STATE_VSCDB = db_path
             try:
                 data = (
+                    # Composer bubble metadata keeps the unwrapped query key;
+                    # transcript storage must normalize wrappers without losing
+                    # per-turn model attribution.
                     json.dumps(
                         {
                             "role": "user",
                             "message": {
                                 "content": [
-                                    {"type": "text", "text": "first question"}
+                                    {
+                                        "type": "text",
+                                        "text": (
+                                            "<timestamp>Wednesday, Jul 1, 2026, "
+                                            "10:00 AM (UTC+00:00)</timestamp>\n"
+                                            "<user_query>first question</user_query>"
+                                        ),
+                                    }
                                 ]
                             },
                         }
@@ -135,7 +145,14 @@ class CursorPerMessageModelTests(unittest.TestCase):
                             "role": "user",
                             "message": {
                                 "content": [
-                                    {"type": "text", "text": "second question"}
+                                    {
+                                        "type": "text",
+                                        "text": (
+                                            "<timestamp>Wednesday, Jul 1, 2026, "
+                                            "10:01 AM (UTC+00:00)</timestamp>\n"
+                                            "<user_query>second question</user_query>"
+                                        ),
+                                    }
                                 ]
                             },
                         }
@@ -164,6 +181,8 @@ class CursorPerMessageModelTests(unittest.TestCase):
                 self.assertEqual(result.session.effort_source, "high")
                 asst = [m for m in result.messages if m.role == "assistant"]
                 self.assertEqual([m.model for m in asst], ["grok-4.5", "claude-opus-5"])
+                users = [m for m in result.messages if m.role == "user"]
+                self.assertEqual([m.text for m in users], ["first question", "second question"])
             finally:
                 cursor_mod.CURSOR_STATE_VSCDB = original
                 _clear()

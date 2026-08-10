@@ -20,6 +20,51 @@ def _line(obj: dict) -> bytes:
 
 
 class CursorSubagentAuthoredTests(unittest.TestCase):
+    def test_cursor_synthetic_followup_is_not_human_owned(self) -> None:
+        callback = (
+            "<timestamp>Sunday, Aug 9, 2026, 1:59 PM (UTC+5:30)</timestamp>\n"
+            "<user_query>Perform any necessary follow-up actions in response to "
+            "the subagent completion above.</user_query>"
+        )
+        data = b"".join(
+            [
+                _line(
+                    {
+                        "role": "user",
+                        "message": {
+                            "role": "user",
+                            "content": [{"type": "text", "text": callback}],
+                        },
+                    }
+                ),
+                _line(
+                    {
+                        "role": "user",
+                        "message": {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": (
+                                        "Why does Cursor say ‘Perform any necessary "
+                                        "follow-up actions in response to the subagent "
+                                        "completion above.’?"
+                                    ),
+                                }
+                            ],
+                        },
+                    }
+                ),
+            ]
+        )
+        result = CursorAdapter().parse_chunk(
+            Path("/tmp/proj/agent-transcripts/root-uuid/root-uuid.jsonl"),
+            data,
+            start_offset=0,
+        )
+        self.assertTrue(result.messages[0].authored_by_agent)
+        self.assertFalse(result.messages[1].authored_by_agent)
+
     def test_child_initial_user_flagged(self) -> None:
         data = b"".join(
             [
