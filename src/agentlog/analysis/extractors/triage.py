@@ -50,6 +50,7 @@ class TriageReport:
 # Structural rules only. Order is evaluation order for logging; route uses priority.
 TRIAGE_RULES: tuple[str, ...] = (
     "tool_plumbing",
+    "authored_by_agent",
     "auto_review",
     "task_notification",
     "continue_stub",
@@ -68,6 +69,8 @@ def _match_rules(ctx: WindowContext, request_kind: str, raw_text: str) -> list[s
 
     if ctx.is_tool_plumbing or request_kind == "tool_plumbing":
         matched.append("tool_plumbing")
+    if ctx.authored_by_agent:
+        matched.append("authored_by_agent")
     if request_kind == "auto_review":
         matched.append("auto_review")
     if request_kind == "task_notification":
@@ -114,6 +117,19 @@ def _route_from_rules(matched: list[str], request_kind: str) -> Route:
     return Route.UX
 
 
+# Harness-synthetic kinds keep priority over the authored_by_agent override.
+_AUTHORED_OVERRIDE_KEEP = frozenset(
+    {
+        "auto_review",
+        "task_notification",
+        "continue_stub",
+        "realtime_delegation",
+        "skill_body",
+        "tool_plumbing",
+    }
+)
+
+
 def triage_window(ctx: WindowContext) -> TriageResult:
     raw = ctx.request_text or ""
     if ctx.is_tool_plumbing:
@@ -123,6 +139,9 @@ def triage_window(ctx: WindowContext) -> TriageResult:
         hit = classify_request_text(raw)
         hit_kind = hit.kind
         turn_kinds = list(hit.turn_kinds)
+        if ctx.authored_by_agent and hit_kind not in _AUTHORED_OVERRIDE_KEEP:
+            hit_kind = "worker_brief"
+            turn_kinds = [TurnKind.WORKER_BRIEF.value]
 
     matched = _match_rules(ctx, hit_kind, raw)
     route = _route_from_rules(matched, hit_kind)

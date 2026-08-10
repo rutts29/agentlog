@@ -61,7 +61,7 @@ def parse_range(
     if key == "all":
         return TimeRange(key="all", start=None, end=end, prev_start=None, prev_end=None)
 
-    days_map = {"7d": 7, "30d": 30, "90d": 90}
+    days_map = {"7d": 7, "30d": 30, "90d": 90, "365d": 365}
     if key not in days_map:
         raise ValueError(f"unsupported range: {range_key}")
     days = days_map[key]
@@ -83,3 +83,26 @@ def range_params(tr: TimeRange) -> dict[str, Any]:
         "start": tr.start_iso,
         "end": tr.end_iso,
     }
+
+
+def session_time_clause(
+    tr: TimeRange,
+    *,
+    start_param: str = "start",
+    end_param: str = "end",
+    alias: str = "s",
+) -> tuple[str, dict[str, Any]]:
+    """Index-friendly session time filter matching COALESCE(started_at, '') semantics.
+
+    With a start bound, NULL started_at is excluded (empty string fails >= start).
+    With only an end bound (range=all), NULL started_at is included.
+    Avoids wrapping started_at in COALESCE so idx_sessions_started can range-scan.
+    """
+    params: dict[str, Any] = {end_param: tr.end_iso}
+    col = f"{alias}.started_at"
+    if tr.start is not None:
+        params[start_param] = tr.start_iso
+        clause = f"{col} >= :{start_param} AND {col} < :{end_param}"
+    else:
+        clause = f"({col} IS NULL OR {col} < :{end_param})"
+    return clause, params

@@ -6,6 +6,8 @@ import urllib.error
 import urllib.request
 from typing import Any, Protocol
 
+from agentlog.safety.egress import assert_egress_allowed
+
 
 class ChatClient(Protocol):
     def complete_json(self, *, system: str, user: str, model: str) -> dict[str, Any]:
@@ -13,7 +15,13 @@ class ChatClient(Protocol):
 
 
 class XAIChatClient:
-    """OpenAI-compatible chat completions against xAI (Grok)."""
+    """OpenAI-compatible chat completions against xAI (Grok).
+
+    This is the only agentlog code path that transmits transcript-derived text
+    off the machine. Every send is gated by ``assert_egress_allowed`` before the
+    request body is built, so no-network mode holds even when a caller above
+    forgets to check.
+    """
 
     def __init__(
         self,
@@ -26,12 +34,15 @@ class XAIChatClient:
         self.base_url = base_url.rstrip("/")
         self.timeout_s = timeout_s
 
-    def complete_json(self, *, system: str, user: str, model: str) -> dict[str, Any]:
-        if not self.api_key:
-            raise RuntimeError(
-                "XAI_API_KEY is not set; cannot call Grok for UX extraction"
-            )
-        payload = {
+    @property
+    def endpoint(self) -> str:
+        return f"{self.base_url}/chat/completions"
+
+    def build_request_body(
+        self, *, system: str, user: str, model: str
+    ) -> dict[str, Any]:
+        """Exact JSON body that would be posted. Sends nothing."""
+        return {
             "model": model,
             "temperature": 0,
             "response_format": {"type": "json_object"},
@@ -40,9 +51,17 @@ class XAIChatClient:
                 {"role": "user", "content": user},
             ],
         }
+
+    def complete_json(self, *, system: str, user: str, model: str) -> dict[str, Any]:
+        assert_egress_allowed(self.endpoint, purpose="send UX extraction payload")
+        if not self.api_key:
+            raise RuntimeError(
+                "XAI_API_KEY is not set; cannot call Grok for UX extraction"
+            )
+        payload = self.build_request_body(system=system, user=user, model=model)
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
-            f"{self.base_url}/chat/completions",
+            self.endpoint,
             data=data,
             headers={
                 "Content-Type": "application/json",

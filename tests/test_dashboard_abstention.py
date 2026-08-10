@@ -147,7 +147,7 @@ class ApiAbstentionTests(unittest.TestCase):
         lead = body["kpis"]["interaction_style"]
         self.assertEqual(lead["status"], "unavailable")
         self.assertIsNone(lead["estimate"])
-        self.assertIn("ux_observations", lead["message"])
+        self.assertIn("published semantic extraction run", lead["message"])
 
     def test_models_profile_does_not_rank_by_quality(self) -> None:
         res = self.client.get("/api/models", params={"range": "all"})

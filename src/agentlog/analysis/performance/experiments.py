@@ -28,6 +28,7 @@ from agentlog.analysis.performance.outcomes import (
     SCOPE_LIMITATION,
     SECONDARY_OUTCOMES,
 )
+from agentlog.safety.write_guard import assert_writable
 
 
 class ProtocolMutationError(RuntimeError):
@@ -664,6 +665,7 @@ class ExperimentService:
 
     def write_assignment_card(self, assignment: dict[str, Any], path: Path) -> Path:
         """Persist a low-friction assignment card the developer can keep visible."""
+        path = assert_writable(path, purpose="assignment card")
         path.parent.mkdir(parents=True, exist_ok=True)
         card = {
             "assigned_model": assignment.get("assigned_model"),

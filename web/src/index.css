@@ -1,31 +1,59 @@
+@import "@fontsource-variable/inter";
+@import "@fontsource/jetbrains-mono/400.css";
+@import "@fontsource/jetbrains-mono/500.css";
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
+/* v2 "Observatory" palette — true-black core surfaces with cyan live
+   accent + saturated harness/status tokens (blue-cold observatory accents). */
 :root {
-  --background: #0a0a0b;
-  --card: #111113;
-  --popover: #161618;
-  --border: #26262a;
-  --muted: #1c1c1f;
-  --foreground: #e7e7ea;
-  --muted-foreground: #8b8b93;
-  --faint-foreground: #55555c;
-  --primary: #d4d4d8;
-  --ring: #3f3f46;
-  --status-ok: rgba(74, 222, 128, 0.85);
-  --status-warn: rgba(251, 191, 36, 0.85);
-  --status-error: rgba(248, 113, 113, 0.85);
-  --status-info: rgba(96, 165, 250, 0.85);
-  --harness-codex: #7c9acb;
-  --harness-claude: #c4a484;
-  --harness-cursor: #8fbc9f;
-  --harness-warp: #b48fb4;
-  --harness-other: #6e6e76;
+  --background: #000000;
+  --card: #0a0a0a;
+  --popover: #111111;
+  --border: #222222;
+  --border-faint: #161616;
+  --muted: #141414;
+  --foreground: #ececec;
+  --muted-foreground: #9a9a9a;
+  --faint-foreground: #5c5c5c;
+  --primary: #ececec;
+  --ring: rgba(45, 212, 191, 0.6);
+  /* Recessed graph stage + overlay surfaces. */
+  --stage: #000000;
+  --elevated: rgba(17, 17, 17, 0.88);
+  --graph-anchor: #3a3a3a;
+  /* Reserved for "happening now": SSE pulses, sync dot, live markers.
+     Never a harness identity or chart series. */
+  --accent-live: #22d3ee;
+  --status-ok: #4ade80;
+  --status-warn: #fbbf24;
+  --status-error: #fb7185;
+  --status-info: #7da8ff;
+  --harness-codex: #5b9dff;
+  --harness-claude: #f5a623;
+  --harness-cursor: #2dd4bf;
+  --harness-warp: #e45cc3;
+  --harness-t3code: #a78bfa;
+  --harness-other: #66718a;
+  /* Transcript speaker identity. Human is the rarest voice — it gets the
+     warmest, highest-contrast accent. Everything synthetic stays cool/faint. */
+  --speaker-human: #f0c674;
+  --speaker-human-dim: rgba(240, 198, 116, 0.09);
+  --speaker-agent: #6b6b6b;
+  --speaker-tool: #3d3d3d;
+  --speaker-system: #666666;
+  --speaker-brief: #e45cc3;
+  --speaker-synthetic: #8a8a8a;
 }
 
 * {
   border-color: var(--border);
+}
+
+html {
+  color-scheme: dark;
 }
 
 body {
@@ -33,10 +61,258 @@ body {
   min-height: 100vh;
   background: var(--background);
   color: var(--foreground);
-  font-family: Inter, system-ui, sans-serif;
+  font-family: "Inter Variable", Inter, system-ui, sans-serif;
+  font-size: 13px;
+  line-height: 1.45;
+  text-rendering: optimizeLegibility;
+}
+
+::selection {
+  background: rgba(255, 255, 255, 0.18);
+}
+
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-thumb {
+  background: #2a2a2a;
+  border: 3px solid var(--background);
+  border-radius: 6px;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: #3a3a3a;
+}
+*::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+}
+
+:focus-visible {
+  outline: 1px solid var(--ring);
+  outline-offset: 1px;
 }
 
 .tabular {
   font-feature-settings: "tnum";
   font-variant-numeric: tabular-nums;
+}
+
+/* Uppercase micro-label used for card titles, table headers, gutter tags. */
+.microlabel {
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+/* Display type roles — the v1 24px cap is repealed. Inter, tabular figures,
+   tight tracking; used only for hero stats and KPI values. */
+.display-xl {
+  font-size: 48px;
+  font-weight: 640;
+  line-height: 1.05;
+  letter-spacing: -0.02em;
+  font-feature-settings: "tnum";
+  font-variant-numeric: tabular-nums;
+}
+.display-md {
+  font-size: 32px;
+  font-weight: 600;
+  line-height: 1.1;
+  letter-spacing: -0.02em;
+  font-feature-settings: "tnum";
+  font-variant-numeric: tabular-nums;
+}
+/* Gradient ink for display numerals only (§3.4.3). */
+.display-ink {
+  background: linear-gradient(180deg, #f0f0f0, #8a8a8a);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  color: transparent;
+}
+
+/* Resting-panel elevation: a 1px top inner highlight reading as ambient
+   light from above (§3.3). Applied by the shared Card components. */
+.elev-card {
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+
+/* Recessed graph stage: darkest plane + dot-grid floor + faint instrument
+   vignette. Static backgrounds — painted once, never animated. */
+.stage-floor {
+  background-color: var(--stage);
+  background-image:
+    radial-gradient(ellipse at center, rgba(34, 211, 238, 0.05), transparent 65%),
+    radial-gradient(rgba(255, 255, 255, 0.045) 1px, transparent 1px);
+  background-size:
+    100% 100%,
+    22px 22px;
+}
+
+/* Gated/unavailable wells: recessed, dashed, clearly inactive — not broken.
+   Gated metrics never receive accent color. */
+.gated-well {
+  background: var(--stage);
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+}
+
+/* Focused stage picks up the live accent: visible border + soft outer glow
+   (§3.3 active-element treatment; the stage is one tab stop). */
+.stage-frame:focus-visible {
+  outline: none;
+  border-color: color-mix(in srgb, var(--accent-live) 45%, var(--border));
+  box-shadow: 0 0 20px -6px rgba(34, 211, 238, 0.35);
+  transition: box-shadow 150ms, border-color 150ms;
+}
+
+/* Overlay surfaces (palette, inspector strip, tooltips) — translucent +
+   blur, overlays only, never on scroll containers. */
+.elevated-overlay {
+  background: var(--elevated);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+}
+
+/* ACTIVE NOW loaders — orb motion means agent work in progress. */
+.live-orb {
+  position: relative;
+  display: inline-flex;
+  width: 30px;
+  height: 30px;
+  flex-shrink: 0;
+}
+.live-orb__glow {
+  opacity: 0.28;
+}
+.live-orb__shell {
+  opacity: 0.92;
+}
+.live-orb--waiting .live-orb__shell {
+  opacity: 0.55;
+}
+.live-orb--worker {
+  opacity: 0.82;
+}
+.live-orb--flash {
+  filter: drop-shadow(0 0 6px rgba(34, 211, 238, 0.7));
+}
+
+/* Ambient/decorative motion stays banned. Loader loops are expected while
+   a session is streaming or tool_running — same justification as a spinner. */
+@media (prefers-reduced-motion: no-preference) {
+  .live-glow {
+    animation: live-glow-pulse 2s ease-out 1;
+  }
+  @keyframes live-glow-pulse {
+    0% {
+      box-shadow: 0 0 20px -6px rgba(34, 211, 238, 0.45);
+      background: rgba(34, 211, 238, 0.07);
+    }
+    100% {
+      box-shadow: 0 0 0 0 rgba(34, 211, 238, 0);
+      background: transparent;
+    }
+  }
+  .live-orb--working .live-orb__sweep {
+    transform-box: view-box;
+    transform-origin: 16px 16px;
+    animation: live-orb-sweep 1.15s linear infinite;
+  }
+  .live-orb--tool .live-orb__sweep {
+    animation-duration: 1.5s;
+  }
+  .live-orb--thinking .live-orb__sweep {
+    animation-duration: 0.9s;
+  }
+  .live-orb--orchestrating .live-orb__sweep {
+    animation-duration: 2.6s;
+  }
+  @keyframes live-orb-sweep {
+    from {
+      transform: rotate(0deg);
+    }
+    to {
+      transform: rotate(360deg);
+    }
+  }
+  /* The pulsing halo and core carry the signal at rail scale, where a thin
+     rotating arc alone reads as static. */
+  .live-orb--working .live-orb__glow {
+    transform-box: view-box;
+    transform-origin: 16px 16px;
+    animation: live-orb-breathe 1.5s ease-in-out infinite;
+  }
+  .live-orb--working .live-orb__core {
+    animation: live-orb-core 1.5s ease-in-out infinite;
+  }
+  @keyframes live-orb-breathe {
+    0%,
+    100% {
+      opacity: 0.16;
+      transform: scale(0.82);
+    }
+    50% {
+      opacity: 0.42;
+      transform: scale(1);
+    }
+  }
+  @keyframes live-orb-core {
+    0%,
+    100% {
+      opacity: 0.72;
+    }
+    50% {
+      opacity: 1;
+    }
+  }
+  .live-orb--flash {
+    animation: live-orb-flash 1.4s ease-out 1;
+  }
+  @keyframes live-orb-flash {
+    0% {
+      filter: drop-shadow(0 0 10px rgba(34, 211, 238, 0.9));
+    }
+    100% {
+      filter: drop-shadow(0 0 0 rgba(34, 211, 238, 0));
+    }
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+mark {
+  background: rgba(125, 168, 255, 0.22);
+  color: var(--foreground);
+  border-radius: 2px;
+  padding: 0 2px;
+}
+
+kbd {
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: 10px;
+  line-height: 1;
+  padding: 3px 5px;
+  border: 1px solid var(--border);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  color: var(--muted-foreground);
+  background: var(--muted);
 }

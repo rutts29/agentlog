@@ -11,11 +11,16 @@ from agentlog.analysis.extractors.packets import (
     emit_packet_run,
     ingest_packet_result,
     ingest_packet_results,
+    labeled_window_ids,
     pack_windows,
     packet_run_status,
+    raw_to_observation,
     validate_window_result,
 )
-from agentlog.analysis.extractors.storage import load_ux_observations
+from agentlog.analysis.extractors.storage import (
+    load_ux_observations,
+    write_ux_observations,
+)
 from agentlog.db.repository import Repository
 from agentlog.db.schema import connect, init_db
 from agentlog.normalize.models import (
@@ -325,6 +330,110 @@ class PacketRoundTripTests(unittest.TestCase):
                 self.assertTrue((run_dir / "rejects" / f"{third}.json").exists())
 
             self.assertGreaterEqual(len(window_ids), 1)
+
+
+class SkipLabeledEmitTests(unittest.TestCase):
+    def test_skip_labeled_excludes_linked_windows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "t.db"
+            conn = connect(db)
+            init_db(conn)
+            _seed_ux_windows(conn, n=5)
+
+            baseline = emit_packet_run(
+                conn,
+                Path(tmp) / "run_all",
+                windows_per_packet=2,
+                model="grok-4.5-test",
+            )
+            all_ids = {
+                wid
+                for meta in baseline["packets"].values()
+                for wid in meta["window_ids"]
+            }
+            self.assertGreaterEqual(len(all_ids), 2)
+
+            labeled = sorted(all_ids)[0]
+            write_ux_observations(
+                conn,
+                baseline["db_run_id"],
+                [
+                    raw_to_observation(
+                        _valid_result(labeled, quote="anything"),
+                        model="grok-4.5-test",
+                        prompt_hash="deadbeef",
+                        packet_id="pkt_0001",
+                    )
+                ],
+            )
+            self.assertEqual(labeled_window_ids(conn), {labeled})
+
+            filtered = emit_packet_run(
+                conn,
+                Path(tmp) / "run_unlabeled",
+                windows_per_packet=2,
+                model="grok-4.5-test",
+                skip_labeled=True,
+            )
+            remaining = {
+                wid
+                for meta in filtered["packets"].values()
+                for wid in meta["window_ids"]
+            }
+            self.assertNotIn(labeled, remaining)
+            self.assertEqual(remaining, all_ids - {labeled})
+            self.assertEqual(filtered["window_count"], len(all_ids) - 1)
+
+    def test_orphaned_labels_are_not_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "t.db"
+            conn = connect(db)
+            init_db(conn)
+            _seed_ux_windows(conn, n=3)
+            baseline = emit_packet_run(
+                conn,
+                Path(tmp) / "run_all",
+                windows_per_packet=2,
+                model="grok-4.5-test",
+            )
+            all_ids = {
+                wid
+                for meta in baseline["packets"].values()
+                for wid in meta["window_ids"]
+            }
+            target = sorted(all_ids)[0]
+            write_ux_observations(
+                conn,
+                baseline["db_run_id"],
+                [
+                    raw_to_observation(
+                        _valid_result(target, quote="anything"),
+                        model="grok-4.5-test",
+                        prompt_hash="deadbeef",
+                        packet_id="pkt_0001",
+                    )
+                ],
+            )
+            conn.execute(
+                "UPDATE ux_observations SET link_status = 'orphaned' WHERE window_id = ?",
+                (target,),
+            )
+            conn.commit()
+            self.assertEqual(labeled_window_ids(conn), set())
+
+            filtered = emit_packet_run(
+                conn,
+                Path(tmp) / "run_unlabeled",
+                windows_per_packet=2,
+                model="grok-4.5-test",
+                skip_labeled=True,
+            )
+            remaining = {
+                wid
+                for meta in filtered["packets"].values()
+                for wid in meta["window_ids"]
+            }
+            self.assertIn(target, remaining)
 
 
 if __name__ == "__main__":

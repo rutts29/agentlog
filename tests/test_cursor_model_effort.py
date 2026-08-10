@@ -8,9 +8,14 @@ from pathlib import Path
 
 from agentlog.ingest.cursor import (
     CursorAdapter,
+    _composer_meta_cached,
     _composer_model_effort_map,
     lookup_composer_model_effort,
 )
+
+
+def _clear() -> None:
+    _composer_meta_cached.cache_clear()
 
 
 class CursorModelEffortLookupTests(unittest.TestCase):
@@ -41,7 +46,6 @@ class CursorModelEffortLookupTests(unittest.TestCase):
                 "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
                 ("composerData:abc-123", json.dumps(payload)),
             )
-            # default alias must not become a published model identity
             conn.execute(
                 "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
                 (
@@ -61,7 +65,7 @@ class CursorModelEffortLookupTests(unittest.TestCase):
             conn.commit()
             conn.close()
 
-            _composer_model_effort_map.cache_clear()
+            _clear()
             model, effort = lookup_composer_model_effort(
                 "abc-123", state_db=db_path
             )
@@ -73,7 +77,9 @@ class CursorModelEffortLookupTests(unittest.TestCase):
             )
             self.assertIsNone(model2)
             self.assertIsNone(effort2)
-            _composer_model_effort_map.cache_clear()
+            scanned = _composer_model_effort_map(str(db_path))
+            self.assertEqual(scanned["abc-123"], ("grok-4.5", "high"))
+            _clear()
 
     def test_parse_chunk_attaches_session_model_effort(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -89,6 +95,8 @@ class CursorModelEffortLookupTests(unittest.TestCase):
                     f"composerData:{composer_id}",
                     json.dumps(
                         {
+                            "status": "completed",
+                            "lastUpdatedAt": 1700001000000,
                             "modelConfig": {
                                 "modelName": "claude-fable-5",
                                 "selectedModels": [
@@ -99,7 +107,8 @@ class CursorModelEffortLookupTests(unittest.TestCase):
                                         ],
                                     }
                                 ],
-                            }
+                            },
+                            "fullConversationHeadersOnly": [],
                         }
                     ),
                 ),
@@ -107,11 +116,7 @@ class CursorModelEffortLookupTests(unittest.TestCase):
             conn.commit()
             conn.close()
 
-            _composer_model_effort_map.cache_clear()
-            # Point lookup at temp db by temporarily overriding via state_db
-            # through monkeypatch of CURSOR_STATE_VSCDB in the map cache key.
-            # parse_chunk uses CURSOR_STATE_VSCDB; inject by clearing cache and
-            # patching the constant on the module.
+            _clear()
             import agentlog.ingest.cursor as cursor_mod
 
             original = cursor_mod.CURSOR_STATE_VSCDB
@@ -138,9 +143,13 @@ class CursorModelEffortLookupTests(unittest.TestCase):
                 )
                 self.assertEqual(result.session.model, "claude-fable-5")
                 self.assertEqual(result.session.effort, "medium")
+                self.assertEqual(result.session.effort_source, "medium")
+                # Session model must not be stamped onto messages without
+                # per-generation modelInfo.
+                self.assertIsNone(result.messages[0].model)
             finally:
                 cursor_mod.CURSOR_STATE_VSCDB = original
-                _composer_model_effort_map.cache_clear()
+                _clear()
 
 
 if __name__ == "__main__":
