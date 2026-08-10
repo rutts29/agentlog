@@ -9,6 +9,7 @@ from agentlog.analysis.extractors.patterns import (
     unwrap_cursor_user_text,
 )
 from agentlog.analysis.extractors.taxonomy import MIN_NONEMPTY_CHARS, Route, TurnKind
+from agentlog.normalize.synthetic import is_cursor_subagent_followup
 
 
 @dataclass
@@ -75,7 +76,7 @@ def _match_rules(ctx: WindowContext, request_kind: str, raw_text: str) -> list[s
         matched.append("auto_review")
     if request_kind == "task_notification":
         matched.append("task_notification")
-        if "perform any necessary follow-up actions" in stripped.lower():
+        if is_cursor_subagent_followup(stripped):
             matched.append("cursor_subagent_followup")
     if request_kind == "continue_stub":
         matched.append("continue_stub")

@@ -111,8 +111,14 @@ function DiffBlock({ diff }: { diff: string }) {
 }
 
 function EvidenceList({ claims }: { claims: ProposalClaim[] }) {
+  const seen = new Set<string>();
   const rows = claims.flatMap((claim) =>
-    claim.evidence.map((ev, idx) => ({ claim, ev, key: `${claim.id}:${idx}` })),
+    claim.evidence.flatMap((ev, idx) => {
+      const identity = [ev.session_id, ev.window_id, ev.message_id, ev.quote].join("\0");
+      if (seen.has(identity)) return [];
+      seen.add(identity);
+      return [{ claim, ev, key: `${claim.id}:${idx}` }];
+    }),
   );
   if (rows.length === 0) {
     return (
@@ -163,22 +169,58 @@ function EvidenceList({ claims }: { claims: ProposalClaim[] }) {
 }
 
 function SupportLine({ support }: { support: ProposalSupport }) {
-  const denominator =
-    support.denominator != null ? ` / n=${support.denominator}` : "";
   return (
-    <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+    <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
       <StatusDot
         tone={SUPPORT_TONE[support.tier]}
         label={`support: ${support.tier}`}
       />
-      <span className="tabular text-[12px] text-muted-foreground">
-        sessions={support.sample_size}
-        {denominator} · citations={support.evidence_count}
+      <span className="tabular text-[11px] text-muted-foreground">
+        n={support.n} · processed={support.processed ?? "—"} · eligible={support.eligible ?? "—"} · citations={support.citations}
       </span>
       <span className="text-[12px] text-faint-foreground">
         {support.derivations.join(", ") || "no derivation recorded"}
       </span>
-      <span className="text-[12px] text-faint-foreground">{support.language}</span>
+    </div>
+  );
+}
+
+function ProvenanceLine({ proposal }: { proposal: ProposalRow }) {
+  const source = proposal.provenance_summary;
+  return (
+    <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-faint-foreground">
+      <StatusDot
+        tone={source.kind === "llm_derived" ? "info" : source.kind === "legacy_unverified" ? "warn" : "neutral"}
+        label={source.kind === "llm_derived" ? "LLM-derived" : source.kind === "legacy_unverified" ? "legacy / unverified" : "deterministic"}
+      />
+      {source.synthesis_model || source.model ? (
+        <span className="font-mono">synthesis {source.synthesis_model || source.model}</span>
+      ) : null}
+      {source.review_model ? <span className="font-mono">review {source.review_model}</span> : null}
+      {source.run_id ? <span>run {source.run_id}</span> : null}
+      {source.packet_id ? <span>packet {source.packet_id}</span> : null}
+      {source.catalog_id ? <span>catalog {source.catalog_id}</span> : null}
+      {source.review_id ? <span>review {source.review_id}</span> : null}
+      <span>{source.review_state}</span>
+      {proposal.coalesced_duplicate_count > 1 ? (
+        <span className="text-muted-foreground">
+          {proposal.coalesced_duplicate_count} exact versions coalesced
+        </span>
+      ) : null}
+    </div>
+  );
+}
+
+function InstructionBlock({ proposal }: { proposal: ProposalRow }) {
+  const instruction = proposal.suggested_instruction;
+  return (
+    <div className="rounded-control border border-border-faint bg-stage px-3 py-2">
+      <div className="microlabel text-[10px] text-faint-foreground">
+        Atomic suggested instruction
+      </div>
+      <p className="mt-1 whitespace-pre-wrap text-[12px] leading-relaxed text-foreground">
+        {instruction || "See the proposed file content below; no atomic instruction was stored."}
+      </p>
     </div>
   );
 }
@@ -227,6 +269,8 @@ function ProposalCard({
           <button
             type="button"
             onClick={() => setOpen((v) => !v)}
+            aria-expanded={open}
+            aria-controls={`proposal-${proposal.id}-details`}
             className="text-left text-[13px] font-medium text-foreground hover:underline"
           >
             {proposal.title}
@@ -243,13 +287,29 @@ function ProposalCard({
         </span>
       </div>
 
-      <CopyPath path={proposal.target_path} />
+      <ProvenanceLine proposal={proposal} />
+      <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-start">
+        <div className="min-w-0">
+          <CopyPath path={proposal.target_path} />
+          <div className="mt-1 text-[11px] text-faint-foreground">
+            target scope: {proposal.scope_type}{proposal.scope_id ? ` / ${proposal.scope_id}` : ""}
+          </div>
+        </div>
+        <TargetStateLine proposal={proposal} />
+      </div>
+      <InstructionBlock proposal={proposal} />
       <SupportLine support={proposal.support} />
-      <TargetStateLine proposal={proposal} />
-
-      <DiffBlock diff={proposal.unified_diff} />
 
       <div className="flex flex-wrap items-center gap-2">
+        <button
+          type="button"
+          onClick={() => setOpen((v) => !v)}
+          aria-expanded={open}
+          aria-controls={`proposal-${proposal.id}-details`}
+          className="rounded-control border border-border px-2.5 py-1 text-[11px] text-muted-foreground hover:text-foreground"
+        >
+          {open ? "Hide evidence & diff" : "Evidence & diff"}
+        </button>
         <CopyButton label="Copy diff" value={proposal.unified_diff} />
         <CopyButton
           label="Copy proposed file"
@@ -287,7 +347,13 @@ function ProposalCard({
       ) : null}
 
       {open ? (
-        <div className="flex flex-col gap-3 border-t border-border pt-3">
+        <div id={`proposal-${proposal.id}-details`} className="flex flex-col gap-3 border-t border-border pt-3">
+          <div>
+            <div className="microlabel pb-1 text-[10px] text-faint-foreground">
+              Proposed diff
+            </div>
+            <DiffBlock diff={proposal.unified_diff} />
+          </div>
           <div>
             <div className="microlabel pb-1 text-[10px] text-faint-foreground">
               Rationale
@@ -311,6 +377,11 @@ function ProposalCard({
                 {proposal.does_not_prove}
               </p>
             </div>
+          ) : null}
+          {proposal.support.language ? (
+            <p className="text-[11px] text-faint-foreground">
+              Caveat: {proposal.support.language}
+            </p>
           ) : null}
         </div>
       ) : null}
@@ -359,37 +430,41 @@ export function Proposals() {
         </span>
       </div>
 
-      <Card>
-        <div className="flex items-baseline justify-between">
-          <div className="text-[13px] font-medium text-foreground">
-            Manual application only
+      <Card className="grid grid-cols-2 gap-3 sm:grid-cols-5">
+        <div className="col-span-2 border-b border-border-faint pb-2 sm:col-span-5">
+          <div className="flex items-baseline justify-between gap-3">
+            <div className="text-[13px] font-medium text-foreground">Review queue</div>
+            <span className="microlabel text-[10px]" style={{ color: "var(--status-info)" }}>
+              manual application only
+            </span>
           </div>
-          <span
-            className="microlabel text-[10px]"
-            style={{ color: "var(--status-info)" }}
-          >
-            policy
-          </span>
+          <p className="mt-1 text-[11px] text-muted-foreground">
+          Provenance identifies packet-derived, deterministic, and legacy records. Nothing here writes AGENTS.md or skill files.
+          </p>
         </div>
-        <p className="mt-2 max-w-2xl text-[12px] leading-relaxed text-muted-foreground">
-          Harness coach, not a feelings board: suggestions are about what agents
-          followed or missed, skills evidenced in transcripts, and concrete
-          AGENTS.md / skill edits — small facts with citations. agentlog never
-          writes those files; there is no apply endpoint. Copy the diff, edit
-          yourself, then Accept / Reject / Defer so the board stops resurfacing
-          it.
-        </p>
+        {(["pending", "accepted", "deferred", "rejected"] as const).map((status) => (
+          <div key={status}>
+            <div className="microlabel text-[10px] text-faint-foreground">{status}</div>
+            <div className="mt-1 tabular text-[20px] font-semibold text-foreground">{counts[status] ?? 0}</div>
+          </div>
+        ))}
+        <div>
+          <div className="microlabel text-[10px] text-faint-foreground">visible total</div>
+          <div className="mt-1 tabular text-[20px] font-semibold text-foreground">{total}</div>
+        </div>
       </Card>
 
-      <div className="flex items-center gap-1 rounded-control border border-border p-0.5">
+      <div role="tablist" aria-label="Proposal status" className="flex flex-wrap items-center gap-1 rounded-control border border-border bg-card p-0.5">
         {FILTERS.map((f) => (
           <button
             key={f}
             type="button"
             onClick={() => setFilter(f)}
+            role="tab"
+            aria-selected={filter === f}
             className={cn(
-              "tabular rounded-[5px] px-2.5 py-1 text-[12px] text-muted-foreground hover:text-foreground",
-              filter === f && "bg-muted text-foreground",
+              "tabular rounded-[5px] px-3 py-1.5 text-[12px] text-muted-foreground hover:text-foreground",
+              filter === f && "bg-muted text-foreground shadow-sm",
             )}
           >
             {f}
@@ -420,8 +495,8 @@ export function Proposals() {
           title={`No ${filter === "all" ? "" : filter} proposals`}
           body={
             filter === "pending"
-              ? "No proposals met evidence gates. Board cards are LLM-authored from transcript packets (agentlog propose packets-emit → subagent results → packets-ingest), not static unused-skill or usage-profile templates."
-              : "Proposals appear after LLM packet ingest clears evidence gates. Run agentlog propose packets-emit, then packets-ingest."
+            ? "No proposals met evidence gates. Cards come from transcript evidence packets, with provenance shown per record; they are not static unused-skill or usage-profile templates."
+              : "Proposals appear after packet ingest clears evidence gates; provenance distinguishes reviewed packet records from legacy and deterministic records."
           }
           className="min-h-[180px]"
         />

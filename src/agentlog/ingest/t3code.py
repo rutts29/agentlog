@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,11 @@ from agentlog.normalize.models import (
     ParseResult,
     ToolEvent,
 )
+from agentlog.normalize.synthetic import (
+    flag_synthetic_user_messages,
+    synthetic_skill_exposures,
+)
+from agentlog.normalize.tool_ops import classify_operation
 
 log = logging.getLogger("agentlog.ingest.t3code")
 
@@ -46,6 +52,19 @@ PROVIDER_INSTANCE_VENDORS: dict[str, str] = {
     "claudeagent": "anthropic",
     "claude": "anthropic",
     "grok": "xai",
+    "opencode": "opencode",
+}
+
+_PROVIDER_FAMILIES = {
+    "codex": "codex",
+    "openai": "codex",
+    "cursor": "cursor",
+    "claude": "anthropic",
+    "claudeagent": "anthropic",
+    "anthropic": "anthropic",
+    "grok": "xai",
+    "xai": "xai",
+    "google": "google",
     "opencode": "opencode",
 }
 
@@ -68,6 +87,11 @@ _TOOL_NAME_KEYS = (
     "command",
 )
 
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+
 
 def _json_obj(raw: object) -> dict[str, Any] | None:
     if isinstance(raw, dict):
@@ -79,6 +103,31 @@ def _json_obj(raw: object) -> dict[str, Any] | None:
             return None
         if isinstance(parsed, dict):
             return parsed
+    return None
+
+
+def _provider_family(raw: object) -> str | None:
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    value = raw.strip().lower()
+    return _PROVIDER_FAMILIES.get(value, value)
+
+
+def _provider_from_mapping(data: dict[str, Any]) -> str | None:
+    for key in (
+        "provider",
+        "providerName",
+        "provider_name",
+        "providerInstanceId",
+        "provider_instance_id",
+        "modelProvider",
+        "model_provider",
+        "instanceId",
+        "instance_id",
+    ):
+        family = _provider_family(data.get(key))
+        if family is not None:
+            return family
     return None
 
 
@@ -118,9 +167,22 @@ class ModelSelection:
         options = data.get("options")
         raw_effort = None
         if isinstance(options, dict):
-            value = options.get("effort")
-            if isinstance(value, str) and value.strip():
-                raw_effort = value.strip()
+            values = (options.get("effort"), options.get("reasoningEffort"))
+            for value in values:
+                if isinstance(value, str) and value.strip():
+                    raw_effort = value.strip()
+                    break
+        elif isinstance(options, list):
+            for option in options:
+                if not isinstance(option, dict):
+                    continue
+                option_id = str(option.get("id") or "").strip().lower()
+                if option_id not in {"effort", "reasoningeffort"}:
+                    continue
+                value = option.get("value")
+                if isinstance(value, str) and value.strip():
+                    raw_effort = value.strip()
+                    break
         self.effort, self.effort_source = normalize_effort(raw_effort)
 
     @property
@@ -465,6 +527,7 @@ class T3CodeAdapter(TranscriptAdapter):
             rows=rows,
         )
         warnings.extend(tool_warnings)
+        provider_backings = self._provider_backings(conn, thread_id)
 
         if not messages and not tools:
             return None
@@ -472,6 +535,8 @@ class T3CodeAdapter(TranscriptAdapter):
         parent_thread = plan_parents.get(thread_id)
         if parent_thread:
             self._flag_plan_brief(messages)
+        flag_synthetic_user_messages(messages)
+        skills = synthetic_skill_exposures(messages)
 
         provider_row = provider_sessions.get(thread_id)
         provider_name = None
@@ -520,6 +585,7 @@ class T3CodeAdapter(TranscriptAdapter):
             ),
             messages=messages,
             tool_events=tools,
+            skill_exposures=skills,
             warnings=warnings,
             bytes_consumed=size,
             extras={
@@ -527,6 +593,7 @@ class T3CodeAdapter(TranscriptAdapter):
                 "runtime_mode": _row_get(thread, "runtime_mode"),
                 "interaction_mode": _row_get(thread, "interaction_mode"),
                 "project_id": thread["project_id"],
+                "session_links": provider_backings,
             },
         )
 
@@ -615,9 +682,209 @@ class T3CodeAdapter(TranscriptAdapter):
                     ),
                     action=_action_for(kind, tone),
                     success=False if tone == "error" else None,
+                    operation_kind=classify_operation(
+                        _tool_name_from(payload, kind, str(row["summary"] or ""))
+                    ),
                 )
             )
         return tools, warnings
+
+    def _provider_backings(
+        self, conn: sqlite3.Connection, thread_id: str
+    ) -> list[dict[str, Any]]:
+        """Recover Codex session ids emitted by T3 task orchestration events."""
+        if not table_exists(conn, "projection_thread_activities"):
+            return []
+
+        def established_provider(table: str) -> str | bool | None:
+            if not table_exists(conn, table):
+                return None
+            columns = {
+                str(row[1])
+                for row in conn.execute(f"PRAGMA table_info({table})")
+            }
+            selected = [
+                column
+                for column in ("provider_name", "provider_instance_id")
+                if column in columns
+            ]
+            if not selected:
+                return None
+            row = conn.execute(
+                f"SELECT {', '.join(selected)} FROM {table} WHERE thread_id = ?",
+                (thread_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            values = {
+                family
+                for column in selected
+                for family in [_provider_family(row[column])]
+                if family is not None
+            }
+            if not values:
+                return None
+            return next(iter(values)) if len(values) == 1 else False
+
+        # Runtime state is authoritative when no historical activity evidence
+        # exists. Activity timestamps below can still recover an earlier Codex
+        # provider after the thread has fallen back to another provider.
+        current_provider: str | None = None
+        for table in ("provider_session_runtime", "projection_thread_sessions"):
+            provider_state = established_provider(table)
+            if provider_state is not None:
+                current_provider = provider_state if isinstance(provider_state, str) else None
+                break
+        else:
+            thread_row = conn.execute(
+                "SELECT model_selection_json FROM projection_threads "
+                "WHERE thread_id = ?",
+                (thread_id,),
+            ).fetchone()
+            selection = ModelSelection(
+                thread_row["model_selection_json"] if thread_row is not None else None
+            )
+            current_provider = _provider_family(selection.instance_id)
+
+        provider_history: list[tuple[Any, str]] = []
+        if table_exists(conn, "orchestration_events"):
+            for event in conn.execute(
+                "SELECT occurred_at, payload_json "
+                "FROM orchestration_events WHERE aggregate_kind = 'thread' "
+                "AND stream_id = ? ORDER BY occurred_at, stream_version",
+                (thread_id,),
+            ):
+                payload = _json_obj(event["payload_json"])
+                if payload is None:
+                    continue
+                selection = payload.get("modelSelection")
+                if not isinstance(selection, dict):
+                    selection = payload.get("model_selection")
+                if isinstance(selection, dict):
+                    provider = _provider_from_mapping(selection)
+                else:
+                    provider = _provider_from_mapping(payload)
+                occurred_at = parse_ts(event["occurred_at"])
+                if provider is not None and occurred_at is not None:
+                    provider_history.append((occurred_at, provider))
+
+        def activity_provider(
+            payload: dict[str, Any], created_at: object
+        ) -> str | None:
+            explicit = _provider_from_mapping(payload)
+            if explicit is None:
+                data = payload.get("data")
+                if isinstance(data, dict):
+                    explicit = _provider_from_mapping(data)
+            if explicit is not None:
+                return explicit
+            when = parse_ts(created_at)
+            historical = None
+            if when is not None:
+                for occurred_at, provider in provider_history:
+                    if occurred_at > when:
+                        break
+                    historical = provider
+            if historical is None or current_provider is None:
+                return historical or current_provider
+            if historical == current_provider:
+                return historical
+            if current_provider == "codex" and historical not in {"codex", "xai"}:
+                return current_provider
+            latest_event = provider_history[-1] if provider_history else None
+            if latest_event is not None and when is not None:
+                latest_at, latest_provider = latest_event
+                if latest_provider != current_provider and latest_at <= when:
+                    return current_provider
+            return historical
+        known_thread_ids = {
+            str(row[0])
+            for row in conn.execute("SELECT thread_id FROM projection_threads")
+        }
+        evidence_by_id: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+
+        def add(
+            raw: object,
+            activity_id: object,
+            field: str,
+            link_role: str,
+        ) -> None:
+            if not isinstance(raw, str):
+                return
+            value = raw.strip()
+            if (
+                not _UUID_RE.fullmatch(value)
+                or value == thread_id
+                or value in known_thread_ids
+            ):
+                return
+            evidence_by_id.setdefault(value, []).append(
+                (
+                    link_role,
+                    {
+                        "source": "t3code.projection_thread_activities",
+                        "activity_id": str(activity_id),
+                        "field": field,
+                    },
+                )
+            )
+
+        for row in conn.execute(
+            "SELECT activity_id, payload_json, created_at "
+            "FROM projection_thread_activities WHERE thread_id = ? "
+            "ORDER BY COALESCE(sequence, 0), created_at, activity_id",
+            (thread_id,),
+        ):
+            payload = _json_obj(row["payload_json"])
+            if payload is None:
+                continue
+            if activity_provider(payload, row["created_at"]) != "codex":
+                continue
+            # T3 task ids are the provider CLI session ids in Codex's JSONL
+            # session_meta; senderThreadId is the equivalent collab bridge id.
+            add(
+                payload.get("taskId"),
+                row["activity_id"],
+                "taskId",
+                "worker",
+            )
+            add(
+                payload.get("senderThreadId"),
+                row["activity_id"],
+                "senderThreadId",
+                "root",
+            )
+            data = payload.get("data")
+            if isinstance(data, dict):
+                add(
+                    data.get("threadId"),
+                    row["activity_id"],
+                    "data.threadId",
+                    "root",
+                )
+            receiver_ids = payload.get("receiverThreadIds")
+            if isinstance(receiver_ids, list):
+                for idx, value in enumerate(receiver_ids):
+                    add(
+                        value,
+                        row["activity_id"],
+                        f"receiverThreadIds[{idx}]",
+                        "worker",
+                    )
+        links: list[dict[str, Any]] = []
+        for value, evidence in evidence_by_id.items():
+            workers = [item for item in evidence if item[0] == "worker"]
+            role, selected_evidence = (workers or evidence)[0]
+            links.append(
+                {
+                    "link_type": "provider_backing",
+                    "target_harness": "codex",
+                    "target_external_id": value,
+                    "link_role": role,
+                    "evidence": selected_evidence,
+                }
+            )
+        return links
 
     @staticmethod
     def _nearest_message_seq(

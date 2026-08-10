@@ -13,9 +13,22 @@ from datetime import datetime
 from typing import Any
 from urllib.parse import urlparse
 
+from agentlog.api.identity_aggregates import (
+    VisibleLogicalSession,
+    visible_logical_sessions,
+)
 from agentlog.api.model_rollup import collapse_by_model, strict_message_model_sql
 from agentlog.api.ranges import TimeRange, session_time_clause as _session_time_clause
-from agentlog.normalize.model_identity import display_model, sql_coalesce_model
+from agentlog.session_identity import (
+    build_identity_context,
+    logical_orchestrator_id,
+    logical_root_session_id,
+    logical_projection,
+    provider_backings,
+    provider_root_backings,
+    provider_root_shadow_ids,
+)
+from agentlog.normalize.model_identity import display_model
 
 _SORT_COLUMNS = {
     "started_at": "COALESCE(s.started_at, '')",
@@ -69,32 +82,84 @@ def _fts_match_query(raw: str) -> str | None:
     return " AND ".join(f'"{t}"' for t in tokens[:24])
 
 
-def ledger_counts(conn: sqlite3.Connection, tr: TimeRange) -> dict[str, Any]:
+def _aggregate_sessions(
+    conn: sqlite3.Connection, tr: TimeRange
+) -> list[VisibleLogicalSession]:
     where, params = _session_time_clause(tr)
+    rows = conn.execute(
+        f"""
+        SELECT s.id, s.harness, s.started_at, s.model_canonical, s.effort,
+               s.branch, s.repo, s.cwd, s.parent_session_id
+        FROM sessions s
+        WHERE {where}
+        """,
+        params,
+    ).fetchall()
+    return visible_logical_sessions(conn, rows)
+
+
+def _metric_rows(
+    conn: sqlite3.Connection, sessions: list[VisibleLogicalSession]
+) -> dict[str, sqlite3.Row]:
+    ids = sorted({session.metric_session_id for session in sessions})
+    if not ids:
+        return {}
+    placeholders = ",".join("?" for _ in ids)
+    rows = conn.execute(
+        f"SELECT id, model_canonical FROM sessions WHERE id IN ({placeholders})",
+        ids,
+    ).fetchall()
+    return {str(row["id"]): row for row in rows}
+
+
+def _model_label(row: sqlite3.Row | None) -> str:
+    value = row["model_canonical"] if row is not None else None
+    return str(value or "(unknown)")
+
+
+def ledger_counts(conn: sqlite3.Connection, tr: TimeRange) -> dict[str, Any]:
+    sessions = _aggregate_sessions(conn, tr)
+    metric_ids = sorted({session.metric_session_id for session in sessions})
+    if not metric_ids:
+        return {
+            "sessions": 0,
+            "messages": 0,
+            "tool_events": 0,
+            "windows": 0,
+            "skill_exposures": 0,
+            "auto_reviews": 0,
+            "worker_briefs": 0,
+            "child_sessions": 0,
+        }
+    placeholders = ",".join("?" for _ in metric_ids)
     row = conn.execute(
         f"""
         SELECT
-          (SELECT COUNT(*) FROM sessions s WHERE {where}) AS sessions,
-          (SELECT COUNT(*) FROM messages m
-             JOIN sessions s ON s.id = m.session_id WHERE {where}) AS messages,
-          (SELECT COUNT(*) FROM tool_events t
-             JOIN sessions s ON s.id = t.session_id WHERE {where}) AS tool_events,
-          (SELECT COUNT(*) FROM exchange_windows w
-             JOIN sessions s ON s.id = w.session_id WHERE {where}) AS windows,
-          (SELECT COUNT(*) FROM skill_exposures se
-             JOIN sessions s ON s.id = se.session_id WHERE {where}) AS skill_exposures,
+          (SELECT COUNT(*) FROM messages WHERE session_id IN ({placeholders})) AS messages,
+          (SELECT COUNT(*) FROM tool_events WHERE session_id IN ({placeholders})) AS tool_events,
+          (SELECT COUNT(*) FROM exchange_windows WHERE session_id IN ({placeholders})) AS windows,
+          (SELECT COUNT(*) FROM skill_exposures WHERE session_id IN ({placeholders})) AS skill_exposures,
           (SELECT COUNT(*) FROM auto_review_observations a
              JOIN exchange_windows w ON w.id = a.window_id
-             JOIN sessions s ON s.id = w.session_id WHERE {where}) AS auto_reviews,
+             WHERE w.session_id IN ({placeholders})) AS auto_reviews,
           (SELECT COUNT(*) FROM worker_task_observations wt
              JOIN exchange_windows w ON w.id = wt.window_id
-             JOIN sessions s ON s.id = w.session_id WHERE {where}) AS worker_briefs,
-          (SELECT COUNT(*) FROM sessions s
-             WHERE {where} AND s.parent_session_id IS NOT NULL) AS child_sessions
+             WHERE w.session_id IN ({placeholders})) AS worker_briefs
         """,
-        params,
+        [*metric_ids, *metric_ids, *metric_ids, *metric_ids, *metric_ids, *metric_ids],
     ).fetchone()
-    return {k: int(row[k] or 0) for k in row.keys()}
+    return {
+        "sessions": len(sessions),
+        "messages": int(row["messages"] or 0),
+        "tool_events": int(row["tool_events"] or 0),
+        "windows": int(row["windows"] or 0),
+        "skill_exposures": int(row["skill_exposures"] or 0),
+        "auto_reviews": int(row["auto_reviews"] or 0),
+        "worker_briefs": int(row["worker_briefs"] or 0),
+        "child_sessions": sum(
+            1 for session in sessions if session.row["parent_session_id"] is not None
+        ),
+    }
 
 
 def sessions_daily_by(
@@ -102,27 +167,22 @@ def sessions_daily_by(
 ) -> list[dict[str, Any]]:
     if by not in {"harness", "model"}:
         raise ValueError("by must be harness or model")
-    where, params = _session_time_clause(tr)
-    dim = (
-        "s.harness"
-        if by == "harness"
-        else sql_coalesce_model("s.model_canonical")
-    )
-    rows = conn.execute(
-        f"""
-        SELECT substr(s.started_at, 1, 10) AS day, {dim} AS dim, COUNT(*) AS sessions
-        FROM sessions s
-        WHERE s.started_at IS NOT NULL AND {where}
-        GROUP BY day, dim
-        ORDER BY day, dim
-        """,
-        params,
-    ).fetchall()
+    sessions = _aggregate_sessions(conn, tr)
+    metrics = _metric_rows(conn, sessions)
     by_day: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
     dims: set[str] = set()
-    for r in rows:
-        by_day[r["day"]][r["dim"]] = int(r["sessions"])
-        dims.add(r["dim"])
+    for session in sessions:
+        started_at = session.row["started_at"]
+        if not started_at:
+            continue
+        day = str(started_at)[:10]
+        dim = (
+            session.logical_harness
+            if by == "harness"
+            else _model_label(metrics.get(session.metric_session_id))
+        )
+        by_day[day][dim] += 1
+        dims.add(dim)
     # Cap model series to top 8 + other for chart readability.
     if by == "model" and len(dims) > 8:
         totals = defaultdict(int)
@@ -149,28 +209,36 @@ def sessions_daily_by(
 def tool_usage(
     conn: sqlite3.Connection, tr: TimeRange, *, limit: int = 40
 ) -> dict[str, Any]:
-    where, params = _session_time_clause(tr)
+    sessions = _aggregate_sessions(conn, tr)
+    by_metric = {session.metric_session_id: session for session in sessions}
+    if not by_metric:
+        return {
+            "total": 0,
+            "distinct_tools": 0,
+            "items": [],
+            "note": "Tool call frequencies from canonical logical sessions. Descriptive only.",
+        }
+    metric_ids = sorted(by_metric)
+    placeholders = ",".join("?" for _ in metric_ids)
     rows = conn.execute(
         f"""
-        SELECT t.tool_name, s.harness, COUNT(*) AS c
+        SELECT t.tool_name, t.session_id
         FROM tool_events t
-        JOIN sessions s ON s.id = t.session_id
-        WHERE {where}
-        GROUP BY t.tool_name, s.harness
-        ORDER BY c DESC
+        WHERE t.session_id IN ({placeholders})
         """,
-        params,
+        metric_ids,
     ).fetchall()
     by_tool: dict[str, dict[str, Any]] = {}
     for r in rows:
         name = r["tool_name"]
+        session = by_metric[str(r["session_id"])]
         entry = by_tool.setdefault(
             name, {"tool": name, "count": 0, "by_harness": defaultdict(int)}
         )
-        entry["count"] += int(r["c"])
-        entry["by_harness"][r["harness"]] += int(r["c"])
+        entry["count"] += 1
+        entry["by_harness"][session.logical_harness] += 1
     ranked = sorted(by_tool.values(), key=lambda x: -x["count"])[:limit]
-    total = sum(int(r["c"]) for r in rows)
+    total = len(rows)
     items = [
         {
             "tool": e["tool"],
@@ -184,25 +252,33 @@ def tool_usage(
         "total": total,
         "distinct_tools": len(by_tool),
         "items": items,
-        "note": "Tool call frequencies from observed tool_events. Descriptive only.",
+        "note": "Tool call frequencies from canonical logical sessions. Descriptive only.",
     }
 
 
 def request_kind_distribution(
     conn: sqlite3.Connection, tr: TimeRange
 ) -> dict[str, Any]:
-    where, params = _session_time_clause(tr)
+    sessions = _aggregate_sessions(conn, tr)
+    metric_ids = sorted({session.metric_session_id for session in sessions})
+    if not metric_ids:
+        return {
+            "total": 0,
+            "items": [],
+            "orchestration_signals": {},
+            "note": "Deterministic request-kind classifications over canonical logical sessions. Counts of observed traffic — not quality scores.",
+        }
+    placeholders = ",".join("?" for _ in metric_ids)
     rows = conn.execute(
         f"""
         SELECT d.request_kind, COUNT(*) AS c
         FROM window_det_classifications d
         JOIN exchange_windows w ON w.id = d.window_id
-        JOIN sessions s ON s.id = w.session_id
-        WHERE {where}
+        WHERE w.session_id IN ({placeholders})
         GROUP BY d.request_kind
         ORDER BY c DESC
         """,
-        params,
+        metric_ids,
     ).fetchall()
     total = sum(int(r["c"]) for r in rows) or 1
     items = [
@@ -229,30 +305,27 @@ def request_kind_distribution(
         "items": items,
         "orchestration_signals": orchestration,
         "note": (
-            "Deterministic request-kind classifications over exchange windows. "
+            "Deterministic request-kind classifications over canonical logical sessions. "
             "Counts of observed traffic — not quality scores."
         ),
     }
 
 
 def model_monthly_mix(conn: sqlite3.Connection, tr: TimeRange) -> dict[str, Any]:
-    where, params = _session_time_clause(tr)
-    rows = conn.execute(
-        f"""
-        SELECT substr(s.started_at, 1, 7) AS month,
-               {sql_coalesce_model('s.model_canonical')} AS model,
-               s.harness,
-               COUNT(*) AS sessions
-        FROM sessions s
-        WHERE s.started_at IS NOT NULL AND {where}
-        GROUP BY month, {sql_coalesce_model('s.model_canonical')}, harness
-        ORDER BY month, sessions DESC
-        """,
-        params,
-    ).fetchall()
+    sessions = _aggregate_sessions(conn, tr)
+    metrics = _metric_rows(conn, sessions)
     months: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for r in rows:
-        months[r["month"]].append(dict(r))
+    for session in sessions:
+        started_at = session.row["started_at"]
+        if not started_at:
+            continue
+        months[str(started_at)[:7]].append(
+            {
+                "model": _model_label(metrics.get(session.metric_session_id)),
+                "harness": session.logical_harness,
+                "sessions": 1,
+            }
+        )
     series = []
     for month in sorted(months):
         items = collapse_by_model(months[month])
@@ -276,19 +349,30 @@ def model_monthly_mix(conn: sqlite3.Connection, tr: TimeRange) -> dict[str, Any]
 def duration_and_volume(
     conn: sqlite3.Connection, tr: TimeRange
 ) -> dict[str, Any]:
-    where, params = _session_time_clause(tr)
-    rows = conn.execute(
-        f"""
-        SELECT
-          s.id,
-          {_duration_seconds_sql()} AS duration_seconds,
-          (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) AS message_count,
-          (SELECT COUNT(*) FROM tool_events t WHERE t.session_id = s.id) AS tool_count
-        FROM sessions s
-        WHERE {where}
-        """,
-        params,
-    ).fetchall()
+    sessions = _aggregate_sessions(conn, tr)
+    metric_ids = sorted({session.metric_session_id for session in sessions})
+    if metric_ids:
+        placeholders = ",".join("?" for _ in metric_ids)
+        metric_rows = conn.execute(
+            f"""
+            SELECT
+              s.id,
+              {_duration_seconds_sql()} AS duration_seconds,
+              (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) AS message_count,
+              (SELECT COUNT(*) FROM tool_events t WHERE t.session_id = s.id) AS tool_count
+            FROM sessions s
+            WHERE s.id IN ({placeholders})
+            """,
+            metric_ids,
+        ).fetchall()
+    else:
+        metric_rows = []
+    by_metric = {str(row["id"]): row for row in metric_rows}
+    rows = [
+        by_metric[session.metric_session_id]
+        for session in sessions
+        if session.metric_session_id in by_metric
+    ]
 
     def _bucket_duration(seconds: int | None) -> str | None:
         if seconds is None or seconds < 0:
@@ -339,6 +423,7 @@ def duration_and_volume(
     durations.sort()
     return {
         "sessions": len(rows),
+        "identity_grain": "logical_sessions",
         "with_duration": len(durations),
         "duration_seconds": {
             "p50": _pct(durations, 50),
@@ -352,58 +437,42 @@ def duration_and_volume(
         "message_buckets": [
             {"bucket": b, "count": msg_counts.get(b, 0)} for b in msg_order
         ],
-        "note": "Observed session duration and message-volume distributions.",
+        "note": "Observed logical-session duration and message-volume distributions.",
     }
 
 
 def session_facets(conn: sqlite3.Connection, tr: TimeRange) -> dict[str, Any]:
-    where, params = _session_time_clause(tr)
-    harness = conn.execute(
-        f"""
-        SELECT s.harness AS value, COUNT(*) AS c
-        FROM sessions s WHERE {where}
-        GROUP BY s.harness ORDER BY c DESC
-        """,
-        params,
-    ).fetchall()
-    model = conn.execute(
-        f"""
-        SELECT {sql_coalesce_model('s.model_canonical')} AS value, COUNT(*) AS c
-        FROM sessions s WHERE {where}
-        GROUP BY value ORDER BY c DESC LIMIT 40
-        """,
-        params,
-    ).fetchall()
-    effort = conn.execute(
-        f"""
-        SELECT COALESCE(NULLIF(s.effort, ''), '(none)') AS value, COUNT(*) AS c
-        FROM sessions s WHERE {where}
-        GROUP BY value ORDER BY c DESC
-        """,
-        params,
-    ).fetchall()
-    branch = conn.execute(
-        f"""
-        SELECT COALESCE(NULLIF(s.branch, ''), '(none)') AS value, COUNT(*) AS c
-        FROM sessions s WHERE {where}
-        GROUP BY value ORDER BY c DESC LIMIT 40
-        """,
-        params,
-    ).fetchall()
-    rows = conn.execute(
-        f"SELECT s.repo, s.cwd FROM sessions s WHERE {where}",
-        params,
-    ).fetchall()
-    projects: dict[str, int] = defaultdict(int)
-    for r in rows:
-        projects[_project_label(r["repo"], r["cwd"])] += 1
-    project_items = sorted(projects.items(), key=lambda x: (-x[1], x[0]))[:40]
+    sessions = _aggregate_sessions(conn, tr)
+    metrics = _metric_rows(conn, sessions)
+    buckets: dict[str, dict[str, int]] = {
+        "harness": defaultdict(int),
+        "model": defaultdict(int),
+        "effort": defaultdict(int),
+        "branch": defaultdict(int),
+        "project": defaultdict(int),
+    }
+    for session in sessions:
+        row = session.row
+        buckets["harness"][session.logical_harness] += 1
+        buckets["model"][_model_label(metrics.get(session.metric_session_id))] += 1
+        buckets["effort"][str(row["effort"] or "(none)")] += 1
+        buckets["branch"][str(row["branch"] or "(none)")] += 1
+        buckets["project"][_project_label(row["repo"], row["cwd"])] += 1
+
+    def items(key: str) -> list[dict[str, Any]]:
+        return [
+            {"value": value, "count": count}
+            for value, count in sorted(
+                buckets[key].items(), key=lambda item: (-item[1], item[0])
+            )[:40]
+        ]
+
     return {
-        "harness": [{"value": r["value"], "count": int(r["c"])} for r in harness],
-        "model": [{"value": r["value"], "count": int(r["c"])} for r in model],
-        "effort": [{"value": r["value"], "count": int(r["c"])} for r in effort],
-        "branch": [{"value": r["value"], "count": int(r["c"])} for r in branch],
-        "project": [{"value": p, "count": n} for p, n in project_items],
+        "harness": items("harness"),
+        "model": items("model"),
+        "effort": items("effort"),
+        "branch": items("branch"),
+        "project": items("project"),
     }
 
 
@@ -424,29 +493,6 @@ def list_sessions_v2(
 ) -> dict[str, Any]:
     where, params = _session_time_clause(tr)
     clauses = [where]
-    if harness:
-        ph = ",".join(f":h{i}" for i in range(len(harness)))
-        clauses.append(f"s.harness IN ({ph})")
-        for i, h in enumerate(harness):
-            params[f"h{i}"] = h
-    if model:
-        ph = ",".join(f":m{i}" for i in range(len(model)))
-        clauses.append(
-            f"""EXISTS (
-                SELECT 1
-                FROM messages model_message
-                WHERE model_message.session_id = s.id
-                  AND model_message.role = 'assistant'
-                  AND {strict_message_model_sql(message_alias='model_message', session_alias='s')} IN ({ph})
-            )"""
-        )
-        for i, m in enumerate(model):
-            params[f"m{i}"] = m
-    if effort:
-        ph = ",".join(f":e{i}" for i in range(len(effort)))
-        clauses.append(f"COALESCE(NULLIF(s.effort, ''), '(none)') IN ({ph})")
-        for i, e in enumerate(effort):
-            params[f"e{i}"] = e
     if branch:
         ph = ",".join(f":b{i}" for i in range(len(branch)))
         clauses.append(f"COALESCE(NULLIF(s.branch, ''), '(none)') IN ({ph})")
@@ -484,18 +530,92 @@ def list_sessions_v2(
         params,
     ).fetchall()
 
-    items: list[dict[str, Any]] = []
+    identity = build_identity_context(conn)
+    candidates: list[tuple[sqlite3.Row, dict[str, Any], str]] = []
+    shadow_ids = provider_root_shadow_ids(conn, context=identity)
     for r in rows:
+        if r["id"] in shadow_ids:
+            continue
+        projection = logical_projection(
+            conn, str(r["id"]), str(r["harness"]), context=identity
+        )
+        if harness and projection["logical_harness"] not in harness:
+            continue
         label = _project_label(r["repo"], r["cwd"])
         if project and label not in project:
+            continue
+        candidates.append((r, projection, label))
+
+    metric_ids = sorted(
+        {
+            str(projection["transcript_session_id"] or row["id"])
+            for row, projection, _ in candidates
+        }
+    )
+    metric_rows: dict[str, sqlite3.Row] = {}
+    if metric_ids:
+        metric_ph = ",".join("?" for _ in metric_ids)
+        metric_rows = {
+            str(metric["id"]): metric
+            for metric in conn.execute(
+                f"""
+                SELECT id, model, model_canonical, effort
+                FROM sessions
+                WHERE id IN ({metric_ph})
+                """,
+                metric_ids,
+            ).fetchall()
+        }
+
+    metric_candidates: list[
+        tuple[sqlite3.Row, dict[str, Any], str, str, sqlite3.Row | None]
+    ] = []
+    for row, projection, label in candidates:
+        metric_id = str(projection["transcript_session_id"] or row["id"])
+        metric = metric_rows.get(metric_id)
+        metric_effort = metric["effort"] if metric is not None else row["effort"]
+        effort_value = metric_effort if metric_effort not in (None, "") else "(none)"
+        if effort and effort_value not in effort:
+            continue
+        metric_candidates.append((row, projection, label, metric_id, metric))
+
+    matching_metric_ids: set[str] | None = None
+    if model:
+        metric_ids = sorted({candidate[3] for candidate in metric_candidates})
+        matching_metric_ids = set()
+        if metric_ids:
+            metric_ph = ",".join("?" for _ in metric_ids)
+            model_ph = ",".join("?" for _ in model)
+            matching_metric_ids = {
+                str(row["session_id"])
+                for row in conn.execute(
+                    f"""
+                    SELECT DISTINCT model_message.session_id
+                    FROM messages model_message
+                    JOIN sessions model_session
+                      ON model_session.id = model_message.session_id
+                    WHERE model_message.session_id IN ({metric_ph})
+                      AND model_message.role = 'assistant'
+                      AND {strict_message_model_sql(message_alias='model_message', session_alias='model_session')} IN ({model_ph})
+                    """,
+                    [*metric_ids, *model],
+                ).fetchall()
+            }
+
+    items: list[dict[str, Any]] = []
+    for r, projection, label, metric_id, metric in metric_candidates:
+        if matching_metric_ids is not None and metric_id not in matching_metric_ids:
             continue
         dur = r["duration_seconds"]
         items.append(
             {
                 "id": r["id"],
                 "harness": r["harness"],
-                "model": display_model(r["model_canonical"]),
-                "effort": r["effort"],
+                **projection,
+                "model": display_model(
+                    metric["model_canonical"] if metric is not None else r["model_canonical"]
+                ),
+                "effort": metric["effort"] if metric is not None else r["effort"],
                 "project": label,
                 "repo": r["repo"],
                 "branch": r["branch"],
@@ -526,7 +646,7 @@ def list_sessions_v2(
         if sort_key == "model":
             return item["model"]
         if sort_key == "harness":
-            return item["harness"]
+            return item["logical_harness"]
         if sort_key == "effort":
             return item["effort"] or ""
         if sort_key == "project":
@@ -538,7 +658,7 @@ def list_sessions_v2(
     def _attach_counts(target: list[dict[str, Any]]) -> None:
         if not target:
             return
-        ids = [it["id"] for it in target]
+        ids = [it["transcript_session_id"] or it["id"] for it in target]
         placeholders = ",".join("?" * len(ids))
         msg = {
             r["session_id"]: int(r["c"])
@@ -565,7 +685,7 @@ def list_sessions_v2(
             ).fetchall()
         }
         for it in target:
-            sid = it["id"]
+            sid = it["transcript_session_id"] or it["id"]
             it["message_count"] = msg.get(sid, 0)
             it["tool_count"] = tools.get(sid, 0)
             it["window_count"] = windows.get(sid, 0)
@@ -573,6 +693,7 @@ def list_sessions_v2(
     if needs_counts_for_sort:
         _attach_counts(items)
 
+    items.sort(key=lambda item: str(item["id"]))
     items.sort(key=sort_value, reverse=reverse)
     total = len(items)
     offset = max(0, cursor)
@@ -619,6 +740,25 @@ def session_detail_v2(
     ).fetchone()
     if s is None:
         return None
+    identity = build_identity_context(conn)
+    projection = logical_projection(
+        conn, resolved_id, str(s["harness"]), context=identity
+    )
+    transcript_id = projection["transcript_session_id"] or resolved_id
+    transcript = s
+    if transcript_id != resolved_id:
+        transcript = conn.execute(
+            """
+            SELECT s.*, a.path AS artifact_path
+            FROM sessions s
+            LEFT JOIN artifacts a ON a.id = s.artifact_id
+            WHERE s.id = ?
+            """,
+            (transcript_id,),
+        ).fetchone()
+        if transcript is None:
+            transcript = s
+            transcript_id = resolved_id
 
     messages = conn.execute(
         """
@@ -626,14 +766,15 @@ def session_detail_v2(
                is_tool_plumbing, authored_by_agent
         FROM messages WHERE session_id = ? ORDER BY seq
         """,
-        (resolved_id,),
+        (transcript_id,),
     ).fetchall()
     tools = conn.execute(
         """
-        SELECT id, message_id, seq, tool_name, action, success, duration_ms
+        SELECT id, message_id, seq, tool_name, action, success, duration_ms,
+               operation_kind
         FROM tool_events WHERE session_id = ? ORDER BY seq
         """,
-        (resolved_id,),
+        (transcript_id,),
     ).fetchall()
     skills = conn.execute(
         """
@@ -642,14 +783,14 @@ def session_detail_v2(
         GROUP BY skill_name, exposure_type
         ORDER BY c DESC
         """,
-        (resolved_id,),
+        (transcript_id,),
     ).fetchall()
     skill_msgs = conn.execute(
         """
         SELECT message_id, skill_name FROM skill_exposures
         WHERE session_id = ? AND message_id IS NOT NULL
         """,
-        (resolved_id,),
+        (transcript_id,),
     ).fetchall()
     kinds = conn.execute(
         """
@@ -658,13 +799,13 @@ def session_detail_v2(
         JOIN window_det_classifications d ON d.window_id = w.id
         WHERE w.session_id = ?
         """,
-        (resolved_id,),
+        (transcript_id,),
     ).fetchall()
     windows = conn.execute(
         """
         SELECT COUNT(*) AS c FROM exchange_windows WHERE session_id = ?
         """,
-        (resolved_id,),
+        (transcript_id,),
     ).fetchone()
     children = conn.execute(
         """
@@ -674,7 +815,11 @@ def session_detail_v2(
         WHERE parent_session_id IN (?, ?, ?)
         ORDER BY COALESCE(started_at, '') ASC
         """,
-        (resolved_id, s["external_id"], f"{s['harness']}:{s['external_id']}"),
+        (
+            transcript_id,
+            transcript["external_id"],
+            f"{transcript['harness']}:{transcript['external_id']}",
+        ),
     ).fetchall()
 
     tools_by_msg: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -744,6 +889,7 @@ def session_detail_v2(
         "session": {
             "id": s["id"],
             "harness": s["harness"],
+            **projection,
             "model": display_model(s["model_canonical"]),
             "model_raw": s["model"],
             "effort": s["effort"],
@@ -760,11 +906,25 @@ def session_detail_v2(
             "artifact_path": s["artifact_path"],
             "external_id": s["external_id"],
         },
+        "transcript": {
+            "id": transcript["id"],
+            "harness": transcript["harness"],
+            "artifact_id": transcript["artifact_id"],
+            "artifact_path": transcript["artifact_path"],
+        },
         "timeline": timeline,
         "messages": [_with_display_model(m) for m in messages],
         "tool_events": [dict(t) for t in tools],
         "skills": [dict(sk) for sk in skills],
-        "children": [_with_display_model(c) for c in children],
+        "children": [
+            {
+                **_with_display_model(c),
+                **logical_projection(
+                    conn, str(c["id"]), str(c["harness"]), context=identity
+                ),
+            }
+            for c in children
+        ],
         "anatomy": {
             "message_count": len(messages),
             "tool_count": len(tools),
@@ -797,22 +957,26 @@ def search_messages(
             "items": [],
             "note": "Enter a search term to query messages_fts.",
         }
-    where, params = _session_time_clause(tr)
-    clauses = [where, "messages_fts MATCH :match"]
-    params["match"] = match
-    if harness:
-        ph = ",".join(f":h{i}" for i in range(len(harness)))
-        clauses.append(f"s.harness IN ({ph})")
-        for i, h in enumerate(harness):
-            params[f"h{i}"] = h
-    if model:
-        ph = ",".join(f":m{i}" for i in range(len(model)))
-        clauses.append(
-            f"{sql_coalesce_model('s.model_canonical')} IN ({ph})"
-        )
-        for i, m in enumerate(model):
-            params[f"m{i}"] = m
+    sessions = _aggregate_sessions(conn, tr)
+    by_metric = {session.metric_session_id: session for session in sessions}
+    if not by_metric:
+        return {
+            "q": q,
+            "match": match,
+            "total": 0,
+            "cursor": max(0, cursor),
+            "next_cursor": None,
+            "items": [],
+            "note": "Full-text search over canonical logical transcripts.",
+            "truncated": False,
+        }
+    params: dict[str, Any] = {"match": match}
+    metric_ph = ",".join(f":metric{i}" for i in range(len(by_metric)))
+    for i, session_id in enumerate(sorted(by_metric)):
+        params[f"metric{i}"] = session_id
+    clauses = ["messages_fts MATCH :match", f"m.session_id IN ({metric_ph})"]
     where_sql = " AND ".join(clauses)
+    metrics = _metric_rows(conn, sessions)
     # Fetch a bounded candidate set then project-filter in Python.
     fetch_n = min(2000, max(limit * 5, cursor + limit + 200))
     rows = conn.execute(
@@ -844,24 +1008,34 @@ def search_messages(
 
     items: list[dict[str, Any]] = []
     for r in rows:
-        label = _project_label(r["repo"], r["cwd"])
+        session = by_metric.get(str(r["session_id"]))
+        if session is None:
+            continue
+        if harness and session.logical_harness not in harness:
+            continue
+        source_model = _model_label(metrics.get(session.metric_session_id))
+        if model and source_model not in model:
+            continue
+        label = _project_label(session.row["repo"], session.row["cwd"])
         if project and label not in project:
             continue
         items.append(
             {
                 "message_id": r["message_id"],
-                "session_id": r["session_id"],
+                "session_id": session.session_id,
+                "physical_session_id": r["session_id"],
                 "seq": r["seq"],
                 "role": r["role"],
                 "timestamp": r["timestamp"],
                 "snippet": r["snippet"],
-                "harness": r["harness"],
-                "model": display_model(
-                    r["session_model"] or r["message_model"]
-                ),
-                "effort": r["effort"],
+                "harness": session.logical_harness,
+                "runtime_harness": session.runtime_harness,
+                "orchestrator_session_id": session.orchestrator_session_id,
+                "transcript_session_id": session.metric_session_id,
+                "model": display_model(source_model),
+                "effort": session.row["effort"],
                 "project": label,
-                "started_at": r["started_at"],
+                "started_at": session.row["started_at"],
             }
         )
     total = len(items)
@@ -875,8 +1049,8 @@ def search_messages(
         "next_cursor": offset + limit if offset + limit < total else None,
         "items": page,
         "note": (
-            "Full-text search over messages_fts. Snippets use « » around matches. "
-            "Click through to the session transcript at the matching message."
+            "Full-text search over canonical logical transcripts. Snippets use « » "
+            "around matches. Click through to the logical session at the matching message."
         ),
         "truncated": total >= fetch_n,
     }
@@ -915,7 +1089,7 @@ def orchestration_overview(
     conn: sqlite3.Connection, tr: TimeRange, *, limit: int = 40
 ) -> dict[str, Any]:
     where, params = _session_time_clause(tr, alias="p")
-    roots = conn.execute(
+    root_edges = conn.execute(
         f"""
         SELECT
             p.id,
@@ -927,85 +1101,205 @@ def orchestration_overview(
             p.cwd,
             p.started_at,
             p.ended_at,
-            COUNT(c.id) AS child_count,
-            (SELECT COUNT(*) FROM messages m WHERE m.session_id = p.id) AS message_count
+            c.id AS child_id
         FROM sessions p
         JOIN sessions c ON {_parent_match_sql("p", "c")}
         WHERE {where}
-        GROUP BY p.id
-        ORDER BY child_count DESC, COALESCE(p.started_at, '') DESC
-        LIMIT :limit
-        """,
-        {**params, "limit": limit},
-    ).fetchall()
-
-    kind_where, kind_params = _session_time_clause(tr)
-    kinds = conn.execute(
-        f"""
-        SELECT d.request_kind, COUNT(*) AS c
-        FROM window_det_classifications d
-        JOIN exchange_windows w ON w.id = d.window_id
-        JOIN sessions s ON s.id = w.session_id
-        WHERE {kind_where}
-          AND d.request_kind IN (
-            'worker_brief', 'inter_agent_handoff', 'task_notification', 'auto_review'
-          )
-        GROUP BY d.request_kind
-        """,
-        kind_params,
-    ).fetchall()
-    signals = {r["request_kind"]: int(r["c"]) for r in kinds}
-
-    child_where, child_params = _session_time_clause(tr)
-    child_total = conn.execute(
-        f"""
-        SELECT COUNT(*) AS c FROM sessions s
-        WHERE {child_where} AND s.parent_session_id IS NOT NULL
-        """,
-        child_params,
-    ).fetchone()
-
-    root_total = conn.execute(
-        f"""
-        SELECT COUNT(*) AS c FROM (
-            SELECT p.id
-            FROM sessions p
-            JOIN sessions c ON {_parent_match_sql("p", "c")}
-            WHERE {where}
-            GROUP BY p.id
-        )
         """,
         params,
-    ).fetchone()
+    ).fetchall()
+
+    identity = build_identity_context(conn)
+    kind_where, kind_params = _session_time_clause(tr)
+    signal_rows = conn.execute(
+        f"SELECT s.id, s.harness FROM sessions s WHERE {kind_where}",
+        kind_params,
+    ).fetchall()
+    signal_metrics = sorted(
+        {
+            item.metric_session_id
+            for item in visible_logical_sessions(
+                conn, signal_rows, context=identity
+            )
+        }
+    )
+    signals: dict[str, int] = {}
+    if signal_metrics:
+        placeholders = ",".join("?" for _ in signal_metrics)
+        kinds = conn.execute(
+            f"""
+            SELECT d.request_kind, COUNT(*) AS c
+            FROM window_det_classifications d
+            JOIN exchange_windows w ON w.id = d.window_id
+            WHERE w.session_id IN ({placeholders})
+              AND d.request_kind IN (
+                'worker_brief', 'inter_agent_handoff', 'task_notification', 'auto_review'
+              )
+            GROUP BY d.request_kind
+            """,
+            signal_metrics,
+        ).fetchall()
+        signals = {r["request_kind"]: int(r["c"]) for r in kinds}
+    root_shadow_ids = provider_root_shadow_ids(conn, context=identity)
+    physical_roots: dict[str, sqlite3.Row] = {}
+    children_by_root: dict[str, set[str]] = {}
+    for edge in root_edges:
+        physical_id = str(edge["id"])
+        physical_roots.setdefault(physical_id, edge)
+        children_by_root.setdefault(physical_id, set()).add(str(edge["child_id"]))
+
+    link_children_by_source: dict[str, set[str]] = {}
+    for source_id, backings in identity.backings_by_source.items():
+        for backing in backings:
+            target_id = backing["target_session_id"]
+            if (
+                backing.get("link_role") != "worker"
+                or not target_id
+                or identity.owners_by_session.get(str(target_id), set())
+                != {source_id}
+            ):
+                continue
+            link_children_by_source.setdefault(source_id, set()).add(str(target_id))
+    if link_children_by_source:
+        link_where, link_params = _session_time_clause(tr, alias="s")
+        placeholders = ",".join(
+            f":link_source_{index}"
+            for index, _ in enumerate(link_children_by_source)
+        )
+        link_query_params = {
+            **link_params,
+            **{
+                f"link_source_{index}": source_id
+                for index, source_id in enumerate(sorted(link_children_by_source))
+            },
+        }
+        link_rows = conn.execute(
+            f"""
+            SELECT s.id, s.harness, s.model AS model_raw, s.model_canonical,
+                   s.effort, s.repo, s.cwd, s.started_at, s.ended_at
+            FROM sessions s
+            WHERE s.id IN ({placeholders}) AND {link_where}
+            """,
+            link_query_params,
+        ).fetchall()
+        for row in link_rows:
+            source_id = str(row["id"])
+            physical_roots.setdefault(source_id, row)
+            children_by_root.setdefault(source_id, set()).update(
+                link_children_by_source[source_id]
+            )
+
+    def presentation_id(row: sqlite3.Row) -> str:
+        physical_id = str(row["id"])
+        if physical_id not in root_shadow_ids:
+            return physical_id
+        return logical_root_session_id(conn, physical_id, context=identity)
+
+    logical_children: dict[str, set[str]] = {}
+    for physical_id, row in physical_roots.items():
+        logical_id = presentation_id(row)
+        logical_children.setdefault(logical_id, set()).update(
+            children_by_root[physical_id]
+        )
+
+    presentation_rows = dict(physical_roots)
+    missing_ids = set(logical_children).difference(presentation_rows)
+    if missing_ids:
+        placeholders = ",".join("?" for _ in missing_ids)
+        rows = conn.execute(
+            f"""
+            SELECT s.id, s.harness, s.model AS model_raw, s.model_canonical,
+                   s.effort, s.repo, s.cwd, s.started_at, s.ended_at
+            FROM sessions s
+            WHERE s.id IN ({placeholders})
+            """,
+            sorted(missing_ids),
+        ).fetchall()
+        presentation_rows.update({str(row["id"]): row for row in rows})
+
+    projections: dict[str, dict[str, Any]] = {}
+    message_session_ids: set[str] = set()
+    for logical_id in logical_children:
+        row = presentation_rows.get(logical_id)
+        if row is None:
+            continue
+        projection = logical_projection(
+            conn, logical_id, str(row["harness"]), context=identity
+        )
+        projections[logical_id] = projection
+        message_session_ids.add(projection["transcript_session_id"] or logical_id)
+    message_counts: dict[str, int] = {}
+    metric_rows: dict[str, sqlite3.Row] = {}
+    if message_session_ids:
+        placeholders = ",".join("?" for _ in message_session_ids)
+        message_counts = {
+            str(row["session_id"]): int(row["c"])
+            for row in conn.execute(
+                f"""
+                SELECT session_id, COUNT(*) AS c
+                FROM messages
+                WHERE session_id IN ({placeholders})
+                GROUP BY session_id
+                """,
+                sorted(message_session_ids),
+            ).fetchall()
+        }
+        metric_rows = {
+            str(metric["id"]): metric
+            for metric in conn.execute(
+                f"""
+                SELECT id, model, model_canonical, effort
+                FROM sessions
+                WHERE id IN ({placeholders})
+                """,
+                sorted(message_session_ids),
+            ).fetchall()
+        }
 
     items = []
-    for r in roots:
+    for logical_id, child_ids in logical_children.items():
+        row = presentation_rows.get(logical_id)
+        projection = projections.get(logical_id)
+        if row is None or projection is None:
+            continue
+        transcript_id = projection["transcript_session_id"] or logical_id
+        metric = metric_rows.get(transcript_id)
+        metric_model = metric["model_canonical"] if metric is not None else row["model_canonical"]
+        metric_model_raw = metric["model"] if metric is not None else row["model_raw"]
+        metric_effort = metric["effort"] if metric is not None else row["effort"]
         items.append(
             {
-                "id": r["id"],
-                "harness": r["harness"],
-                "model": display_model(r["model_canonical"]),
-                "model_raw": r["model_raw"],
-                "effort": r["effort"],
-                "project": _project_label(r["repo"], r["cwd"]),
-                "started_at": r["started_at"],
-                "ended_at": r["ended_at"],
-                "child_count": int(r["child_count"]),
-                "message_count": int(r["message_count"]),
+                "id": logical_id,
+                "harness": row["harness"],
+                **projection,
+                "model": display_model(metric_model),
+                "model_raw": metric_model_raw,
+                "effort": metric_effort,
+                "project": _project_label(row["repo"], row["cwd"]),
+                "started_at": row["started_at"],
+                "ended_at": row["ended_at"],
+                "child_count": len(child_ids),
+                "message_count": message_counts.get(transcript_id, 0),
             }
         )
+    items.sort(
+        key=lambda item: (item["child_count"], item["started_at"] or ""),
+        reverse=True,
+    )
+    root_total = len(items)
     return {
-        "supervisor_roots": int(root_total["c"]) if root_total else 0,
-        "child_sessions": int(child_total["c"]) if child_total else 0,
+        "supervisor_roots": root_total,
+        "child_sessions": sum(len(children) for children in logical_children.values()),
         "signals": {
             "worker_brief": signals.get("worker_brief", 0),
             "inter_agent_handoff": signals.get("inter_agent_handoff", 0),
             "task_notification": signals.get("task_notification", 0),
             "auto_review": signals.get("auto_review", 0),
         },
-        "items": items,
+        "items": items[:limit],
         "note": (
-            "Supervisor sessions with at least one child via parent_session_id. "
+            "Supervisor sessions with at least one child via parent_session_id "
+            "or an observed worker link. "
             "Navigable tree is available per root."
         ),
     }
@@ -1017,38 +1311,100 @@ def orchestration_tree(
     root = _resolve_session(conn, session_id)
     if root is None:
         return None
+    identity = build_identity_context(conn)
+    metric_rows: dict[str, sqlite3.Row | None] = {}
+
+    def metric_row(session_id: str) -> sqlite3.Row | None:
+        if session_id not in metric_rows:
+            metric_rows[session_id] = conn.execute(
+                """
+                SELECT model, model_canonical, effort
+                FROM sessions
+                WHERE id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+        return metric_rows[session_id]
+
+    def children_of(row: sqlite3.Row) -> list[sqlite3.Row]:
+        return conn.execute(
+            """
+            SELECT * FROM sessions
+            WHERE parent_session_id IN (?, ?, ?)
+            ORDER BY COALESCE(started_at, '') ASC
+            """,
+            (
+                row["id"],
+                row["external_id"],
+                f"{row['harness']}:{row['external_id']}",
+            ),
+        ).fetchall()
+
+    def node_ids(nodes: list[dict[str, Any]]) -> set[str]:
+        seen: set[str] = set()
+        pending = list(nodes)
+        while pending:
+            node = pending.pop()
+            node_id = str(node["id"])
+            if node_id in seen:
+                continue
+            seen.add(node_id)
+            pending.extend(node["children"])
+        return seen
 
     def node_for(row: sqlite3.Row, depth: int = 0) -> dict[str, Any]:
         # Guard pathological cycles / extreme fan-out depth.
         if depth > 12:
             kids: list[sqlite3.Row] = []
         else:
-            kids = conn.execute(
-                """
-                SELECT * FROM sessions
-                WHERE parent_session_id IN (?, ?, ?)
-                ORDER BY COALESCE(started_at, '') ASC
-                """,
-                (
-                    row["id"],
-                    row["external_id"],
-                    f"{row['harness']}:{row['external_id']}",
-                ),
-            ).fetchall()
+            kids = children_of(row)
+        relationships: dict[str, str] = {}
+        provider_links: list[dict[str, Any]] = []
+        root_target_ids: set[str] = set()
+        if row["harness"] == "t3code":
+            known = {str(k["id"]) for k in kids}
+            provider_links = provider_backings(
+                conn, str(row["id"]), context=identity
+            )
+            for backing in provider_root_backings(
+                conn, str(row["id"]), context=identity
+            ):
+                target_id = backing["target_session_id"]
+                if target_id:
+                    root_target_ids.add(str(target_id))
+                if not target_id:
+                    continue
+                target = conn.execute(
+                    "SELECT * FROM sessions WHERE id = ?", (target_id,)
+                ).fetchone()
+                if target is None:
+                    continue
+                for child in children_of(target):
+                    child_id = str(child["id"])
+                    if child_id in known:
+                        continue
+                    kids.append(child)
+                    known.add(child_id)
+        projection = logical_projection(
+            conn, str(row["id"]), str(row["harness"]), context=identity
+        )
+        count_session_id = projection["transcript_session_id"] or str(row["id"])
+        metric = metric_row(count_session_id) or row
         msg_n = conn.execute(
             "SELECT COUNT(*) AS c FROM messages WHERE session_id = ?",
-            (row["id"],),
+            (count_session_id,),
         ).fetchone()
         tool_n = conn.execute(
             "SELECT COUNT(*) AS c FROM tool_events WHERE session_id = ?",
-            (row["id"],),
+            (count_session_id,),
         ).fetchone()
-        return {
+        node = {
             "id": row["id"],
             "harness": row["harness"],
-            "model": display_model(row["model_canonical"]),
-            "model_raw": row["model"],
-            "effort": row["effort"],
+            **projection,
+            "model": display_model(metric["model_canonical"]),
+            "model_raw": metric["model"],
+            "effort": metric["effort"],
             "project": _project_label(row["repo"], row["cwd"]),
             "started_at": row["started_at"],
             "ended_at": row["ended_at"],
@@ -1056,6 +1412,28 @@ def orchestration_tree(
             "tool_count": int(tool_n["c"]) if tool_n else 0,
             "children": [node_for(k, depth + 1) for k in kids],
         }
+        if row["harness"] == "t3code":
+            reachable = node_ids(node["children"])
+            for backing in provider_links:
+                target_id = backing["target_session_id"]
+                if not target_id or str(target_id) in root_target_ids:
+                    continue
+                if str(target_id) in reachable:
+                    continue
+                target = conn.execute(
+                    "SELECT * FROM sessions WHERE id = ?", (target_id,)
+                ).fetchone()
+                if target is None:
+                    continue
+                child = node_for(target, depth + 1)
+                node["children"].append(child)
+                relationships[str(target_id)] = "provider_worker"
+                reachable.update(node_ids([child]))
+        for child in node["children"]:
+            relation = relationships.get(str(child["id"]))
+            if relation:
+                child["relationship"] = relation
+        return node
 
     # If caller passed a child, walk up to the true root for a full tree.
     walk = root
@@ -1066,6 +1444,14 @@ def orchestration_tree(
         if parent is None:
             break
         walk = parent
+
+    owner_id = logical_orchestrator_id(conn, str(walk["id"]), context=identity)
+    if owner_id:
+        owner = conn.execute(
+            "SELECT * FROM sessions WHERE id = ?", (owner_id,)
+        ).fetchone()
+        if owner is not None:
+            walk = owner
 
     tree = node_for(walk)
     return {
@@ -1083,71 +1469,100 @@ def auto_review_surface(
     conn: sqlite3.Connection, tr: TimeRange, *, limit: int = 50
 ) -> dict[str, Any]:
     where, params = _session_time_clause(tr)
-    total = conn.execute(
-        f"""
-        SELECT COUNT(*) AS c
-        FROM auto_review_observations a
-        JOIN exchange_windows w ON w.id = a.window_id
-        JOIN sessions s ON s.id = w.session_id
-        WHERE {where}
-        """,
-        params,
-    ).fetchone()
-    by_model = conn.execute(
-        f"""
-        SELECT {sql_coalesce_model('s.model_canonical')} AS model,
-               s.harness AS harness,
-               COUNT(*) AS count
-        FROM auto_review_observations a
-        JOIN exchange_windows w ON w.id = a.window_id
-        JOIN sessions s ON s.id = w.session_id
-        WHERE {where}
-        GROUP BY 1, 2
-        ORDER BY 3 DESC
-        """,
-        params,
-    ).fetchall()
-    by_day = conn.execute(
-        f"""
-        SELECT substr(COALESCE(s.started_at, a.created_at), 1, 10) AS day,
-               COUNT(*) AS c
-        FROM auto_review_observations a
-        JOIN exchange_windows w ON w.id = a.window_id
-        JOIN sessions s ON s.id = w.session_id
-        WHERE {where}
-        GROUP BY day
-        ORDER BY day
-        """,
-        params,
-    ).fetchall()
-    recent = conn.execute(
+    observations = conn.execute(
         f"""
         SELECT
             a.id,
             a.window_id,
             a.created_at,
+            a.payload_json,
             s.id AS session_id,
-            s.harness,
-            s.model_canonical,
-            s.effort,
-            s.repo,
-            s.cwd,
-            s.started_at,
-            a.payload_json
+            s.harness
         FROM auto_review_observations a
         JOIN exchange_windows w ON w.id = a.window_id
         JOIN sessions s ON s.id = w.session_id
         WHERE {where}
-        ORDER BY COALESCE(a.created_at, s.started_at, '') DESC
-        LIMIT :limit
         """,
-        {**params, "limit": limit},
+        params,
     ).fetchall()
+
+    identity = build_identity_context(conn)
+    session_rows = conn.execute(
+        f"SELECT s.id, s.harness FROM sessions s WHERE {where}", params
+    ).fetchall()
+    visible = visible_logical_sessions(conn, session_rows, context=identity)
+    canonical_metrics = {
+        item.metric_session_id: item for item in visible
+    }
+    canonical: list[tuple[sqlite3.Row, VisibleLogicalSession]] = []
+    for observation in observations:
+        physical_session_id = str(observation["session_id"])
+        logical = canonical_metrics.get(physical_session_id)
+        if logical is None:
+            continue
+        canonical.append((observation, logical))
+
+    metric_ids = sorted({item.metric_session_id for _, item in canonical})
+    display_ids = sorted({item.session_id for _, item in canonical})
+
+    def session_rows(ids: list[str]) -> dict[str, sqlite3.Row]:
+        if not ids:
+            return {}
+        placeholders = ",".join("?" for _ in ids)
+        rows = conn.execute(
+            f"""
+            SELECT id, model_canonical, effort, repo, cwd, started_at
+            FROM sessions WHERE id IN ({placeholders})
+            """,
+            ids,
+        ).fetchall()
+        return {str(row["id"]): row for row in rows}
+
+    metric_rows = session_rows(metric_ids)
+    display_rows = session_rows(display_ids)
+    model_counts: dict[tuple[str, str], int] = defaultdict(int)
+    day_counts: dict[str, int] = defaultdict(int)
+    normalized: list[dict[str, Any]] = []
+    for observation, logical in canonical:
+        metric = metric_rows.get(logical.metric_session_id)
+        display = display_rows.get(logical.session_id) or metric
+        if metric is None or display is None:
+            continue
+        model = display_model(metric["model_canonical"])
+        harness = logical.logical_harness
+        model_counts[(model, harness)] += 1
+        day = str(display["started_at"] or observation["created_at"] or "")[:10]
+        if day:
+            day_counts[day] += 1
+        normalized.append(
+            {
+                "observation": observation,
+                "logical": logical,
+                "session_id": logical.session_id,
+                "transcript_session_id": logical.metric_session_id,
+                "metric": metric,
+                "display": display,
+                "model": model,
+                "harness": harness,
+            }
+        )
+    normalized.sort(
+        key=lambda item: str(
+            item["observation"]["created_at"]
+            or item["display"]["started_at"]
+            or ""
+        ),
+        reverse=True,
+    )
 
     import json
 
     items = []
-    for r in recent:
+    for entry in normalized[:limit]:
+        r = entry["observation"]
+        logical = entry["logical"]
+        metric = entry["metric"]
+        display = entry["display"]
         try:
             payload = json.loads(r["payload_json"] or "{}")
         except json.JSONDecodeError:
@@ -1156,12 +1571,16 @@ def auto_review_surface(
             {
                 "id": r["id"],
                 "window_id": r["window_id"],
-                "session_id": r["session_id"],
-                "harness": r["harness"],
-                "model": display_model(r["model_canonical"]),
-                "effort": r["effort"],
-                "project": _project_label(r["repo"], r["cwd"]),
-                "started_at": r["started_at"],
+                "session_id": entry["session_id"],
+                "physical_session_id": r["session_id"],
+                "transcript_session_id": entry["transcript_session_id"],
+                "harness": entry["harness"],
+                "logical_harness": entry["harness"],
+                "runtime_harness": logical.runtime_harness,
+                "model": entry["model"],
+                "effort": metric["effort"],
+                "project": _project_label(display["repo"], display["cwd"]),
+                "started_at": display["started_at"],
                 "created_at": r["created_at"],
                 "status": payload.get("status"),
                 "route": payload.get("route"),
@@ -1169,14 +1588,21 @@ def auto_review_surface(
             }
         )
     return {
-        "total": int(total["c"]) if total else 0,
+        "total": len(normalized),
         "by_model": collapse_by_model(
-            [dict(r) for r in by_model], count_key="count"
+            [
+                {"model": model, "harness": harness, "count": count}
+                for (model, harness), count in model_counts.items()
+            ],
+            count_key="count",
         )[:30],
-        "by_day": [{"day": r["day"], "count": int(r["c"])} for r in by_day if r["day"]],
+        "by_day": [
+            {"day": day, "count": count}
+            for day, count in sorted(day_counts.items())
+        ],
         "items": items,
         "note": (
             "Auto-review traffic is excluded from UX interaction-style metrics, "
-            "but it is real work and listed here as observed volume."
+            "but is listed here as logical observed volume."
         ),
     }

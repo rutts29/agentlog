@@ -43,11 +43,17 @@ Do **not** invent file paths. If no allowed target fits, abstain.
 
 - Treat only `request_kind=substantive` windows as human-habit evidence.
 - Ignore auto_review / worker_brief / harness-synthetic traffic as habit proof.
-- Require distinct root sessions for support:
-  - `<5` sessions → abstain (do not emit a proposal)
-  - `5–9` → `support_tier=insufficient` (emit only if the instruction rewrite is
-    narrowly evidenced; prefer abstain when unsure)
-  - `≥10` → `support_tier=ok` is allowed
+- Require at least 10 distinct `logical_root_id` values for support. Fewer than
+  10 means abstain; never emit an insufficient proposal.
+- Every proposal needs at least three distinct-root entries from
+  `validated_miss_pairs`, and each selected pair's window must also be cited in
+  `evidence`. Use the packet's theme as `pattern_key`.
+- Link `config_gap` to the selected target with that target's exact
+  `config_snippets` content hash. If the packet lacks three qualifying pairs or
+  cannot prove the config linkage, abstain.
+- A global target needs at least 15 distinct `logical_root_id` values, evidence
+  from at least two logical harnesses, and no harness or opaque project key
+  above 70% of cited roots.
 - Co-occurrence is not causation. Never claim a skill or model *caused* an outcome.
 - Every proposal must include verbatim evidence quotes that appear in the packet
   windows (substring match). Paraphrase is rejectable.
@@ -80,6 +86,15 @@ Return JSON only:
       "does_not_prove": "what the evidence does not establish",
       "support_tier": "ok",
       "sample_size": 11,
+      "pattern_key": "<packet theme>",
+      "validated_miss_pair_ids": [
+        "<three or more pair_id values from validated_miss_pairs>"
+      ],
+      "config_gap": {
+        "target_path": "<same target_path as proposal>",
+        "content_hash": "<matching config_snippets content_hash>",
+        "finding": "plain, factual description of the missing or inadequate rule"
+      },
       "evidence": [
         {
           "session_id": "...",

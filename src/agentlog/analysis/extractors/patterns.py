@@ -7,6 +7,7 @@ from agentlog.analysis.extractors.taxonomy import (
     SKILL_BODY_CHAR_THRESHOLD,
     TurnKind,
 )
+from agentlog.normalize.synthetic import is_cursor_subagent_followup
 
 _AUTO_REVIEW_RE = re.compile(
     r"(codex agent history added since your last approval assessment|"
@@ -15,8 +16,7 @@ _AUTO_REVIEW_RE = re.compile(
     re.IGNORECASE,
 )
 _TASK_NOTIF_RE = re.compile(
-    r"^\s*<task-notification\b|"
-    r"perform any necessary follow-up actions in response to the subagent completion",
+    r"^\s*<task-notification\b",
     re.IGNORECASE,
 )
 _REALTIME_DELEGATION_RE = re.compile(
@@ -108,7 +108,7 @@ def classify_request_text(text: str) -> RequestKindHit:
             "auto_review",
             (TurnKind.AUTO_REVIEW.value, TurnKind.HARNESS_SYNTHETIC.value),
         )
-    if _TASK_NOTIF_RE.search(stripped):
+    if _TASK_NOTIF_RE.search(stripped) or is_cursor_subagent_followup(stripped):
         return RequestKindHit(
             "task_notification",
             (TurnKind.HARNESS_SYNTHETIC.value,),

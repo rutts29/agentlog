@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 from agentlog.api.app import create_app
 from agentlog.db.repository import Repository
 from agentlog.db.schema import connect, init_db
-from agentlog.ingest.pipeline import ingest_harness
+from agentlog.ingest.pipeline import IngestStats, ingest_harness
 from agentlog.watch.daemon import WatchDaemon
 from agentlog.watch.debounce import Debouncer
 from agentlog.watch.events import list_ingest_events, record_ingest_event
@@ -268,6 +268,55 @@ class WatchDaemonIngestTests(unittest.TestCase):
         self.assertEqual(second.parsed, 0)
         self.assertEqual(second.appended, 0)
         self.assertGreaterEqual(second.skipped, 1)
+
+    def test_failed_cycle_schedules_bounded_retry(self) -> None:
+        path = self.sessions / "rollout-watch-retry.jsonl"
+        path.write_text(_codex_jsonl("watch-retry"), encoding="utf-8")
+        failed = IngestStats(failed=1)
+        succeeded = IngestStats(skipped=1)
+        daemon = WatchDaemon(
+            db_path=self.db,
+            sources=[WatchSource("codex", self.sessions, poll=False)],
+            debounce_seconds=0,
+            use_watchdog=False,
+        )
+        daemon._note_change("codex", str(path))
+        with mock.patch(
+            "agentlog.watch.daemon.ingest_harness",
+            side_effect=[failed, succeeded],
+        ) as ingest:
+            daemon._run_ingest("codex")
+            self.assertEqual(daemon._debouncer.drain_ready(), ["codex"])
+            daemon._run_ingest("codex")
+
+        self.assertEqual(ingest.call_count, 2)
+        self.assertEqual(daemon._take_changed("codex"), [])
+        self.assertNotIn("codex", daemon._retry_counts)
+
+    def test_failed_cycle_without_change_schedules_retry_and_no_failure_event(self) -> None:
+        failed = IngestStats(failed=1)
+        succeeded = IngestStats(skipped=1)
+        daemon = WatchDaemon(
+            db_path=self.db,
+            sources=[WatchSource("codex", self.sessions, poll=False)],
+            debounce_seconds=0,
+            use_watchdog=False,
+        )
+        with mock.patch(
+            "agentlog.watch.daemon.ingest_harness",
+            side_effect=[failed, succeeded],
+        ) as ingest:
+            daemon._run_ingest("codex")
+            self.assertEqual(daemon._debouncer.drain_ready(), ["codex"])
+            daemon._run_ingest("codex")
+
+        self.assertEqual(ingest.call_count, 2)
+        self.assertNotIn("codex", daemon._retry_counts)
+        conn = connect(self.db)
+        try:
+            self.assertEqual(len(list_ingest_events(conn)), 1)
+        finally:
+            conn.close()
 
     def test_file_drop_triggers_debounced_ingest(self) -> None:
         path = self.sessions / "rollout-watch-sess-3.jsonl"

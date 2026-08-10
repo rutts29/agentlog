@@ -1,10 +1,16 @@
 import { Link, useNavigate, useOutletContext, useSearchParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
-import { fetchOrchestration, fetchSessionTree, type TreeNode } from "@/lib/api";
+import {
+  fetchOrchestration,
+  fetchSessionTree,
+  logicalHarness,
+  runtimeHarness,
+  type TreeNode,
+} from "@/lib/api";
 import { EmptyState } from "@/components/EmptyState";
 import { Card, CardTitle, PanelCard } from "@/components/ui/card";
 import { Kpi } from "@/components/ui/kpi";
-import { HarnessTag, ModelBadge } from "@/components/ui/badges";
+import { HarnessTag, ModelBadge, RuntimeHarnessLabel } from "@/components/ui/badges";
 import { cn, formatDayTime, harnessColor } from "@/lib/utils";
 
 type Ctx = { range: string };
@@ -89,7 +95,13 @@ export function Orchestration() {
                   )}
                 >
                   <div className="flex items-center justify-between gap-2">
-                    <HarnessTag harness={item.harness} />
+                    <div className="flex items-center gap-2">
+                      <HarnessTag harness={logicalHarness(item)} />
+                      <RuntimeHarnessLabel
+                        logicalHarness={logicalHarness(item)}
+                        runtimeHarness={runtimeHarness(item)}
+                      />
+                    </div>
                     <span className="flex items-baseline gap-1.5">
                       <span className="display-md display-ink">{item.child_count}</span>
                       <span className="microlabel text-[9px] text-faint-foreground">
@@ -184,11 +196,15 @@ function TreeView({
         className="group mb-1.5 block rounded-control border border-border-faint px-3 py-2 hover:border-border hover:bg-muted/30"
         style={{
           borderLeftWidth: 2,
-          borderLeftColor: harnessColor(node.harness),
+          borderLeftColor: harnessColor(logicalHarness(node)),
         }}
       >
         <div className="flex flex-wrap items-center gap-2">
-          <HarnessTag harness={node.harness} />
+          <HarnessTag harness={logicalHarness(node)} />
+          <RuntimeHarnessLabel
+            logicalHarness={logicalHarness(node)}
+            runtimeHarness={runtimeHarness(node)}
+          />
           <span className="min-w-0 truncate font-mono text-[11px] text-muted-foreground group-hover:text-foreground">
             {node.id}
           </span>
@@ -197,7 +213,18 @@ function TreeView({
           </span>
         </div>
         <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-faint-foreground">
-          <ModelBadge model={node.model} harness={node.harness} effort={node.effort} />
+          <ModelBadge
+            model={node.model}
+            harness={runtimeHarness(node)}
+            effort={node.effort}
+          />
+          {node.relationship ? (
+            <span className="text-[10px] text-faint-foreground">
+              {node.relationship === "provider_backing"
+                ? "backing transcript"
+                : node.relationship}
+            </span>
+          ) : null}
           <span className="tabular">
             {node.message_count} msgs · {node.tool_count} tools
             {node.children.length > 0 ? ` · ${node.children.length} children` : ""}
@@ -209,7 +236,7 @@ function TreeView({
           key={child.id}
           node={child}
           depth={depth + 1}
-          railColor={harnessColor(node.harness)}
+          railColor={harnessColor(logicalHarness(node))}
         />
       ))}
     </div>

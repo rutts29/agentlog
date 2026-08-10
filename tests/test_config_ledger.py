@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import shutil
+import sqlite3
 import subprocess
 import tempfile
 import unittest
@@ -14,6 +16,7 @@ from agentlog.analysis.claims.store import (
     set_proposal_status,
 )
 from agentlog.analysis.config_ledger import (
+    backup_agentlog_db,
     find_supersession_cycles,
     proposal_correspondence,
     refresh_config_ledger,
@@ -154,6 +157,52 @@ class ProposalSupersededStatusTests(unittest.TestCase):
 
 
 class ConfigLedgerTests(unittest.TestCase):
+    def test_backup_includes_committed_rows_left_in_wal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "agentlog.db"
+            writer = sqlite3.connect(source)
+            writer.execute("CREATE TABLE entries (value TEXT NOT NULL)")
+            writer.commit()
+            self.assertEqual(
+                writer.execute("PRAGMA journal_mode = WAL").fetchone()[0],
+                "wal",
+            )
+            writer.execute("PRAGMA wal_autocheckpoint = 1000000")
+            writer.execute("INSERT INTO entries(value) VALUES ('committed')")
+            writer.commit()
+            wal_path = Path(f"{source}-wal")
+            self.assertTrue(wal_path.is_file())
+            self.assertGreater(wal_path.stat().st_size, 0)
+
+            main_only = root / "main-only.db"
+            shutil.copy2(source, main_only)
+            main_conn = sqlite3.connect(main_only)
+            self.assertEqual(
+                main_conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0],
+                0,
+            )
+            main_conn.close()
+
+            backup = backup_agentlog_db(source, reason="wal test")
+            backup_conn = sqlite3.connect(backup)
+            self.assertEqual(
+                backup_conn.execute("SELECT value FROM entries").fetchone()[0],
+                "committed",
+            )
+            self.assertEqual(
+                backup_conn.execute("PRAGMA quick_check").fetchone()[0],
+                "ok",
+            )
+            backup_conn.close()
+            writer.close()
+
+    def test_backup_missing_source_is_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "missing.db"
+            backup = backup_agentlog_db(source, reason="missing")
+            self.assertEqual(backup.read_bytes(), b"")
+
     def test_git_history_and_live_scan(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

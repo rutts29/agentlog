@@ -29,6 +29,8 @@ from agentlog.watch.sources import WatchSource, existing_watch_roots
 
 log = logging.getLogger("agentlog.watch")
 
+_MAX_INGEST_RETRIES = 3
+
 
 def _structured(
     event: str,
@@ -84,6 +86,7 @@ class WatchDaemon:
         self._clock = clock or time.monotonic
         self._stop = threading.Event()
         self._changed_paths: dict[str, set[str]] = {}
+        self._retry_counts: dict[str, int] = {}
         self._changed_lock = threading.Lock()
         self._ingest_lock = threading.Lock()
         self._poll_state: dict[str, tuple[int, ...]] = {}
@@ -116,6 +119,7 @@ class WatchDaemon:
             log.exception("presence update failed for %s", path)
         with self._changed_lock:
             self._changed_paths.setdefault(harness, set()).add(path)
+            self._retry_counts.pop(harness, None)
         self._debouncer.ping(harness)
         _structured(
             "change",
@@ -129,6 +133,26 @@ class WatchDaemon:
             paths = sorted(self._changed_paths.pop(harness, set()))
         return paths
 
+    def _requeue_changed(
+        self,
+        harness: str,
+        paths: list[str],
+        *,
+        retry_empty: bool = False,
+    ) -> None:
+        if not paths and not retry_empty:
+            return
+        with self._changed_lock:
+            self._changed_paths.setdefault(harness, set()).update(paths)
+            attempts = self._retry_counts.get(harness, 0) + 1
+            self._retry_counts[harness] = attempts
+        if attempts <= _MAX_INGEST_RETRIES:
+            self._debouncer.ping(harness)
+
+    def _clear_retry(self, harness: str) -> None:
+        with self._changed_lock:
+            self._retry_counts.pop(harness, None)
+
     def _run_ingest(self, harness: str) -> None:
         changed = self._take_changed(harness)
         started = self._clock()
@@ -140,13 +164,22 @@ class WatchDaemon:
                 init_db(conn)
                 repo = Repository(conn)
                 stats = ingest_harness(repo, harness)
-                event = record_ingest_event(
-                    conn,
-                    harness=harness,
-                    sessions_added=stats.sessions_added,
-                    sessions_updated=stats.sessions_updated,
-                    messages_added=stats.messages_added,
-                )
+                if stats.failed:
+                    self._requeue_changed(
+                        harness, changed, retry_empty=not changed
+                    )
+                else:
+                    self._clear_retry(harness)
+                event_id = None
+                if not stats.failed:
+                    event = record_ingest_event(
+                        conn,
+                        harness=harness,
+                        sessions_added=stats.sessions_added,
+                        sessions_updated=stats.sessions_updated,
+                        messages_added=stats.messages_added,
+                    )
+                    event_id = event.id
                 duration_ms = int((self._clock() - started) * 1000)
                 _structured(
                     "ingest_cycle",
@@ -159,11 +192,14 @@ class WatchDaemon:
                     sessions_added=stats.sessions_added,
                     sessions_updated=stats.sessions_updated,
                     messages_added=stats.messages_added,
-                    event_id=event.id,
+                    event_id=event_id,
                     duration_ms=duration_ms,
                 )
                 self._run_derive(conn, harness=harness)
             except Exception as exc:  # noqa: BLE001 - keep daemon alive
+                self._requeue_changed(
+                    harness, changed, retry_empty=not changed
+                )
                 duration_ms = int((self._clock() - started) * 1000)
                 _structured(
                     "ingest_error",

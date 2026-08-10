@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import sqlite3
 from dataclasses import dataclass, field
 
 from rich.console import Console
@@ -9,7 +10,13 @@ from rich.progress import BarColumn, Progress, TextColumn, TimeElapsedColumn
 from agentlog.analysis.windows import build_exchange_windows
 from agentlog.config import PARSER_VERSION
 from agentlog.db.repository import Repository
-from agentlog.ingest.base import TranscriptAdapter, hash_prefix
+from agentlog.ingest.base import (
+    TranscriptAdapter,
+    file_stat,
+    hash_prefix,
+    is_sqlite_path,
+    sqlite_fingerprint,
+)
 from agentlog.ingest.checkpoint import (
     CheckpointDecision,
     IngestAction,
@@ -24,6 +31,8 @@ from agentlog.ingest.t3code import T3CodeAdapter
 from agentlog.ingest.warp import WarpAdapter
 
 log = logging.getLogger("agentlog.ingest")
+
+_STABLE_SOURCE_ATTEMPTS = 3
 
 
 @dataclass
@@ -56,6 +65,17 @@ def adapter_for(harness: str) -> TranscriptAdapter | None:
         if adapter.harness.value == key:
             return adapter
     return None
+
+
+def _sqlite_logical_snapshot(
+    path,
+) -> tuple[tuple[int, int], str] | None:
+    revision_before = file_stat(path)
+    fingerprint = sqlite_fingerprint(path)
+    revision_after = file_stat(path)
+    if revision_before != revision_after:
+        return None
+    return revision_after, fingerprint
 
 
 def ingest_all(repo: Repository, console: Console | None = None) -> IngestStats:
@@ -129,31 +149,106 @@ def _ingest_one(
     path,
     stats: IngestStats,
 ) -> None:
-    decision = decide(repo, path, adapter.harness.value)
-    if decision.action == IngestAction.SKIP:
-        stats.skipped += 1
-        return
+    sqlite_source = is_sqlite_path(path)
+    for attempt in range(_STABLE_SOURCE_ATTEMPTS):
+        try:
+            decision = decide(repo, path, adapter.harness.value)
+            revision_before = file_stat(path)
+            if revision_before != (decision.size, decision.mtime_ns):
+                continue
+            if decision.action == IngestAction.SKIP:
+                stats.skipped += 1
+                return
 
-    if (
-        decision.action == IngestAction.APPEND
-        and not adapter.supports_byte_append
-    ):
-        decision = CheckpointDecision(
-            action=IngestAction.REPARSE,
-            artifact=decision.artifact,
-            size=decision.size,
-            mtime_ns=decision.mtime_ns,
-            start_offset=0,
-        )
+            logical_snapshot = (
+                _sqlite_logical_snapshot(path) if sqlite_source else None
+            )
+            if sqlite_source and logical_snapshot is None:
+                continue
+            logical_before_revision, logical_before = (
+                logical_snapshot if logical_snapshot is not None else (None, None)
+            )
+            if sqlite_source and logical_before_revision != revision_before:
+                continue
+            if (
+                sqlite_source
+                and decision.artifact is not None
+                and decision.artifact.parser_version == PARSER_VERSION
+                and logical_before == decision.artifact.content_hash
+            ):
+                size, mtime_ns = logical_before_revision
+                repo.upsert_artifact(
+                    harness=adapter.harness.value,
+                    path=str(path),
+                    size=size,
+                    mtime_ns=mtime_ns,
+                    content_hash=decision.artifact.content_hash,
+                    parsed_offset=decision.artifact.parsed_offset,
+                    parser_version=PARSER_VERSION,
+                )
+                stats.skipped += 1
+                return
 
-    data = (
-        read_slice(path, decision.start_offset)
-        if adapter.supports_byte_append
-        else b""
-    )
-    results = adapter.parse_path(path, data, start_offset=decision.start_offset)
-    for result in results:
-        stats.warnings.extend(result.warnings)
+            if (
+                decision.action == IngestAction.APPEND
+                and not adapter.supports_byte_append
+            ):
+                decision = CheckpointDecision(
+                    action=IngestAction.REPARSE,
+                    artifact=decision.artifact,
+                    size=decision.size,
+                    mtime_ns=decision.mtime_ns,
+                    start_offset=0,
+                )
+
+            data = (
+                read_slice(path, decision.start_offset)
+                if adapter.supports_byte_append
+                else b""
+            )
+            results = adapter.parse_path(
+                path, data, start_offset=decision.start_offset
+            )
+            content_size = decision.size
+            parsed_offset = content_size
+            if results:
+                reported = max(r.bytes_consumed for r in results)
+                if decision.action == IngestAction.APPEND:
+                    parsed_offset = decision.start_offset + len(data)
+                    if reported >= decision.start_offset:
+                        parsed_offset = reported
+                elif adapter.supports_byte_append:
+                    parsed_offset = reported
+                else:
+                    parsed_offset = reported if reported else content_size
+            if sqlite_source:
+                logical_after = _sqlite_logical_snapshot(path)
+                if logical_after is None:
+                    continue
+                (revision_after, content_hash) = logical_after
+                if logical_before != content_hash:
+                    continue
+                decision = CheckpointDecision(
+                    action=decision.action,
+                    artifact=decision.artifact,
+                    size=revision_after[0],
+                    mtime_ns=revision_after[1],
+                    start_offset=decision.start_offset,
+                )
+            else:
+                content_hash = hash_prefix(path, parsed_offset)
+                revision_after = file_stat(path)
+                if revision_before != revision_after:
+                    continue
+        except (OSError, sqlite3.Error):
+            if attempt + 1 < _STABLE_SOURCE_ATTEMPTS:
+                continue
+            raise
+        for result in results:
+            stats.warnings.extend(result.warnings)
+        break
+    else:
+        raise RuntimeError(f"source changed while ingesting: {path}")
 
     append = decision.action == IngestAction.APPEND
     artifact_id = (
@@ -179,22 +274,6 @@ def _ingest_one(
 
     if not append and artifact_id is not None:
         repo.delete_sessions_for_artifact(artifact_id)
-
-    parsed_offset = decision.size
-    if results:
-        reported = max(r.bytes_consumed for r in results)
-        if append:
-            parsed_offset = decision.start_offset + len(data)
-            if reported >= decision.start_offset:
-                parsed_offset = reported
-        elif adapter.supports_byte_append:
-            # Byte-framed adapters report the last safely framed offset; an
-            # unparsed trailing line must stay unconsumed.
-            parsed_offset = reported
-        else:
-            parsed_offset = reported if reported else decision.size
-
-    content_hash = hash_prefix(path, parsed_offset)
 
     artifact_id = repo.upsert_artifact(
         harness=adapter.harness.value,

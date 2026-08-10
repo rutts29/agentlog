@@ -126,6 +126,30 @@ class RedactionTests(unittest.TestCase):
         text = "please refactor parse_window() in windows.py and add a test"
         self.assertEqual(redact_text(text), text)
 
+    def test_shared_redactor_masks_complete_locator_shapes(self):
+        text = (
+            "/Volumes/Client Secret/project/file.txt /mnt/private data/file.txt "
+            "/srv/acme/secret.txt C:\\Users\\alice\\Secret\\x.txt "
+            "\\\\server\\share\\Client Secret\\x.txt "
+            "git@github.com:private/repo.git"
+        )
+        redacted = redact_text(text)
+        for suffix in (
+            "/Volumes/Client Secret/project/file.txt",
+            "/mnt/private data/file.txt",
+            "/srv/acme/secret.txt",
+            "C:\\Users\\alice\\Secret\\x.txt",
+            "\\\\server\\share\\Client Secret\\x.txt",
+            "git@github.com:private/repo.git",
+        ):
+            with self.subTest(suffix=suffix):
+                self.assertNotIn(suffix, redacted)
+        self.assertEqual(REDACTION_VERSION, "r2")
+
+    def test_shared_redactor_does_not_mask_slash_prose(self):
+        text = "Use a/b notation, or press / for the root option."
+        self.assertEqual(redact_text(text), text)
+
     def test_token_counts_are_not_treated_as_credentials(self):
         # This corpus is largely token accounting; masking counts would destroy
         # the analysis input while protecting nothing.

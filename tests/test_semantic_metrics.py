@@ -27,7 +27,7 @@ from agentlog.analysis.extractors.storage import (
 from agentlog.api.clusters import resolve_session_roots
 from agentlog.api.queries import semantic_lead_metric
 from agentlog.api.ranges import TimeRange
-from agentlog.api.semantic import MIN_COVERAGE, redirect_cell
+from agentlog.api.semantic import MIN_COVERAGE, eligible_windows, redirect_cell
 from agentlog.db.schema import connect, init_db
 
 ALL_TIME = TimeRange(
@@ -321,6 +321,79 @@ class EligibleDenominatorTests(SemanticMetricTestBase):
         cell = redirect_cell(self.conn, ALL_TIME)
         self.assertNotEqual(cell.reason, "coverage_below_gate")
         self.assertEqual(cell.coverage["observed_eligible_windows"], observed)
+
+
+class IdentityProjectionTests(SemanticMetricTestBase):
+    def test_t3_backing_windows_replace_projection_and_keep_workers(self) -> None:
+        all_windows: list[str] = []
+        canonical_windows: list[str] = []
+        for i in range(12):
+            root = self.fx.session(
+                f"t3code:root{i}",
+                harness="t3code",
+                external_id=f"root{i}",
+                model="orchestrator-model",
+            )
+            backing = self.fx.session(
+                f"codex:backing{i}",
+                harness="codex",
+                external_id=f"backing{i}",
+                model="gpt-5.5",
+            )
+            worker = self.fx.session(
+                f"codex:worker{i}",
+                harness="codex",
+                external_id=f"worker{i}",
+                model="gpt-5.5",
+            )
+            self.conn.execute(
+                """
+                INSERT INTO session_links
+                  (source_session_id, target_session_id, link_type,
+                   target_harness, target_external_id, link_role, confidence, evidence_json)
+                VALUES (?, ?, 'provider_backing', 'codex', ?, 'root', 'observed', '{}')
+                """,
+                (root, backing, f"backing{i}"),
+            )
+            self.conn.execute(
+                """
+                INSERT INTO session_links
+                  (source_session_id, target_session_id, link_type,
+                   target_harness, target_external_id, link_role, confidence, evidence_json)
+                VALUES (?, ?, 'provider_backing', 'codex', ?, 'worker', 'observed', '{}')
+                """,
+                (root, worker, f"worker{i}"),
+            )
+            root_window = self.fx.window(root, f"w{i}-root")
+            backing_window = self.fx.window(backing, f"w{i}-backing")
+            worker_window = self.fx.window(worker, f"w{i}-worker")
+            all_windows.extend((root_window, backing_window, worker_window))
+            canonical_windows.extend((backing_window, worker_window))
+        self.conn.commit()
+
+        eligible = eligible_windows(self.conn, ALL_TIME)
+        self.assertEqual(
+            {str(row["window_id"]) for row in eligible}, set(canonical_windows)
+        )
+        self.assertFalse(
+            {str(row["window_id"]) for row in eligible} &
+            {window for window in all_windows if window.endswith("-root")}
+        )
+
+        run_id = self.publish_run()
+        write_ux_observations(
+            self.conn,
+            run_id,
+            [_observation(window, ["redirect_or_brake"]) for window in all_windows],
+        )
+        self.complete(run_id)
+
+        cell = redirect_cell(self.conn, ALL_TIME)
+        self.assertEqual(cell.coverage["eligible_windows"], 24)
+        self.assertEqual(cell.coverage["observed_eligible_windows"], 24)
+        model_cell = redirect_cell(self.conn, ALL_TIME, model="gpt-5.5")
+        self.assertEqual(model_cell.coverage["eligible_windows"], 24)
+        self.assertEqual(model_cell.coverage["observed_eligible_windows"], 24)
 
 
 class PublishedRunSelectionTests(SemanticMetricTestBase):

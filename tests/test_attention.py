@@ -110,6 +110,88 @@ class AttentionDerivationTests(unittest.TestCase):
         self.assertEqual(wait.lane, "urgent")
         self.assertIn("Which approach should I take?", wait.reason)
 
+    def test_t3_root_uses_backing_metrics_and_keeps_worker_visible(self) -> None:
+        self._session(
+            "t3code:root",
+            started="2026-08-09T08:00:00+00:00",
+            ended="2026-08-09T10:00:00+00:00",
+            harness="t3code",
+        )
+        self._session(
+            "codex:backing",
+            started="2026-08-09T08:01:00+00:00",
+            ended="2026-08-09T10:00:00+00:00",
+        )
+        self._session(
+            "codex:worker",
+            started="2026-08-09T08:30:00+00:00",
+            ended="2026-08-09T10:00:00+00:00",
+        )
+        self.conn.executescript(
+            """
+            INSERT INTO session_links
+              (source_session_id, target_session_id, link_type,
+               target_harness, target_external_id, link_role, confidence, evidence_json)
+            VALUES
+              ('t3code:root', 'codex:backing', 'provider_backing',
+               'codex', 'backing', 'root', 'observed', '{}'),
+              ('t3code:root', 'codex:worker', 'provider_backing',
+               'codex', 'worker', 'worker', 'observed', '{}');
+            INSERT INTO messages (id, session_id, seq, role, timestamp, text)
+            VALUES
+              ('root-a', 't3code:root', 1, 'assistant',
+               '2026-08-09T10:00:00+00:00', 'root projection'),
+              ('backing-a', 'codex:backing', 1, 'assistant',
+               '2026-08-09T10:00:00+00:00', 'Which backing answer should I use?'),
+              ('worker-a', 'codex:worker', 1, 'assistant',
+               '2026-08-09T10:00:00+00:00', 'Which worker answer should I use?');
+            """
+        )
+        self.conn.commit()
+
+        items = self._derive()
+        by_id = {item.session_id: item for item in items}
+        self.assertEqual(set(by_id), {"t3code:root", "codex:worker"})
+        self.assertEqual(by_id["t3code:root"].harness, "t3code")
+        self.assertEqual(by_id["t3code:root"].runtime_harness, "codex")
+        self.assertIn("backing answer", by_id["t3code:root"].reason)
+        self.assertEqual(by_id["codex:worker"].harness, "t3code")
+        self.assertEqual(by_id["codex:worker"].runtime_harness, "codex")
+
+    def test_multi_owner_backing_stays_physical_in_attention(self) -> None:
+        for sid in ("t3code:one", "t3code:two"):
+            self._session(
+                sid,
+                started="2026-08-09T08:00:00+00:00",
+                ended="2026-08-09T10:00:00+00:00",
+                harness="t3code",
+            )
+        self._session(
+            "codex:shared",
+            started="2026-08-09T08:01:00+00:00",
+            ended="2026-08-09T10:00:00+00:00",
+        )
+        self.conn.executescript(
+            """
+            INSERT INTO session_links
+              (source_session_id, target_session_id, link_type,
+               target_harness, target_external_id, link_role, confidence, evidence_json)
+            VALUES
+              ('t3code:one', 'codex:shared', 'provider_backing',
+               'codex', 'shared', 'root', 'observed', '{}'),
+              ('t3code:two', 'codex:shared', 'provider_backing',
+               'codex', 'shared', 'root', 'observed', '{}');
+            INSERT INTO messages (id, session_id, seq, role, timestamp, text)
+            VALUES ('shared-a', 'codex:shared', 1, 'assistant',
+                    '2026-08-09T10:00:00+00:00', 'Which owner should I use?');
+            """
+        )
+        self.conn.commit()
+
+        items = self._derive()
+        self.assertEqual([item.session_id for item in items], ["codex:shared"])
+        self.assertEqual(items[0].harness, "codex")
+
     def test_open_task_incomplete_todo_within_horizon(self) -> None:
         self._session(
             "codex:todo",

@@ -6,6 +6,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from agentlog.normalize.tool_ops import OperationKind
+
 
 class Harness(str, Enum):
     CODEX = "codex"
@@ -38,6 +40,7 @@ class ToolEvent(BaseModel):
     action: str
     success: bool | None = None
     duration_ms: int | None = None
+    operation_kind: OperationKind = "unknown"
 
 
 class SkillExposure(BaseModel):

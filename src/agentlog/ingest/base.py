@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import logging
 import re
+import sqlite3
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
@@ -15,21 +17,135 @@ from agentlog.normalize.models import Harness, NormalizedMessage, ParseResult
 
 log = logging.getLogger("agentlog.ingest")
 
+_SQLITE_SUFFIXES = frozenset({".sqlite", ".db", ".vscdb"})
+_FILE_STABILITY_ATTEMPTS = 3
+_SQLITE_FINGERPRINT_ATTEMPTS = 3
+
 
 def hash_bytes(data: bytes) -> str:
     return xxhash.xxh64(data).hexdigest()
 
 
+def is_sqlite_path(path: Path) -> bool:
+    return path.suffix.lower() in _SQLITE_SUFFIXES
+
+
+def sqlite_fingerprint(path: Path) -> str:
+    """Hash a consistent logical image without reading SQLite sidecars raw."""
+    uri = f"{path.resolve().as_uri()}?mode=ro"
+    last_error: sqlite3.Error | None = None
+    for attempt in range(_SQLITE_FINGERPRINT_ATTEMPTS):
+        conn: sqlite3.Connection | None = None
+        try:
+            conn = sqlite3.connect(uri, uri=True, timeout=30)
+            conn.execute("PRAGMA busy_timeout = 30000")
+            image = conn.serialize(name="main")
+            digest = xxhash.xxh64()
+            digest.update(b"agentlog-sqlite-logical-v1\0")
+            digest.update(image)
+            return digest.hexdigest()
+        except sqlite3.Error as exc:
+            last_error = exc
+            if attempt + 1 < _SQLITE_FINGERPRINT_ATTEMPTS:
+                time.sleep(0)
+        finally:
+            if conn is not None:
+                conn.close()
+    if last_error is not None:
+        raise last_error
+    raise OSError(f"could not fingerprint SQLite source: {path}")
+
+
+def _sqlite_revision(path: Path) -> tuple[int, int]:
+    """Return a bounded revision token while tolerating WAL checkpoint races."""
+    for attempt in range(_FILE_STABILITY_ATTEMPTS):
+        main = path.stat()
+        wal = Path(f"{path}-wal")
+        try:
+            wal_st = wal.stat()
+        except OSError:
+            wal_st = None
+        main_after = path.stat()
+        try:
+            wal_after = wal.stat()
+        except OSError:
+            wal_after = None
+        if (
+            main.st_size == main_after.st_size
+            and main.st_mtime_ns == main_after.st_mtime_ns
+            and (wal_st is None) == (wal_after is None)
+            and (
+                wal_st is None
+                or (
+                    wal_st.st_size == wal_after.st_size
+                    and wal_st.st_mtime_ns == wal_after.st_mtime_ns
+                )
+            )
+        ):
+            if wal_after is None:
+                return main_after.st_size, main_after.st_mtime_ns
+            revision = (
+                (main_after.st_mtime_ns * 31 + wal_after.st_mtime_ns) * 31
+                + wal_after.st_size
+            ) & ((1 << 63) - 1)
+            return main_after.st_size, revision
+        if attempt + 1 < _FILE_STABILITY_ATTEMPTS:
+            time.sleep(0)
+    raise OSError(f"SQLite source remained unstable: {path}")
+
+
 def hash_prefix(path: Path, nbytes: int) -> str:
-    if nbytes <= 0:
-        return hash_bytes(b"")
-    with path.open("rb") as f:
-        return hash_bytes(f.read(nbytes))
+    for attempt in range(_FILE_STABILITY_ATTEMPTS):
+        main_st = path.stat()
+        if nbytes <= 0:
+            main = b""
+        else:
+            with path.open("rb") as f:
+                main = f.read(nbytes)
+        if not is_sqlite_path(path):
+            return hash_bytes(main)
+
+        wal = Path(f"{path}-wal")
+        try:
+            wal_st = wal.stat()
+        except OSError:
+            wal_st = None
+        main_after = path.stat()
+        try:
+            wal_after = wal.stat()
+        except OSError:
+            wal_after = None
+        stable = (
+            main_st.st_size == main_after.st_size
+            and main_st.st_mtime_ns == main_after.st_mtime_ns
+            and (wal_st is None) == (wal_after is None)
+            and (
+                wal_st is None
+                or (
+                    wal_st.st_size == wal_after.st_size
+                    and wal_st.st_mtime_ns == wal_after.st_mtime_ns
+                )
+            )
+        )
+        if stable:
+            # The WAL revision is metadata here; hashing its raw bytes makes a
+            # checkpoint look like content growth and causes needless reparses.
+            wal_token = (
+                b""
+                if wal_after is None
+                else f"{wal_after.st_size}:{wal_after.st_mtime_ns}".encode()
+            )
+            return hash_bytes(main + b"\0agentlog-wal-revision\0" + wal_token)
+        if attempt + 1 < _FILE_STABILITY_ATTEMPTS:
+            time.sleep(0)
+    raise OSError(f"SQLite source remained unstable: {path}")
 
 
 def file_stat(path: Path) -> tuple[int, int]:
-    st = path.stat()
-    return st.st_size, st.st_mtime_ns
+    if not is_sqlite_path(path):
+        st = path.stat()
+        return st.st_size, st.st_mtime_ns
+    return _sqlite_revision(path)
 
 
 _CURSOR_TS_RE = re.compile(

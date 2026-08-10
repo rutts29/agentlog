@@ -22,13 +22,19 @@ import {
   fetchSummary,
   fetchTimeseries,
   fetchTools,
+  logicalHarness,
+  runtimeHarness,
   type PresenceEvent,
 } from "@/lib/api";
 import { EmptyState } from "@/components/EmptyState";
 import { ConstellationGraph } from "@/components/ConstellationGraph";
 import { Card, CardTitle } from "@/components/ui/card";
 import { KpiPartial, KpiTile, KpiUnavailable } from "@/components/ui/kpi";
-import { HarnessTag, StatusDot } from "@/components/ui/badges";
+import {
+  HarnessTag,
+  RuntimeHarnessLabel,
+  StatusDot,
+} from "@/components/ui/badges";
 import { Sparkline, Meter } from "@/components/ui/spark";
 import { CHART_TOOLTIP, ChartDefs, chartGradient } from "@/components/ui/chartdefs";
 import { useIngestStream } from "@/lib/useIngestStream";
@@ -683,7 +689,7 @@ export function Overview() {
                   {live ? (
                     <LiveOrb
                       state={live.state}
-                      harnessColor={harnessColor(live.harness)}
+                      harnessColor={harnessColor(logicalHarness(s))}
                       size={16}
                       worker={live.role === "worker"}
                       title={live.activity ?? live.state}
@@ -692,7 +698,7 @@ export function Overview() {
                     <span
                       aria-hidden
                       className="inline-block h-[6px] w-[6px] shrink-0 rounded-full"
-                      style={{ background: harnessColor(s.harness) }}
+                      style={{ background: harnessColor(logicalHarness(s)) }}
                     />
                   )}
                   <span
@@ -704,6 +710,11 @@ export function Overview() {
                   >
                     {truncLabel(s.project, 22)}
                   </span>
+                  <RuntimeHarnessLabel
+                    logicalHarness={logicalHarness(s)}
+                    runtimeHarness={runtimeHarness(s)}
+                    className="shrink-0"
+                  />
                   <span className="tabular shrink-0 font-mono text-faint-foreground">
                     {live
                       ? (live.activity ?? "live")

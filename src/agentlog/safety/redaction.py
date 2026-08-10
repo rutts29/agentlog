@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
-REDACTION_VERSION = "r1"
+REDACTION_VERSION = "r2"
 
 _SECRET = "[REDACTED:{kind}]"
 
@@ -210,6 +210,14 @@ _VALIDATORS = {
 # home is rewritten to "~"; other users' homes lose the account name.
 _POSIX_HOME = re.compile(r"/(Users|home)/[^/\s\"':;,)\]}]+")
 _WINDOWS_HOME = re.compile(r"(?i)\b[A-Z]:\\Users\\[^\\\s\"':;,)\]}]+")
+_LOCATOR_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("absolute_path", re.compile(r"([\"'])(/(?:[^\"']|\\.)+)\1")),
+    ("url", re.compile(r"\b[A-Za-z][A-Za-z0-9+.-]*://[^\s\"'<>]+", re.IGNORECASE)),
+    ("url", re.compile(r"\b[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+:[^\s\"'<>]+")),
+    ("absolute_path", re.compile(r"(?i)(?<![A-Za-z0-9_])[A-Z]:\\[^\n\"'<>;,)\]}]+")),
+    ("absolute_path", re.compile(r"(?<![A-Za-z0-9_])\\\\[^\n\"'<>;,)\]}]+")),
+    ("absolute_path", re.compile(r"(?<![A-Za-z0-9_])(?:~|/)(?:[^\n\"'<>;,)\]}]+/)+[^\n\"'<>;,)\]}]+")),
+)
 
 
 def _luhn_ok(digits: str) -> bool:
@@ -239,6 +247,13 @@ def redact_text(text: str, report: RedactionReport | None = None) -> str:
         return text
     rep = report if report is not None else RedactionReport()
     out = text
+
+    for kind, pattern in _LOCATOR_RULES:
+        def _mask_locator(match: re.Match[str], _kind: str = kind) -> str:
+            rep.note(_kind)
+            return _SECRET.format(kind=_kind)
+
+        out = pattern.sub(_mask_locator, out)
 
     for kind, pattern in _RULES:
         placeholder = _SECRET.format(kind=kind)

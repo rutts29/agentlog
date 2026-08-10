@@ -1,8 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
-import { fetchFacets, fetchRecent, fetchSkills } from "@/lib/api";
-import { HarnessTag } from "@/components/ui/badges";
+import {
+  fetchFacets,
+  fetchRecent,
+  fetchSkills,
+  logicalHarness,
+  runtimeHarness,
+} from "@/lib/api";
+import { HarnessTag, RuntimeHarnessLabel } from "@/components/ui/badges";
 import { formatDayTime } from "@/lib/utils";
 import { cn } from "@/lib/utils";
 
@@ -12,6 +18,7 @@ type Item = {
   label: string;
   meta?: string;
   harness?: string;
+  runtimeHarness?: string;
   run: () => void;
 };
 
@@ -91,7 +98,8 @@ export function CommandPalette({
         group: "Recent sessions",
         label: s.id,
         meta: `${s.project} · ${formatDayTime(s.started_at)}`,
-        harness: s.harness,
+        harness: logicalHarness(s),
+        runtimeHarness: runtimeHarness(s),
         run: go(`/sessions/${encodeURIComponent(s.id)}`),
       });
     }
@@ -218,6 +226,13 @@ export function CommandPalette({
                     >
                       {item.harness ? (
                         <HarnessTag harness={item.harness} className="shrink-0" />
+                      ) : null}
+                      {item.harness && item.runtimeHarness ? (
+                        <RuntimeHarnessLabel
+                          logicalHarness={item.harness}
+                          runtimeHarness={item.runtimeHarness}
+                          className="shrink-0"
+                        />
                       ) : null}
                       <span
                         className={cn(

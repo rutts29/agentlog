@@ -41,6 +41,64 @@ function modelHue(model: string): string {
   return MODEL_COLORS[(hash >>> 0) % MODEL_COLORS.length];
 }
 
+type ModelTooltipItem = {
+  name?: string | number;
+  value?: string | number;
+};
+
+function ModelTooltip({
+  active,
+  label,
+  payload,
+}: {
+  active?: boolean;
+  label?: string | number;
+  payload?: ModelTooltipItem[];
+}) {
+  if (!active || !payload?.length) return null;
+  const items = payload
+    .filter((item) => Number(item.value) > 0)
+    .sort((a, b) => Number(b.value) - Number(a.value));
+  return (
+    <div className="rounded-control border border-border bg-popover px-3 py-2 text-[12px] shadow-lg">
+      <div className="mb-2 text-muted-foreground">{label}</div>
+      <div className="space-y-1.5">
+        {items.map((item) => {
+          const name = String(item.name ?? "(unknown)");
+          return (
+            <div key={name} className="flex min-w-[150px] items-center gap-2">
+              <span
+                className="h-2 w-2 shrink-0 rounded-full"
+                style={{ backgroundColor: modelHue(name) }}
+                aria-hidden
+              />
+              <span className="min-w-0 flex-1 truncate text-foreground">{name}</span>
+              <span className="tabular text-muted-foreground">{item.value}</span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function ModelLegend({ models }: { models: string[] }) {
+  return (
+    <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1.5 text-[10px] text-muted-foreground">
+      {models.map((model) => (
+        <span key={model} className="inline-flex items-center gap-1.5">
+          <span
+            className="h-2 w-2 rounded-full"
+            style={{ backgroundColor: modelHue(model) }}
+            aria-hidden
+          />
+          <span className="font-mono">{model}</span>
+        </span>
+      ))}
+    </div>
+  );
+}
+
 export function Models() {
   const { range } = useOutletContext<Ctx>();
   const [params] = useSearchParams();
@@ -126,7 +184,7 @@ export function Models() {
         </span>
       </div>
 
-      <div className="grid grid-cols-2 gap-3">
+      <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
         <Card>
           <div className="flex items-baseline justify-between gap-2">
             <CardTitle>Session starts by recorded model, daily</CardTitle>
@@ -159,7 +217,7 @@ export function Models() {
                     tickLine={false}
                     width={26}
                   />
-                  <Tooltip {...CHART_TOOLTIP} />
+                  <Tooltip {...CHART_TOOLTIP} content={<ModelTooltip />} />
                   <defs>
                     {modelKeys.map((k, i) => (
                       <linearGradient key={k} id={`mgrad-${i}`} x1="0" y1="0" x2="0" y2="1">
@@ -183,6 +241,7 @@ export function Models() {
               </ResponsiveContainer>
             )}
           </div>
+          {modelSeries.length > 0 ? <ModelLegend models={modelKeys} /> : null}
         </Card>
 
         <Card>
@@ -216,7 +275,7 @@ export function Models() {
                     tickLine={false}
                     width={26}
                   />
-                  <Tooltip {...CHART_TOOLTIP} />
+                  <Tooltip {...CHART_TOOLTIP} content={<ModelTooltip />} />
                   <defs>
                     {monthKeys.map((k, i) => (
                       <linearGradient key={k} id={`mograd-${i}`} x1="0" y1="0" x2="0" y2="1">
@@ -240,11 +299,13 @@ export function Models() {
               </ResponsiveContainer>
             )}
           </div>
+          {monthlyChart.length > 0 ? <ModelLegend models={monthKeys} /> : null}
         </Card>
       </div>
 
       <PanelCard title="Usage table" aside={`${data.items.length} models`}>
-        <table className="w-full text-left text-[12px]">
+        <div className="overflow-x-auto">
+          <table className="min-w-[720px] w-full text-left text-[12px]">
           <thead>
             <tr className="microlabel border-b border-border text-[10px] text-faint-foreground">
               <th className="px-4 py-2 font-medium">Model</th>
@@ -312,10 +373,11 @@ export function Models() {
               </tr>
             ))}
           </tbody>
-        </table>
+          </table>
+        </div>
       </PanelCard>
 
-      <div className="grid grid-cols-2 gap-3">
+      <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
         <PanelCard
           title="Agent profiles"
           aside={`${data.profiles.length} profiles`}

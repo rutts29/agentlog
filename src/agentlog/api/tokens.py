@@ -7,6 +7,10 @@ from collections import defaultdict
 from typing import Any
 from urllib.parse import urlparse
 
+from agentlog.api.identity_aggregates import (
+    VisibleLogicalSession,
+    visible_logical_sessions,
+)
 from agentlog.api.model_rollup import (
     GRAIN_DESCRIPTIONS,
     MESSAGE_MODEL,
@@ -18,6 +22,7 @@ from agentlog.api.model_rollup import (
 from agentlog.api.ranges import TimeRange, session_time_clause as _session_time_clause
 from agentlog.normalize.model_identity import display_model
 from agentlog.pricing import estimate_cost, get_pricing
+from agentlog.session_identity import build_identity_context, logical_projection
 
 _USAGE_GROUP_BY = frozenset(
     {"harness", "model", "day", "repo", "agent_profile"}
@@ -28,6 +33,21 @@ _USAGE_GROUP_BY = frozenset(
 # - Codex: final session_cumulative snapshot only (never sum cumulatives)
 _ADDITIVE_GRANULARITIES = ("message",)
 _SESSION_CUMULATIVE = "session_cumulative"
+
+
+def _aggregate_sessions(
+    conn: sqlite3.Connection, tr: TimeRange
+) -> list[VisibleLogicalSession]:
+    where, params = _session_time_clause(tr)
+    rows = conn.execute(
+        f"""
+        SELECT s.id, s.harness, s.started_at
+        FROM sessions s
+        WHERE {where}
+        """,
+        params,
+    ).fetchall()
+    return visible_logical_sessions(conn, rows)
 
 
 def _empty_totals() -> dict[str, Any]:
@@ -118,16 +138,19 @@ def _cache_ratios(totals: dict[str, Any]) -> dict[str, Any]:
 
 def _session_additive_rows(
     conn: sqlite3.Connection, tr: TimeRange
-) -> list[sqlite3.Row]:
+) -> list[dict[str, Any]]:
     """One additive contribution row per session with usage."""
-    time_sql, params = _session_time_clause(tr)
-    # Claude / message-level: sum per session.
+    sessions = _aggregate_sessions(conn, tr)
+    by_metric = {session.metric_session_id: session for session in sessions}
+    metric_ids = sorted(by_metric)
+    if not metric_ids:
+        return []
+    placeholders = ",".join("?" for _ in metric_ids)
     message_rows = list(
         conn.execute(
             f"""
             SELECT
                 s.id AS session_id,
-                s.harness AS harness,
                 {SESSION_START_MODEL_SQL} AS model,
                 SUM(u.input_tokens) AS input_tokens,
                 SUM(u.output_tokens) AS output_tokens,
@@ -140,20 +163,18 @@ def _session_additive_rows(
                 COUNT(*) AS usage_rows
             FROM token_usage u
             JOIN sessions s ON s.id = u.session_id
-            WHERE u.granularity IN ('message')
-              AND {time_sql}
+            WHERE u.session_id IN ({placeholders})
+              AND u.granularity IN ('message')
             GROUP BY s.id
             """,
-            params,
+            metric_ids,
         )
     )
-    # Codex: last cumulative snapshot per session (by seq).
     cumulative_rows = list(
         conn.execute(
             f"""
             SELECT
                 s.id AS session_id,
-                s.harness AS harness,
                 {SESSION_START_MODEL_SQL} AS model,
                 u.input_tokens AS input_tokens,
                 u.output_tokens AS output_tokens,
@@ -169,105 +190,90 @@ def _session_additive_rows(
             JOIN (
                 SELECT u2.session_id AS session_id, MAX(u2.seq) AS max_seq
                 FROM token_usage u2
-                JOIN sessions s2 ON s2.id = u2.session_id
-                WHERE u2.granularity = 'session_cumulative'
-                  AND {_session_time_clause(tr, alias="s2")[0]}
+                WHERE u2.session_id IN ({placeholders})
+                  AND u2.granularity = 'session_cumulative'
                 GROUP BY u2.session_id
             ) latest ON latest.session_id = u.session_id AND latest.max_seq = u.seq
-            WHERE u.granularity = 'session_cumulative'
-              AND {time_sql}
+            WHERE u.session_id IN ({placeholders})
+              AND u.granularity = 'session_cumulative'
             """,
-            params,
+            [*metric_ids, *metric_ids],
         )
     )
-    return message_rows + cumulative_rows
+    out: list[dict[str, Any]] = []
+    for row in [*message_rows, *cumulative_rows]:
+        session = by_metric[str(row["session_id"])]
+        item = dict(row)
+        item["session_id"] = session.session_id
+        item["harness"] = session.logical_harness
+        item["started_at"] = session.row["started_at"]
+        out.append(item)
+    return out
 
 
 def coverage(conn: sqlite3.Connection, tr: TimeRange) -> dict[str, Any]:
-    time_sql, params = _session_time_clause(tr)
-
-    def _scalar(sql: str) -> int:
-        row = conn.execute(sql, params).fetchone()
-        return int(row["c"]) if row else 0
-
-    def _by_harness_map(sql: str) -> dict[str, int]:
-        return {
-            str(r["harness"]): int(r["c"])
-            for r in conn.execute(sql, params).fetchall()
-        }
-
-    sessions_by = _by_harness_map(
-        f"""
-        SELECT s.harness AS harness, COUNT(*) AS c
-        FROM sessions s
-        WHERE {time_sql}
-        GROUP BY s.harness
-        """
-    )
-    sessions_with_by = _by_harness_map(
-        f"""
-        SELECT s.harness AS harness, COUNT(DISTINCT u.session_id) AS c
-        FROM token_usage u
-        JOIN sessions s ON s.id = u.session_id
-        WHERE {time_sql}
-        GROUP BY s.harness
-        """
-    )
-    messages_by = _by_harness_map(
-        f"""
-        SELECT s.harness AS harness, COUNT(*) AS c
-        FROM messages m
-        JOIN sessions s ON s.id = m.session_id
-        WHERE {time_sql}
-        GROUP BY s.harness
-        """
-    )
-    messages_with_by = _by_harness_map(
-        f"""
-        SELECT s.harness AS harness, COUNT(DISTINCT u.message_id) AS c
-        FROM token_usage u
-        JOIN sessions s ON s.id = u.session_id
-        WHERE u.message_id IS NOT NULL AND {time_sql}
-        GROUP BY s.harness
-        """
-    )
+    sessions = _aggregate_sessions(conn, tr)
+    by_metric = {session.metric_session_id: session for session in sessions}
+    metric_ids = sorted(by_metric)
+    sessions_by: dict[str, int] = defaultdict(int)
+    sessions_with_by: dict[str, int] = defaultdict(int)
+    messages_by: dict[str, int] = defaultdict(int)
+    messages_with_by: dict[str, int] = defaultdict(int)
     usage_rows_by_gran: dict[str, dict[str, int]] = {
-        "message": {},
-        "turn": {},
-        "session_cumulative": {},
+        "message": defaultdict(int),
+        "turn": defaultdict(int),
+        "session_cumulative": defaultdict(int),
     }
-    for r in conn.execute(
-        f"""
-        SELECT s.harness AS harness, u.granularity AS granularity, COUNT(*) AS c
-        FROM token_usage u
-        JOIN sessions s ON s.id = u.session_id
-        WHERE {time_sql}
-        GROUP BY s.harness, u.granularity
-        """,
-        params,
-    ).fetchall():
-        gran = str(r["granularity"])
-        if gran in usage_rows_by_gran:
-            usage_rows_by_gran[gran][str(r["harness"])] = int(r["c"])
+    for session in sessions:
+        sessions_by[session.logical_harness] += 1
+    if metric_ids:
+        placeholders = ",".join("?" for _ in metric_ids)
+        message_counts = conn.execute(
+            f"""
+            SELECT session_id, COUNT(*) AS c
+            FROM messages WHERE session_id IN ({placeholders})
+            GROUP BY session_id
+            """,
+            metric_ids,
+        ).fetchall()
+        for row in message_counts:
+            messages_by[by_metric[str(row["session_id"])].logical_harness] += int(row["c"])
+        usage_rows = conn.execute(
+            f"""
+            SELECT session_id, granularity, COUNT(*) AS c
+            FROM token_usage WHERE session_id IN ({placeholders})
+            GROUP BY session_id, granularity
+            """,
+            metric_ids,
+        ).fetchall()
+        seen_usage_sessions: set[str] = set()
+        for row in usage_rows:
+            metric_id = str(row["session_id"])
+            harness = by_metric[metric_id].logical_harness
+            if metric_id not in seen_usage_sessions:
+                sessions_with_by[harness] += 1
+                seen_usage_sessions.add(metric_id)
+            granularity = str(row["granularity"])
+            if granularity in usage_rows_by_gran:
+                usage_rows_by_gran[granularity][harness] += int(row["c"])
+        message_usage = conn.execute(
+            f"""
+            SELECT session_id, COUNT(DISTINCT message_id) AS c
+            FROM token_usage
+            WHERE session_id IN ({placeholders}) AND message_id IS NOT NULL
+            GROUP BY session_id
+            """,
+            metric_ids,
+        ).fetchall()
+        for row in message_usage:
+            messages_with_by[
+                by_metric[str(row["session_id"])].logical_harness
+            ] += int(row["c"])
 
-    st = sum(sessions_by.values())
-    sw = _scalar(
-        f"""
-        SELECT COUNT(DISTINCT u.session_id) AS c
-        FROM token_usage u
-        JOIN sessions s ON s.id = u.session_id
-        WHERE {time_sql}
-        """
-    )
+    st = len(sessions)
+    sw = sum(sessions_with_by.values())
     mt = sum(messages_by.values())
-    mw = _scalar(
-        f"""
-        SELECT COUNT(DISTINCT u.message_id) AS c
-        FROM token_usage u
-        JOIN sessions s ON s.id = u.session_id
-        WHERE u.message_id IS NOT NULL AND {time_sql}
-        """
-    )
+    mw = sum(messages_with_by.values())
     by_harness = [
         {
             "harness": harness,
@@ -442,22 +448,9 @@ def by_model(conn: sqlite3.Connection, tr: TimeRange) -> dict[str, Any]:
 
 def timeseries_daily(conn: sqlite3.Connection, tr: TimeRange) -> dict[str, Any]:
     rows = _session_additive_rows(conn, tr)
-    # Need session started_at for bucketing — re-query with dates.
-    time_sql, params = _session_time_clause(tr)
-    dated = list(
-        conn.execute(
-            f"""
-            SELECT s.id AS session_id, substr(COALESCE(s.started_at, ''), 1, 10) AS day
-            FROM sessions s
-            WHERE {time_sql}
-            """,
-            params,
-        )
-    )
-    day_by_session = {str(r["session_id"]): str(r["day"] or "") for r in dated}
-    by_day: dict[str, list[sqlite3.Row]] = {}
+    by_day: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
-        day = day_by_session.get(str(row["session_id"]), "")
+        day = str(row["started_at"] or "")[:10]
         if not day:
             continue
         by_day.setdefault(day, []).append(row)
@@ -818,6 +811,7 @@ def usage(
     return {
         "group_by": group_by,
         "grain": grain,
+        "identity_grain": "physical_sessions",
         "grain_note": (
             GRAIN_DESCRIPTIONS[MESSAGE_MODEL]
             if group_by == "model"
@@ -850,7 +844,7 @@ def usage(
             ),
         },
         "note": (
-            "Descriptive token sums with explicit coverage. Partial coverage "
+            "Descriptive token sums at physical-session grain with explicit coverage. Partial coverage "
             "means the sum must not be treated as complete for the group. "
             "Cost is unavailable while pricing.toml has no rates."
         ),
@@ -863,6 +857,16 @@ def session_tokens(conn: sqlite3.Connection, session_id: str) -> dict[str, Any] 
     ).fetchone()
     if session is None:
         return None
+    identity = build_identity_context(conn)
+    projection = logical_projection(
+        conn, session_id, str(session["harness"]), context=identity
+    )
+    metric_session_id = str(projection["transcript_session_id"] or session_id)
+    metric_session = session
+    if metric_session_id != session_id:
+        metric_session = conn.execute(
+            "SELECT * FROM sessions WHERE id = ?", (metric_session_id,)
+        ).fetchone() or session
     rows = list(
         conn.execute(
             """
@@ -871,7 +875,7 @@ def session_tokens(conn: sqlite3.Connection, session_id: str) -> dict[str, Any] 
             WHERE session_id = ?
             ORDER BY seq, usage_source
             """,
-            (session_id,),
+            (metric_session_id,),
         )
     )
     additive = [
@@ -886,9 +890,12 @@ def session_tokens(conn: sqlite3.Connection, session_id: str) -> dict[str, Any] 
     totals = _totals_from_rows(additive) if additive else _empty_totals()
     return {
         "session_id": session_id,
-        "harness": session["harness"],
-        "model": display_model(session["model_canonical"]),
-        "model_raw": session["model"],
+        "harness": projection["logical_harness"],
+        "runtime_harness": projection["runtime_harness"],
+        "orchestrator_session_id": projection["orchestrator_session_id"],
+        "transcript_session_id": metric_session_id,
+        "model": display_model(metric_session["model_canonical"]),
+        "model_raw": metric_session["model"],
         "model_grain": SESSION_START_MODEL,
         "totals": totals,
         "cache_ratios": _cache_ratios(totals),

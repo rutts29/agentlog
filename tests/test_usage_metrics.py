@@ -120,6 +120,7 @@ class CodexCumulativeTrapTests(unittest.TestCase):
 
     def test_usage_by_harness_avoids_cumulative_double_count(self) -> None:
         out = tokens_api.usage(self.conn, _tr(), group_by="harness")
+        self.assertEqual(out["identity_grain"], "physical_sessions")
         by_key = {g["key"]: g for g in out["groups"]}
         codex = by_key["codex"]
         # Final cumulative is 275, not 110+275=385, not sum of turns 110+165=275
@@ -233,6 +234,7 @@ class ActivityRollupTests(unittest.TestCase):
 
     def test_rollup_counts_and_model_switches(self) -> None:
         out = activity_rollup(self.conn, _tr())
+        self.assertEqual(out["identity_grain"], "physical_sessions")
         by_h = {r["harness"]: r for r in out["by_harness"]}
         self.assertEqual(by_h["codex"]["sessions"], 2)
         self.assertEqual(by_h["claude"]["messages"], 3)

@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import sqlite3
 import subprocess
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -57,16 +59,54 @@ def backup_agentlog_db(
     *,
     reason: str,
 ) -> Path:
-    """Copy the SQLite file to ``~/.agentlog/agentlog.db.bak_<reason>_<ts>``."""
+    """Back up SQLite consistently, or create an empty target if the source is absent."""
     src = Path(db_path or DEFAULT_DB_PATH).expanduser()
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     safe_reason = "".join(c if c.isalnum() or c in "-_" else "_" for c in reason)[:48]
     dest = src.parent / f"agentlog.db.bak_{safe_reason}_{stamp}"
     target = assert_writable(dest, purpose=f"db backup:{reason}")
-    if src.is_file():
-        shutil.copy2(src, target)
-    else:
-        target.write_bytes(b"")
+
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{target.name}.",
+        suffix=".tmp",
+        dir=str(target.parent),
+    )
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        assert_writable(tmp_path, purpose=f"db backup temp:{reason}")
+        if src.is_file() and src.stat().st_size > 0:
+            source_conn = sqlite3.connect(
+                src.resolve().as_uri() + "?mode=ro",
+                uri=True,
+                timeout=BUSY_TIMEOUT_MS / 1000,
+            )
+            destination_conn: sqlite3.Connection | None = None
+            try:
+                destination_conn = sqlite3.connect(
+                    str(tmp_path),
+                    timeout=BUSY_TIMEOUT_MS / 1000,
+                )
+                source_conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
+                destination_conn.execute(
+                    f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}"
+                )
+                source_conn.backup(destination_conn)
+                destination_conn.commit()
+            finally:
+                if destination_conn is not None:
+                    destination_conn.close()
+                source_conn.close()
+            shutil.copymode(src, tmp_path)
+        else:
+            # Keep missing and zero-byte sources as explicit empty backups.
+            tmp_path.write_bytes(b"")
+            if src.is_file():
+                shutil.copymode(src, tmp_path)
+        os.replace(tmp_path, target)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
     return target
 
 

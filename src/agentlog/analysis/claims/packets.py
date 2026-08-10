@@ -18,7 +18,6 @@ from typing import Any, Protocol
 
 from agentlog.analysis.claims.models import (
     MIN_SESSIONS_FINDING,
-    MIN_SESSIONS_FLOOR,
     MAX_QUOTE_CHARS,
     Claim,
     ClaimEvidence,
@@ -28,7 +27,6 @@ from agentlog.analysis.claims.models import (
 from agentlog.analysis.claims.proposals import (
     PROPOSAL_EXTRACTOR_VERSION,
     _append_section,
-    _proposal_id,
     _read_text,
     _sha1_text,
     unified_diff,
@@ -37,7 +35,11 @@ from agentlog.analysis.claims.scope import (
     ConfigInventory,
     discover_config_inventory,
 )
-from agentlog.analysis.claims.store import upsert_claims, upsert_proposals
+from agentlog.analysis.claims.store import (
+    set_proposal_status,
+    upsert_claims,
+    upsert_proposals,
+)
 from agentlog.safety.redaction import REDACTION_VERSION, RedactionReport, redact_text
 from agentlog.safety.write_guard import assert_writable
 
@@ -52,16 +54,26 @@ PACKET_STATUS_PENDING = "pending"
 PACKET_STATUS_COMPLETED = "completed"
 PACKET_STATUS_REJECTED = "rejected"
 PACKET_STATUS_ABSTAINED = "abstained"
+PACKET_STATUS_INELIGIBLE = "ineligible"
+
+PROPOSAL_PACKET_VALIDATOR_VERSION = "proposal_packet_v4"
+ELIGIBLE_POPULATION_VERSION = "eligible_logical_root_clusters_v2"
+EVIDENCE_CONTRACT_VERSION = "adjudicated_miss_pairs_v2"
 
 MAX_WINDOWS_PER_THEME = 24
 MAX_QUOTE_IN_PACKET = 400
 MAX_CONFIG_CHARS = 2_500
 MAX_PROPOSALS_PER_PACKET = 3
+MIN_ADJUDICATED_MISS_PAIRS = 3
+MIN_GLOBAL_LOGICAL_ROOTS = 15
+MAX_GLOBAL_CONCENTRATION = 0.70
 
 _PACKET_POSIX_PATH = re.compile(
     r"(?<![A-Za-z0-9_.:-])/(?!/)[^\s\"'`<>()\[\]{},;:]+"
 )
 _PACKET_WINDOWS_PATH = re.compile(r"\b[A-Za-z]:\\[^\s\"'`<>()\[\]{},;:]+")
+_LEADING_LIST_MARKER = re.compile(r"^(?:[-*+]|\d+[.)])\s+")
+_INTENT_NORMALIZE = re.compile(r"[^a-z0-9]+")
 
 # Phrase filters only — never match flag *keys* (false booleans still contain the name).
 THEME_SPECS: list[tuple[str, str]] = [
@@ -242,6 +254,7 @@ class PacketIngestResult:
     claims: list[Claim] = field(default_factory=list)
     failures: list[ValidationFailure] = field(default_factory=list)
     abstain_reason: str | None = None
+    theme: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -430,57 +443,148 @@ def _signal_summaries(
     return out
 
 
+def _opaque_project_key(repo: Any, cwd: Any) -> str | None:
+    project = str(repo or "").strip() or str(cwd or "").strip()
+    if not project:
+        return None
+    return f"project_{hashlib.sha1(project.encode('utf-8')).hexdigest()[:16]}"
+
+
+def _session_logical_roots(conn: sqlite3.Connection) -> dict[str, dict[str, str | None]]:
+    rows = conn.execute(
+        "SELECT id, harness, external_id, parent_session_id, repo, cwd FROM sessions"
+    ).fetchall()
+    by_id = {str(row["id"]): row for row in rows}
+    by_external: dict[tuple[str, str], list[str]] = {}
+    for row in rows:
+        key = (str(row["harness"] or ""), str(row["external_id"] or ""))
+        by_external.setdefault(key, []).append(str(row["id"]))
+
+    parents: dict[str, str] = {}
+    for sid, row in by_id.items():
+        raw_parent = str(row["parent_session_id"] or "")
+        if not raw_parent:
+            continue
+        if raw_parent in by_id:
+            parents[sid] = raw_parent
+            continue
+        candidates = by_external.get((str(row["harness"] or ""), raw_parent), [])
+        if len(candidates) == 1:
+            parents[sid] = candidates[0]
+
+    roots: dict[str, str] = {}
+    for sid in sorted(by_id):
+        cursor = sid
+        seen: set[str] = set()
+        while cursor in parents and cursor not in seen:
+            seen.add(cursor)
+            cursor = parents[cursor]
+        roots[sid] = cursor if cursor in by_id else sid
+
+    owners: dict[str, set[str]] = {}
+    if _table_exists(conn, "session_links"):
+        for row in conn.execute(
+            """
+            SELECT link.target_session_id, link.source_session_id
+            FROM session_links link
+            JOIN sessions source ON source.id = link.source_session_id
+            WHERE link.link_type = 'provider_backing'
+              AND link.target_session_id IS NOT NULL
+              AND source.harness = 't3code'
+            """
+        ):
+            owners.setdefault(str(row["target_session_id"]), set()).add(
+                str(row["source_session_id"])
+            )
+    changed = True
+    while changed:
+        changed = False
+        for child, parent in parents.items():
+            parent_owners = owners.get(parent)
+            if not parent_owners:
+                continue
+            child_owners = owners.setdefault(child, set())
+            before = len(child_owners)
+            child_owners.update(parent_owners)
+            changed = changed or len(child_owners) != before
+
+    out: dict[str, dict[str, str | None]] = {}
+    for sid, row in by_id.items():
+        physical_root = roots[sid]
+        owner_ids = owners.get(sid, set())
+        logical_root = (
+            roots[next(iter(owner_ids))]
+            if len(owner_ids) == 1
+            else physical_root
+        )
+        logical_row = by_id[logical_root]
+        project_key = _opaque_project_key(
+            logical_row["repo"] or row["repo"],
+            logical_row["cwd"] or row["cwd"],
+        )
+        out[sid] = {
+            "logical_root_id": logical_root,
+            "logical_harness": str(logical_row["harness"] or "(unknown)"),
+            "project_key": project_key,
+        }
+    return out
+
+
 def _fetch_theme_windows(
     conn: sqlite3.Connection,
     *,
     where_sql: str,
     limit: int,
     report: RedactionReport,
+    logical_roots: dict[str, dict[str, str | None]],
 ) -> list[dict[str, Any]]:
-    # One window per root session (newest first) so packets clear n≥10 gates.
     sql = f"""
-        WITH matched AS (
-            SELECT
-                w.id AS window_id,
-                w.session_id,
-                d.request_kind,
-                s.harness,
-                s.repo,
-                s.cwd,
-                s.started_at,
-                m_user.text AS user_text,
-                m_asst.text AS assistant_text,
-                m_user.timestamp AS user_ts,
-                u.turn_kinds_json,
-                u.user_stance,
-                u.agent_stance,
-                u.flags_json,
-                u.spans_json,
-                ROW_NUMBER() OVER (
-                    PARTITION BY w.session_id
-                    ORDER BY COALESCE(m_user.timestamp, s.started_at) DESC
-                ) AS rn
-            FROM window_det_classifications d
-            JOIN exchange_windows w ON w.id = d.window_id
-            JOIN sessions s ON s.id = w.session_id
-            JOIN messages m_user ON m_user.id = w.request_message_id
-            LEFT JOIN messages m_asst ON m_asst.id = w.response_message_id
-            JOIN ux_observations u ON u.window_id = w.id
-            WHERE d.request_kind = 'substantive'
-              AND s.parent_session_id IS NULL
-              AND COALESCE(s.external_id, '') NOT LIKE 'skills:%'
-              AND COALESCE(u.link_status, 'linked') = 'linked'
-              AND ({where_sql})
-        )
-        SELECT * FROM matched
-        WHERE rn = 1
-        ORDER BY COALESCE(user_ts, started_at) DESC
-        LIMIT ?
+        SELECT
+            w.id AS window_id,
+            w.session_id,
+            w.request_message_id,
+            w.response_message_id,
+            d.request_kind,
+            s.harness,
+            s.started_at,
+            m_user.text AS user_text,
+            m_asst.text AS assistant_text,
+            m_user.timestamp AS user_ts,
+            u.turn_kinds_json,
+            u.user_stance,
+            u.agent_stance,
+            u.flags_json,
+            u.spans_json
+        FROM window_det_classifications d
+        JOIN exchange_windows w ON w.id = d.window_id
+        JOIN sessions s ON s.id = w.session_id
+        JOIN messages m_user ON m_user.id = w.request_message_id
+        LEFT JOIN messages m_asst ON m_asst.id = w.response_message_id
+        JOIN ux_observations u ON u.window_id = w.id
+        WHERE d.request_kind = 'substantive'
+          AND s.parent_session_id IS NULL
+          AND COALESCE(s.external_id, '') NOT LIKE 'skills:%'
+          AND COALESCE(u.link_status, 'linked') = 'linked'
+          AND COALESCE(m_user.authored_by_agent, 0) = 0
+          AND ({where_sql})
+        ORDER BY COALESCE(m_user.timestamp, s.started_at) DESC
     """
-    rows = conn.execute(sql, (limit,)).fetchall()
+    rows = conn.execute(sql).fetchall()
     out: list[dict[str, Any]] = []
+    seen_sessions: set[str] = set()
+    seen_roots: set[str] = set()
     for r in rows:
         sid = str(r["session_id"])
+        if sid in seen_sessions:
+            continue
+        logical = logical_roots.get(sid)
+        if logical is None:
+            continue
+        logical_root_id = str(logical["logical_root_id"] or "")
+        if not logical_root_id or logical_root_id in seen_roots:
+            continue
+        seen_sessions.add(sid)
+        seen_roots.add(logical_root_id)
         user = _redact(str(r["user_text"] or ""), report)[:MAX_QUOTE_IN_PACKET]
         asst = _redact(str(r["assistant_text"] or ""), report)[:MAX_QUOTE_IN_PACKET]
         spans = []
@@ -502,6 +606,11 @@ def _fetch_theme_windows(
             {
                 "window_id": str(r["window_id"]),
                 "session_id": sid,
+                "request_message_id": str(r["request_message_id"]),
+                "response_message_id": str(r["response_message_id"] or ""),
+                "logical_root_id": logical_root_id,
+                "logical_harness": logical["logical_harness"],
+                "project_key": logical["project_key"],
                 "request_kind": r["request_kind"],
                 "harness": r["harness"],
                 "timestamp": r["user_ts"] or r["started_at"],
@@ -514,12 +623,273 @@ def _fetch_theme_windows(
                 "spans": spans,
             }
         )
+        if len(out) >= limit:
+            break
     return out
 
 
+def _eligible_root_population(
+    conn: sqlite3.Connection,
+    logical_roots: dict[str, dict[str, str | None]],
+) -> dict[str, Any]:
+    rows = conn.execute(
+        """
+        SELECT DISTINCT s.id
+        FROM sessions s
+        JOIN exchange_windows w ON w.session_id = s.id
+        JOIN window_det_classifications d ON d.window_id = w.id
+        JOIN ux_observations u ON u.window_id = w.id
+        JOIN messages m_user ON m_user.id = w.request_message_id
+        WHERE s.parent_session_id IS NULL
+          AND COALESCE(s.external_id, '') NOT LIKE 'skills:%'
+          AND d.request_kind = 'substantive'
+          AND COALESCE(u.link_status, 'linked') = 'linked'
+          AND COALESCE(m_user.authored_by_agent, 0) = 0
+        """
+    ).fetchall()
+    unique_roots = {
+        str(logical["logical_root_id"])
+        for row in rows
+        if (logical := logical_roots.get(str(row["id"]))) is not None
+        and logical.get("logical_root_id")
+    }
+    root_info = {
+        root_id: next(
+            logical
+            for logical in logical_roots.values()
+            if logical.get("logical_root_id") == root_id
+        )
+        for root_id in unique_roots
+    }
+    counts: dict[str, int] = {}
+    for logical in root_info.values():
+        harness = str(logical.get("logical_harness") or "(unknown)")
+        counts[harness] = counts.get(harness, 0) + 1
+    by_harness = [
+        {"harness": harness, "root_cluster_count": count}
+        for harness, count in sorted(counts.items())
+    ]
+    return {
+        "definition_version": ELIGIBLE_POPULATION_VERSION,
+        "root_cluster_count": len(unique_roots),
+        "by_harness": by_harness,
+    }
+
+
+def _adjudicated_miss_pairs(
+    conn: sqlite3.Connection,
+    windows: list[dict[str, Any]],
+    theme: str,
+) -> list[dict[str, Any]]:
+    if not windows or not _table_exists(conn, "adjudications"):
+        return []
+    columns = {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(adjudications)")
+    }
+    if "window_id" not in columns or "turn_kind" not in columns:
+        return []
+    window_ids = [str(window["window_id"]) for window in windows]
+    placeholders = ", ".join("?" for _ in window_ids)
+    fields = ["window_id", "turn_kind", "user_stance", "prior_outcome"]
+    if "link_status" in columns:
+        fields.append("link_status")
+    rows = conn.execute(
+        f"SELECT {', '.join(fields)} FROM adjudications "
+        f"WHERE window_id IN ({placeholders})",
+        window_ids,
+    ).fetchall()
+    windows_by_id = {str(window["window_id"]): window for window in windows}
+    pairs: list[dict[str, Any]] = []
+    for row in rows:
+        if "link_status" in columns and row["link_status"] != "linked":
+            continue
+        try:
+            turn_kinds = json.loads(row["turn_kind"] or "[]")
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(turn_kinds, list):
+            continue
+        kinds = {str(kind) for kind in turn_kinds}
+        if not kinds.intersection({"correction", "redirect_or_brake"}):
+            continue
+        if str(row["prior_outcome"] or "") != "rejected_redo":
+            continue
+        window_id = str(row["window_id"])
+        window = windows_by_id.get(window_id)
+        if window is None:
+            continue
+        pairs.append(
+            {
+                "pair_id": f"adjudicated_miss:{window_id}",
+                "pattern_key": theme,
+                "window_id": window_id,
+                "logical_root_id": window["logical_root_id"],
+                "logical_harness": window["logical_harness"],
+                "project_key": window["project_key"],
+                "turn_kinds": sorted(kinds),
+                "prior_outcome": "rejected_redo",
+            }
+        )
+    return sorted(pairs, key=lambda pair: str(pair["pair_id"]))
+
+
+def _packet_provenance_failure(packet: dict[str, Any]) -> str | None:
+    redaction = packet.get("redaction")
+    if (
+        not isinstance(redaction, dict)
+        or redaction.get("redaction_version") != REDACTION_VERSION
+    ):
+        return "legacy_packet_missing_current_provenance"
+    if packet.get("validator_version") != PROPOSAL_PACKET_VALIDATOR_VERSION:
+        return "legacy_packet_missing_current_provenance"
+    contract = packet.get("evidence_contract")
+    if (
+        not isinstance(contract, dict)
+        or contract.get("version") != EVIDENCE_CONTRACT_VERSION
+        or contract.get("min_independent_logical_roots") != MIN_SESSIONS_FINDING
+        or contract.get("min_adjudicated_miss_pairs") != MIN_ADJUDICATED_MISS_PAIRS
+        or contract.get("min_global_logical_roots") != MIN_GLOBAL_LOGICAL_ROOTS
+    ):
+        return "legacy_packet_missing_current_provenance"
+    if not isinstance(packet.get("validated_miss_pairs"), list):
+        return "legacy_packet_missing_current_provenance"
+    return None
+
+
+def _eligible_population(
+    packet: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    population = packet.get("eligible_population")
+    if not isinstance(population, dict):
+        return None, "packet_missing_eligible_population"
+    if population.get("definition_version") != ELIGIBLE_POPULATION_VERSION:
+        return None, "packet_missing_eligible_population"
+    count = population.get("root_cluster_count")
+    if not isinstance(count, int) or count < 0:
+        return None, "packet_invalid_eligible_population"
+    distribution = population.get("by_harness")
+    if not isinstance(distribution, list):
+        return None, "packet_invalid_eligible_population"
+    counts: list[int] = []
+    for item in distribution:
+        if not isinstance(item, dict) or not str(item.get("harness") or ""):
+            return None, "packet_invalid_eligible_population"
+        item_count = item.get("root_cluster_count")
+        if not isinstance(item_count, int) or item_count < 0:
+            return None, "packet_invalid_eligible_population"
+        counts.append(item_count)
+    if sum(counts) != count:
+        return None, "packet_invalid_eligible_population"
+    return population, None
+
+
+def _normalized_key(value: Any) -> str:
+    return _INTENT_NORMALIZE.sub("-", str(value or "").lower()).strip("-")
+
+
+def _validated_miss_pair_index(
+    packet: dict[str, Any], windows: dict[str, dict[str, Any]]
+) -> tuple[dict[str, dict[str, Any]], str | None]:
+    pairs = packet.get("validated_miss_pairs")
+    if not isinstance(pairs, list):
+        return {}, "packet_missing_validated_miss_pairs"
+    expected_pattern = _normalized_key(packet.get("theme"))
+    index: dict[str, dict[str, Any]] = {}
+    for pair in pairs:
+        if not isinstance(pair, dict):
+            return {}, "packet_invalid_validated_miss_pairs"
+        pair_id = str(pair.get("pair_id") or "")
+        window_id = str(pair.get("window_id") or "")
+        window = windows.get(window_id)
+        if not pair_id or pair_id in index or window is None:
+            return {}, "packet_invalid_validated_miss_pairs"
+        if _normalized_key(pair.get("pattern_key")) != expected_pattern:
+            return {}, "packet_invalid_validated_miss_pairs"
+        for key in ("logical_root_id", "logical_harness", "project_key"):
+            if pair.get(key) != window.get(key):
+                return {}, "packet_invalid_validated_miss_pairs"
+        index[pair_id] = pair
+    return index, None
+
+
+def _config_hashes(packet: dict[str, Any]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for snippet in packet.get("config_snippets") or []:
+        if not isinstance(snippet, dict):
+            continue
+        target = str(snippet.get("target_path") or "")
+        content_hash = str(snippet.get("content_hash") or "")
+        if target and content_hash:
+            out[target] = content_hash
+    return out
+
+
+def _normalize_instruction_rewrite(rewrite: str) -> str:
+    cleaned = rewrite.strip()
+    while True:
+        normalized = _LEADING_LIST_MARKER.sub("", cleaned, count=1).strip()
+        if normalized == cleaned:
+            return normalized
+        cleaned = normalized
+
+
+def _normalized_intent(theme: str, heading: str) -> str:
+    normalized_theme = _normalized_key(theme)
+    normalized_heading = _normalized_key(heading)
+    return f"{normalized_theme}\x1f{normalized_heading}"
+
+
+def _semantic_identity(
+    *,
+    scope_type: str,
+    scope_id: str | None,
+    target_ref: str,
+    path: str,
+    intent_key: str,
+) -> str:
+    target_identity = path or target_ref
+    return "\x1f".join(
+        (scope_type, scope_id or "", target_identity, intent_key)
+    )
+
+
+def _semantic_id(prefix: str, semantic_identity: str) -> str:
+    return hashlib.sha1(
+        f"{prefix}\x1f{semantic_identity}".encode("utf-8")
+    ).hexdigest()[:24]
+
+
+def _proposal_intent_key(proposal: Proposal) -> str:
+    intent = str(proposal.provenance.get("intent_key") or "")
+    if not intent:
+        intent = _normalized_intent(
+            str(proposal.provenance.get("theme") or ""), proposal.title
+        )
+    return f"{proposal.target_path}\x1f{intent}"
+
+
 def _packet_hash(body: dict[str, Any]) -> str:
-    blob = json.dumps(body, sort_keys=True, ensure_ascii=False)
+    canonical_body = {
+        key: value for key, value in body.items() if key != "evidence_pack_hash"
+    }
+    blob = json.dumps(canonical_body, sort_keys=True, ensure_ascii=False)
     return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:24]
+
+
+def _target_bindings_hash(target_paths: dict[str, str]) -> str:
+    blob = json.dumps(target_paths, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:24]
+
+
+def _packet_integrity_failure(packet: dict[str, Any], meta: Any) -> str | None:
+    expected_hash = str(packet.get("evidence_pack_hash") or "")
+    if not expected_hash or expected_hash != _packet_hash(packet):
+        return "packet_evidence_hash_mismatch"
+    if not isinstance(meta, dict):
+        return "packet_manifest_metadata_invalid"
+    if str(meta.get("evidence_pack_hash") or "") != expected_hash:
+        return "packet_manifest_evidence_hash_mismatch"
+    return None
 
 
 def emit_proposal_packet_run(
@@ -545,6 +915,8 @@ def emit_proposal_packet_run(
 
     inventory = discover_config_inventory(home)
     allowed, target_paths = _allowed_targets(inventory)
+    logical_roots = _session_logical_roots(conn)
+    eligible_population = _eligible_root_population(conn, logical_roots)
     prompt_text = load_proposal_prompt()
     phash = proposal_prompt_hash(prompt_text)
 
@@ -562,10 +934,16 @@ def emit_proposal_packet_run(
         snippets = _config_snippets(inventory, target_paths, report)
         signals = _signal_summaries(conn, report)
         windows = _fetch_theme_windows(
-            conn, where_sql=where_sql, limit=windows_per_theme, report=report
+            conn,
+            where_sql=where_sql,
+            limit=windows_per_theme,
+            report=report,
+            logical_roots=logical_roots,
         )
+        miss_pairs = _adjudicated_miss_pairs(conn, windows, theme)
         window_count += len(windows)
         packet_id = f"ppkt_{i:04d}_{theme}"
+        target_paths_hash = _target_bindings_hash(target_paths)
         body = {
             "packet_id": packet_id,
             "run_id": run_id,
@@ -574,21 +952,36 @@ def emit_proposal_packet_run(
             "prompt_file": "proposal_subagent.md",
             "model_hint": model,
             "provider": PROVIDER_PACKET,
+            "validator_version": PROPOSAL_PACKET_VALIDATOR_VERSION,
             "denominator_note": (
                 "Only substantive root-session windows are included. "
                 "auto_review/worker_brief are excluded as habit evidence."
             ),
             "gates": {
                 "min_sessions_ok": MIN_SESSIONS_FINDING,
-                "min_sessions_floor": MIN_SESSIONS_FLOOR,
+                "min_global_logical_roots": MIN_GLOBAL_LOGICAL_ROOTS,
+                "min_adjudicated_miss_pairs": MIN_ADJUDICATED_MISS_PAIRS,
+                "global_min_harnesses": 2,
+                "global_max_concentration": MAX_GLOBAL_CONCENTRATION,
                 "max_proposals": MAX_PROPOSALS_PER_PACKET,
             },
+            "evidence_contract": {
+                "version": EVIDENCE_CONTRACT_VERSION,
+                "min_independent_logical_roots": MIN_SESSIONS_FINDING,
+                "min_adjudicated_miss_pairs": MIN_ADJUDICATED_MISS_PAIRS,
+                "min_global_logical_roots": MIN_GLOBAL_LOGICAL_ROOTS,
+                "global_min_harnesses": 2,
+                "global_max_concentration": MAX_GLOBAL_CONCENTRATION,
+            },
             "allowed_targets": allowed,
+            "target_paths_hash": target_paths_hash,
             "config_snippets": snippets,
             "signals": [
                 s for s in signals if s.get("theme") == theme or s["kind"] != "recurring_instruction"
             ][:12],
+            "eligible_population": eligible_population,
             "windows": windows,
+            "validated_miss_pairs": miss_pairs,
             "redaction": report.to_dict(),
         }
         body["evidence_pack_hash"] = _packet_hash(body)
@@ -602,9 +995,11 @@ def emit_proposal_packet_run(
             "theme": theme,
             "window_ids": [w["window_id"] for w in windows],
             "session_count": len({w["session_id"] for w in windows}),
+            "eligible_population": eligible_population,
             "evidence_pack_hash": body["evidence_pack_hash"],
             "packet_path": str(packet_path.relative_to(run_dir)),
             "target_paths": target_paths,
+            "target_paths_hash": target_paths_hash,
             "redaction": body["redaction"],
             "result_path": None,
             "ingested_at": None,
@@ -618,6 +1013,8 @@ def emit_proposal_packet_run(
         "model": model,
         "prompt_hash": phash,
         "redaction_version": REDACTION_VERSION,
+        "validator_version": PROPOSAL_PACKET_VALIDATOR_VERSION,
+        "eligible_population": eligible_population,
         "window_count": window_count,
         "packet_count": len(packet_meta),
         "packets": packet_meta,
@@ -632,22 +1029,39 @@ def _window_index(packet: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {str(w["window_id"]): w for w in packet.get("windows") or [] if w.get("window_id")}
 
 
-def _quote_in_window(quote: str, window: dict[str, Any]) -> bool:
+def _quote_source_in_window(
+    quote: str, window: dict[str, Any]
+) -> tuple[str | None, str | None, str | None]:
     q = quote.strip()
     if not q:
-        return False
-    blob = "\n".join(
-        [
-            str(window.get("user") or ""),
-            str(window.get("assistant") or ""),
-            *(
-                str(sp.get("quote") or "")
-                for sp in (window.get("spans") or [])
-                if isinstance(sp, dict)
-            ),
-        ]
+        return None, None, "quote_not_in_window"
+    request_message_id = str(
+        window.get("request_message_id") or window.get("message_id") or ""
     )
-    return q in blob
+    response_message_id = str(window.get("response_message_id") or "")
+    matches: set[tuple[str, str]] = set()
+    if q in str(window.get("user") or ""):
+        matches.add(("user", request_message_id))
+    if q in str(window.get("assistant") or ""):
+        matches.add(("assistant", response_message_id))
+    for span in window.get("spans") or []:
+        if not isinstance(span, dict) or q not in str(span.get("quote") or ""):
+            continue
+        role = str(span.get("role") or "")
+        if role == "user":
+            matches.add((role, request_message_id))
+        elif role == "assistant":
+            matches.add((role, response_message_id))
+        else:
+            return None, None, "quote_source_message_unbound"
+    if not matches:
+        return None, None, "quote_not_in_window"
+    if len(matches) != 1:
+        return None, None, "quote_source_ambiguous"
+    role, message_id = next(iter(matches))
+    if not message_id:
+        return None, None, "quote_source_message_unbound"
+    return role, message_id, None
 
 
 def validate_proposal_result(
@@ -663,6 +1077,13 @@ def validate_proposal_result(
     packet_id = str(packet.get("packet_id") or "")
     if str(raw.get("packet_id") or "") != packet_id:
         failures.append(ValidationFailure(reason="packet_id_mismatch"))
+
+    provenance_failure = _packet_provenance_failure(packet)
+    if provenance_failure:
+        failures.append(ValidationFailure(reason=provenance_failure))
+    population, population_failure = _eligible_population(packet)
+    if population_failure:
+        failures.append(ValidationFailure(reason=population_failure))
 
     if raw.get("abstain") is True:
         if failures:
@@ -682,19 +1103,20 @@ def validate_proposal_result(
     if len(proposals) > MAX_PROPOSALS_PER_PACKET:
         failures.append(ValidationFailure(reason="too_many_proposals"))
 
-    allowed_paths = {
-        str(t.get("target_path") or t.get("path") or "")
-        for t in (packet.get("allowed_targets") or [])
-        if isinstance(t, dict)
+    allowed_targets = {
+        str(target.get("target_path") or target.get("path") or ""): target
+        for target in (packet.get("allowed_targets") or [])
+        if isinstance(target, dict)
     }
+    allowed_paths = set(allowed_targets)
     windows = _window_index(packet)
-    packet_population = len(
-        {
-            str(window.get("session_id") or "")
-            for window in windows.values()
-            if window.get("session_id")
-        }
-    )
+    miss_pairs, miss_pair_failure = _validated_miss_pair_index(packet, windows)
+    if miss_pair_failure:
+        return None, [ValidationFailure(reason=miss_pair_failure)]
+    config_hashes = _config_hashes(packet)
+    population_denominator = int((population or {}).get("root_cluster_count") or 0)
+    intent_theme = str(packet.get("theme") or "")
+    seen_intents: set[str] = set()
     cleaned: list[dict[str, Any]] = []
 
     for idx, prop in enumerate(proposals):
@@ -705,12 +1127,17 @@ def validate_proposal_result(
             continue
         title = str(prop.get("title") or "").strip()
         target = str(prop.get("target_path") or "").strip()
-        rewrite = str(prop.get("instruction_rewrite") or "").strip()
+        rewrite = _normalize_instruction_rewrite(
+            str(prop.get("instruction_rewrite") or "")
+        )
         rationale = str(prop.get("rationale") or "").strip()
         does_not_prove = str(prop.get("does_not_prove") or "").strip()
         action = str(prop.get("action") or "add").strip()
         heading = str(prop.get("heading") or title).strip()
         evidence = prop.get("evidence")
+        pattern_key = _normalized_key(prop.get("pattern_key"))
+        pair_ids = prop.get("validated_miss_pair_ids")
+        config_gap = prop.get("config_gap")
 
         if not title:
             failures.append(
@@ -732,6 +1159,69 @@ def validate_proposal_result(
             failures.append(
                 ValidationFailure(reason="missing_does_not_prove", proposal_index=idx)
             )
+        if pattern_key != _normalized_key(intent_theme):
+            failures.append(
+                ValidationFailure(
+                    reason="pattern_key_not_linked_to_packet_theme",
+                    proposal_index=idx,
+                )
+            )
+        selected_pairs: list[dict[str, Any]] = []
+        if not isinstance(pair_ids, list) or not pair_ids:
+            failures.append(
+                ValidationFailure(
+                    reason="missing_validated_miss_pair_ids",
+                    proposal_index=idx,
+                )
+            )
+        else:
+            pair_id_set = {str(pair_id) for pair_id in pair_ids}
+            if len(pair_id_set) != len(pair_ids) or not pair_id_set <= set(miss_pairs):
+                failures.append(
+                    ValidationFailure(
+                        reason="invalid_validated_miss_pair_ids",
+                        proposal_index=idx,
+                    )
+                )
+            else:
+                selected_pairs = [miss_pairs[pair_id] for pair_id in sorted(pair_id_set)]
+        clean_gap: dict[str, str] | None = None
+        if not isinstance(config_gap, dict):
+            failures.append(
+                ValidationFailure(reason="missing_config_gap", proposal_index=idx)
+            )
+        else:
+            gap_target = str(config_gap.get("target_path") or "")
+            gap_hash = str(config_gap.get("content_hash") or "")
+            gap_finding = str(config_gap.get("finding") or "").strip()
+            if (
+                gap_target != target
+                or config_hashes.get(target) != gap_hash
+                or not gap_finding
+            ):
+                failures.append(
+                    ValidationFailure(
+                        reason="config_gap_not_linked_to_packet_target",
+                        proposal_index=idx,
+                    )
+                )
+            else:
+                clean_gap = {
+                    "target_path": gap_target,
+                    "content_hash": gap_hash,
+                    "finding": gap_finding,
+                }
+        intent_key = _normalized_intent(intent_theme, heading)
+        proposal_key = f"{target}\x1f{intent_key}"
+        if proposal_key in seen_intents:
+            failures.append(
+                ValidationFailure(
+                    reason="duplicate_target_intent_within_packet",
+                    proposal_index=idx,
+                )
+            )
+        else:
+            seen_intents.add(proposal_key)
         if action == "update":
             failures.append(
                 ValidationFailure(reason="update_not_supported", proposal_index=idx)
@@ -746,7 +1236,7 @@ def validate_proposal_result(
             )
             evidence = []
 
-        session_ids: set[str] = set()
+        logical_roots: dict[str, tuple[str, str | None]] = {}
         clean_ev: list[dict[str, Any]] = []
         for ev in evidence:
             if not isinstance(ev, dict):
@@ -769,33 +1259,92 @@ def validate_proposal_result(
                 )
                 continue
             sid = str(window.get("session_id") or sid)
-            if not _quote_in_window(quote, window):
+            evidence_role, message_id, quote_failure = _quote_source_in_window(
+                quote, window
+            )
+            if quote_failure is not None:
                 failures.append(
-                    ValidationFailure(reason="quote_not_in_window", proposal_index=idx)
+                    ValidationFailure(reason=quote_failure, proposal_index=idx)
                 )
                 continue
-            session_ids.add(sid)
+            logical_root_id = str(window.get("logical_root_id") or "")
+            logical_harness = str(window.get("logical_harness") or "")
+            project_key = window.get("project_key")
+            if not logical_root_id or not logical_harness:
+                failures.append(
+                    ValidationFailure(
+                        reason="window_missing_logical_root_metadata",
+                        proposal_index=idx,
+                    )
+                )
+                continue
+            existing_root = logical_roots.get(logical_root_id)
+            root_meta = (logical_harness, str(project_key) if project_key else None)
+            if existing_root is not None and existing_root != root_meta:
+                failures.append(
+                    ValidationFailure(
+                        reason="logical_root_metadata_conflict",
+                        proposal_index=idx,
+                    )
+                )
+                continue
+            logical_roots[logical_root_id] = root_meta
             clean_ev.append(
                 {
                     "session_id": sid,
                     "window_id": wid,
+                    "message_id": message_id,
+                    "evidence_role": evidence_role,
+                    "logical_root_id": logical_root_id,
+                    "logical_harness": logical_harness,
+                    "project_key": project_key,
                     "quote": clip_quote(quote) or quote,
                     "timestamp": ev.get("timestamp") or window.get("timestamp"),
                 }
             )
 
-        n_sessions = len(session_ids)
-        if n_sessions < MIN_SESSIONS_FLOOR:
-            # Thin evidence: drop this proposal rather than publish spam.
-            continue
-        support = (
-            "ok" if n_sessions >= MIN_SESSIONS_FINDING else "insufficient"
+        n_sessions = len(logical_roots)
+        target_meta = allowed_targets.get(target) or {}
+        is_global_target = str(target_meta.get("scope_type") or "") == "global"
+        minimum_roots = (
+            MIN_GLOBAL_LOGICAL_ROOTS if is_global_target else MIN_SESSIONS_FINDING
         )
-
-        # Publish ok and insufficient (5–9 sessions) — board shows the tier.
-        # Abstain / below floor never reach pending.
-        if support not in {"ok", "insufficient"}:
+        if n_sessions > population_denominator:
+            failures.append(
+                ValidationFailure(
+                    reason="evidence_exceeds_eligible_population",
+                    proposal_index=idx,
+                )
+            )
+        if n_sessions < minimum_roots:
             continue
+        evidence_window_ids = {str(item["window_id"]) for item in clean_ev}
+        pair_roots = {
+            str(pair["logical_root_id"])
+            for pair in selected_pairs
+            if str(pair.get("window_id") or "") in evidence_window_ids
+        }
+        if (
+            len(pair_roots) < MIN_ADJUDICATED_MISS_PAIRS
+            or len(selected_pairs) < MIN_ADJUDICATED_MISS_PAIRS
+        ):
+            continue
+        harness_counts: dict[str, int] = {}
+        project_counts: dict[str, int] = {}
+        for harness, project_key in logical_roots.values():
+            harness_counts[harness] = harness_counts.get(harness, 0) + 1
+            if project_key is not None:
+                project_counts[project_key] = project_counts.get(project_key, 0) + 1
+        if is_global_target:
+            largest_harness = max(harness_counts.values(), default=0) / n_sessions
+            largest_project = max(project_counts.values(), default=0) / n_sessions
+            if (
+                len(harness_counts) < 2
+                or sum(project_counts.values()) != n_sessions
+                or largest_harness > MAX_GLOBAL_CONCENTRATION
+                or largest_project > MAX_GLOBAL_CONCENTRATION
+            ):
+                continue
 
         cleaned.append(
             {
@@ -806,9 +1355,19 @@ def validate_proposal_result(
                 "instruction_rewrite": rewrite,
                 "rationale": rationale,
                 "does_not_prove": does_not_prove,
-                "support_tier": support,
+                "support_tier": "ok",
                 "sample_size": n_sessions,
-                "packet_population": packet_population,
+                "population_denominator": population_denominator,
+                "eligible_population": population,
+                "intent_key": intent_key,
+                "validated_miss_pair_ids": [
+                    str(pair["pair_id"]) for pair in selected_pairs
+                ],
+                "config_gap": clean_gap,
+                "support_distribution": {
+                    "by_harness": dict(sorted(harness_counts.items())),
+                    "by_project": dict(sorted(project_counts.items())),
+                },
                 "evidence": clean_ev,
             }
         )
@@ -845,16 +1404,38 @@ def _target_meta(
 
 
 def _hydrate_packet_target_paths(
-    packet: dict[str, Any], target_paths: Any
-) -> None:
+    packet: dict[str, Any], meta: Any
+) -> str | None:
     """Attach local target paths after reading the model-facing packet."""
+    if not isinstance(meta, dict):
+        return "packet_manifest_metadata_invalid"
+    target_paths = meta.get("target_paths")
     if not isinstance(target_paths, dict):
-        return
-    packet["_target_paths"] = {
+        return "packet_target_bindings_missing"
+    bindings = {
         str(target_id): str(path)
         for target_id, path in target_paths.items()
         if isinstance(target_id, str) and isinstance(path, str)
     }
+    if len(bindings) != len(target_paths):
+        return "packet_target_bindings_invalid"
+    expected_hash = str(packet.get("target_paths_hash") or "")
+    actual_hash = _target_bindings_hash(bindings)
+    if (
+        not expected_hash
+        or expected_hash != actual_hash
+        or str(meta.get("target_paths_hash") or "") != actual_hash
+    ):
+        return "packet_target_bindings_mismatch"
+    allowed_refs = {
+        str(target.get("target_path") or target.get("path") or "")
+        for target in packet.get("allowed_targets") or []
+        if isinstance(target, dict)
+    }
+    if not allowed_refs or set(bindings) != allowed_refs:
+        return "packet_target_bindings_mismatch"
+    packet["_target_paths"] = bindings
+    return None
 
 
 def materialize_proposals(
@@ -869,7 +1450,8 @@ def materialize_proposals(
     run_id = str(packet.get("run_id") or "")
     pack_hash = str(packet.get("evidence_pack_hash") or "")
     prompt_hash = str(packet.get("prompt_hash") or "")
-    model = str(validated.get("model") or packet.get("model_hint") or DEFAULT_MODEL)
+    model = str(packet.get("model_hint") or DEFAULT_MODEL)
+    reported_model = str(validated.get("model") or "").strip() or None
     theme = str(packet.get("theme") or "llm_proposal")
     local_target_paths = packet.get("_target_paths") or {}
 
@@ -877,26 +1459,46 @@ def materialize_proposals(
         target_ref = str(prop["target_path"])
         path = str(local_target_paths.get(target_ref) or target_ref)
         old = _read_text(Path(path))
+        config_gap = prop.get("config_gap") or {}
+        if (
+            not isinstance(config_gap, dict)
+            or str(config_gap.get("content_hash") or "") != _sha1_text(old)
+        ):
+            continue
         heading = str(prop["heading"])
-        body = str(prop["instruction_rewrite"])
+        body = _normalize_instruction_rewrite(str(prop["instruction_rewrite"]))
+        if not body:
+            continue
         new = _append_section(old, heading, f"- {body}")
         if new == old:
             # Already present — skip publish.
             continue
         diff = unified_diff(path=path, old=old, new=new)
         kind, scope_type, scope_id = _target_meta(inventory, path)
+        semantic_identity = _semantic_identity(
+            scope_type=scope_type,
+            scope_id=scope_id,
+            target_ref=target_ref,
+            path=path,
+            intent_key=str(prop["intent_key"]),
+        )
         evidence = [
             ClaimEvidence(
                 session_id=e.get("session_id"),
                 window_id=e.get("window_id"),
+                message_id=e.get("message_id"),
                 quote=e.get("quote"),
-                meta={"timestamp": e.get("timestamp")},
+                meta={
+                    "timestamp": e.get("timestamp"),
+                    "logical_root_id": e.get("logical_root_id"),
+                    "logical_harness": e.get("logical_harness"),
+                    "project_key": e.get("project_key"),
+                    "evidence_role": e.get("evidence_role"),
+                },
             )
             for e in prop.get("evidence") or []
         ]
-        claim_id = hashlib.sha1(
-            f"llm_proposal|{theme}|{path}|{heading}|{pack_hash}".encode()
-        ).hexdigest()[:24]
+        claim_id = _semantic_id("llm_proposal_claim", semantic_identity)
         claim = Claim(
             id=claim_id,
             kind="llm_instruction_proposal",
@@ -908,25 +1510,41 @@ def materialize_proposals(
                 "suggested_instruction": body,
                 "title": prop["title"],
                 "packet_id": packet.get("packet_id"),
+                "validated_miss_pair_ids": prop["validated_miss_pair_ids"],
+                "config_gap": prop["config_gap"],
+                "semantic_identity": semantic_identity,
             },
             scope_type=scope_type,  # type: ignore[arg-type]
             scope_id=scope_id,
             derivation="llm_derived",
             support_status=prop["support_tier"],
             sample_size=int(prop["sample_size"]),
-            denominator=int(prop["packet_population"]),
+            denominator=int(prop["population_denominator"]),
+            rate=(
+                int(prop["sample_size"]) / int(prop["population_denominator"])
+                if int(prop["population_denominator"])
+                else None
+            ),
             observed_at=now,
             extractor_name="proposal_packets",
             extractor_version=PROPOSAL_EXTRACTOR_VERSION,
             confidence_basis={
                 "provider": PROVIDER_PACKET,
                 "model": model,
+                "reported_model_unverified": reported_model,
                 "run_id": run_id,
                 "prompt_hash": prompt_hash,
                 "evidence_pack_hash": pack_hash,
                 "packet_id": packet.get("packet_id"),
                 "evidence_sessions": int(prop["sample_size"]),
-                "packet_session_count": int(prop["packet_population"]),
+                "eligible_population": prop["eligible_population"],
+                "intent_key": prop["intent_key"],
+                "semantic_identity": semantic_identity,
+                "target_ref": target_ref,
+                "validated_miss_pair_ids": prop["validated_miss_pair_ids"],
+                "config_gap": prop["config_gap"],
+                "support_distribution": prop["support_distribution"],
+                "validator_version": packet.get("validator_version"),
             },
             does_not_prove=str(prop["does_not_prove"]),
             evidence=evidence,
@@ -937,6 +1555,7 @@ def materialize_proposals(
         provenance = {
             "provider": PROVIDER_PACKET,
             "model": model,
+            "reported_model_unverified": reported_model,
             "run_id": run_id,
             "prompt_hash": prompt_hash,
             "evidence_pack_hash": pack_hash,
@@ -944,17 +1563,18 @@ def materialize_proposals(
             "theme": theme,
             "redaction": packet.get("redaction") or {},
             "evidence_sessions": int(prop["sample_size"]),
-            "packet_session_count": int(prop["packet_population"]),
+            "eligible_population": prop["eligible_population"],
+            "intent_key": prop["intent_key"],
+            "semantic_identity": semantic_identity,
+            "target_ref": target_ref,
+            "validated_miss_pair_ids": prop["validated_miss_pair_ids"],
+            "config_gap": prop["config_gap"],
+            "support_distribution": prop["support_distribution"],
+            "validator_version": packet.get("validator_version"),
         }
         proposals.append(
             Proposal(
-                id=_proposal_id(
-                    "llm_proposal",
-                    theme,
-                    path,
-                    pack_hash,
-                    PROPOSAL_EXTRACTOR_VERSION,
-                ),
+                id=_semantic_id("llm_proposal", semantic_identity),
                 title=str(prop["title"]),
                 action=prop["action"],  # type: ignore[arg-type]
                 status="pending",
@@ -970,7 +1590,7 @@ def materialize_proposals(
                     f"LLM packet proposal ({PROVIDER_PACKET}/{model}); "
                     f"theme={theme}; support={prop['support_tier']}; "
                     f"n_sessions={prop['sample_size']}/"
-                    f"{prop['packet_population']} packet sessions"
+                    f"{prop['population_denominator']} eligible root clusters"
                 ),
                 does_not_prove=str(prop["does_not_prove"]),
                 sample_size=int(prop["sample_size"]),
@@ -988,6 +1608,93 @@ def materialize_proposals(
     return proposals, claims
 
 
+def _abstain_duplicate_intents(
+    results: list[PacketIngestResult], manifest: dict[str, Any]
+) -> None:
+    seen: dict[str, str] = {}
+    packets = manifest.get("packets") or {}
+    for result in results:
+        if result.status != PACKET_STATUS_COMPLETED:
+            continue
+        keys = {_proposal_intent_key(proposal) for proposal in result.proposals}
+        duplicate_of = next((seen[key] for key in keys if key in seen), None)
+        if duplicate_of is not None:
+            result.status = PACKET_STATUS_ABSTAINED
+            result.abstain_reason = (
+                "duplicate_target_intent_within_run; "
+                f"already proposed by {duplicate_of}"
+            )
+            result.failures.append(
+                ValidationFailure(reason="duplicate_target_intent_within_run")
+            )
+            result.proposals = []
+            result.claims = []
+            meta = packets.get(result.packet_id)
+            if isinstance(meta, dict):
+                meta["status"] = PACKET_STATUS_ABSTAINED
+                meta["reject_reasons"] = [
+                    failure.to_dict() for failure in result.failures
+                ]
+            continue
+        for key in keys:
+            seen[key] = result.packet_id
+
+
+def _record_superseded_evidence_versions(
+    conn: sqlite3.Connection, proposals: list[Proposal]
+) -> None:
+    if not _table_exists(conn, "proposals"):
+        return
+    columns = {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(proposals)")
+    }
+    required = {
+        "run_id",
+        "prompt_hash",
+        "evidence_pack_hash",
+        "model",
+        "provenance_json",
+    }
+    if not required <= columns:
+        return
+    for proposal in proposals:
+        row = conn.execute(
+            """
+            SELECT run_id, prompt_hash, evidence_pack_hash, model, provenance_json
+            FROM proposals WHERE id = ?
+            """,
+            (proposal.id,),
+        ).fetchone()
+        if row is None:
+            continue
+        previous = {
+            "run_id": row["run_id"],
+            "prompt_hash": row["prompt_hash"],
+            "evidence_pack_hash": row["evidence_pack_hash"],
+            "model": row["model"],
+        }
+        current = {
+            "run_id": proposal.run_id,
+            "prompt_hash": proposal.prompt_hash,
+            "evidence_pack_hash": proposal.evidence_pack_hash,
+            "model": proposal.model,
+        }
+        if previous == current:
+            continue
+        try:
+            prior_provenance = json.loads(row["provenance_json"] or "{}")
+        except json.JSONDecodeError:
+            prior_provenance = {}
+        history = prior_provenance.get("superseded_evidence_versions", [])
+        if not isinstance(history, list):
+            history = []
+        if previous not in history:
+            history.append(previous)
+        proposal.provenance["superseded_evidence_versions"] = history
+        for claim in proposal.claims:
+            claim.confidence_basis["superseded_evidence_versions"] = history
+
+
 def ingest_proposal_packet_results(
     conn: sqlite3.Connection,
     run_dir: Path,
@@ -995,26 +1702,51 @@ def ingest_proposal_packet_results(
     home: Path | None = None,
     dry_run: bool = False,
 ) -> list[PacketIngestResult]:
-    """Validate result JSON files and persist proposals + claims."""
+    """Validate and materialize packet results without publishing them."""
     paths = _run_paths(run_dir)
     manifest = load_manifest(run_dir)
     inventory = discover_config_inventory(home)
     now = _utc_now()
     results: list[PacketIngestResult] = []
-    all_proposals: list[Proposal] = []
-    all_claims: list[Claim] = []
 
     for packet_id, meta in (manifest.get("packets") or {}).items():
         packet_path = run_dir / str(meta["packet_path"])
         packet = json.loads(packet_path.read_text(encoding="utf-8"))
-        _hydrate_packet_target_paths(packet, meta.get("target_paths"))
         result_path = paths["results"] / f"{packet_id}.json"
+        integrity_failure = _packet_integrity_failure(packet, meta)
+        binding_failure = (
+            _hydrate_packet_target_paths(packet, meta)
+            if integrity_failure is None
+            else None
+        )
+        provenance_failure = (
+            integrity_failure or binding_failure or _packet_provenance_failure(packet)
+        )
+        if provenance_failure:
+            meta["status"] = PACKET_STATUS_INELIGIBLE
+            meta["result_path"] = (
+                str(result_path.relative_to(run_dir)) if result_path.is_file() else None
+            )
+            meta["ingested_at"] = now
+            meta["reject_reasons"] = [
+                ValidationFailure(reason=provenance_failure).to_dict()
+            ]
+            results.append(
+                PacketIngestResult(
+                    packet_id=packet_id,
+                    status=PACKET_STATUS_INELIGIBLE,
+                    failures=[ValidationFailure(reason=provenance_failure)],
+                )
+            )
+            continue
+        packet_theme = str(packet.get("theme") or "")
         if not result_path.is_file():
             results.append(
                 PacketIngestResult(
                     packet_id=packet_id,
                     status=PACKET_STATUS_PENDING,
                     failures=[ValidationFailure(reason="result_missing")],
+                    theme=packet_theme,
                 )
             )
             continue
@@ -1030,6 +1762,7 @@ def ingest_proposal_packet_results(
                     packet_id=packet_id,
                     status=PACKET_STATUS_REJECTED,
                     failures=[fail],
+                    theme=packet_theme,
                 )
             )
             continue
@@ -1045,6 +1778,7 @@ def ingest_proposal_packet_results(
                     packet_id=packet_id,
                     status=PACKET_STATUS_REJECTED,
                     failures=failures,
+                    theme=packet_theme,
                 )
             )
             continue
@@ -1059,6 +1793,7 @@ def ingest_proposal_packet_results(
                     packet_id=packet_id,
                     status=PACKET_STATUS_ABSTAINED,
                     abstain_reason=str(validated.get("abstain_reason")),
+                    theme=packet_theme,
                 )
             )
             continue
@@ -1078,12 +1813,11 @@ def ingest_proposal_packet_results(
                     packet_id=packet_id,
                     status=PACKET_STATUS_ABSTAINED,
                     abstain_reason="materialize_empty_or_already_present",
+                    theme=packet_theme,
                 )
             )
             continue
 
-        all_proposals.extend(props)
-        all_claims.extend(claims)
         meta["status"] = PACKET_STATUS_COMPLETED
         meta["result_path"] = str(result_path.relative_to(run_dir))
         meta["ingested_at"] = now
@@ -1094,16 +1828,11 @@ def ingest_proposal_packet_results(
                 status=PACKET_STATUS_COMPLETED,
                 proposals=props,
                 claims=claims,
+                theme=packet_theme,
             )
         )
 
-    if not dry_run and (all_proposals or all_claims):
-        if all_claims:
-            upsert_claims(conn, all_claims)
-        if all_proposals:
-            upsert_proposals(conn, all_proposals)
-        conn.commit()
-
+    _abstain_duplicate_intents(results, manifest)
     save_manifest(run_dir, manifest)
     return results
 
@@ -1133,49 +1862,141 @@ def _write_reject(
     )
 
 
+def _supersede_prior_pending_llm_proposals(
+    conn: sqlite3.Connection, keep_ids: set[str]
+) -> int:
+    rows = conn.execute(
+        """
+        SELECT id FROM proposals
+        WHERE status = 'pending'
+          AND derivation_summary LIKE 'LLM packet proposal (%'
+        """
+    ).fetchall()
+    superseded = 0
+    for row in rows:
+        proposal_id = str(row["id"])
+        if proposal_id in keep_ids:
+            continue
+        set_proposal_status(
+            conn,
+            proposal_id,
+            "superseded",
+            note="system-superseded: replaced by latest LLM proposal run",
+            allow_system=True,
+        )
+        superseded += 1
+    return superseded
+
+
+def _quarantine_prior_pending_llm_proposals(
+    conn: sqlite3.Connection, themes: set[str]
+) -> int:
+    """Quarantine only pending LLM proposals whose packet theme is explicit."""
+    if not themes:
+        return 0
+    clauses = " OR ".join("derivation_summary LIKE ?" for _ in themes)
+    rows = conn.execute(
+        f"""
+        SELECT id FROM proposals
+        WHERE status = 'pending'
+          AND derivation_summary LIKE 'LLM packet proposal (%'
+          AND ({clauses})
+        """,
+        [f"%theme={theme};%" for theme in sorted(themes)],
+    ).fetchall()
+    for row in rows:
+        set_proposal_status(
+            conn,
+            str(row["id"]),
+            "superseded",
+            note="system-superseded: authorized complete all-abstain packet run",
+            allow_system=True,
+        )
+    return len(rows)
+
+
 def publish_llm_proposals_from_run(
     conn: sqlite3.Connection,
     run_dir: Path,
     *,
     home: Path | None = None,
+    quarantine_on_all_abstain: bool = False,
 ) -> dict[str, Any]:
-    """Ingest packet results and supersede non-LLM pending board items."""
-    from agentlog.analysis.claims.proposals import _prune_stale_pending
-
+    """Publish a complete valid packet run as one board-visible operation."""
     results = ingest_proposal_packet_results(conn, run_dir, home=home)
-    keep = {
-        p.id
-        for r in results
-        for p in r.proposals
-    }
-    # Also keep any already-pending LLM proposals from this or prior runs.
-    if _table_exists(conn, "proposals"):
-        rows = conn.execute(
-            """
-            SELECT id FROM proposals
-            WHERE status = 'pending'
-              AND (
-                derivation_summary LIKE 'LLM packet proposal%'
-                OR COALESCE(run_id, '') != ''
-              )
-            """
-        ).fetchall()
-        keep.update(str(r["id"]) for r in rows)
-    pruned = _prune_stale_pending(conn, keep, now=_utc_now())
-    conn.commit()
     completed = sum(1 for r in results if r.status == PACKET_STATUS_COMPLETED)
     abstained = sum(1 for r in results if r.status == PACKET_STATUS_ABSTAINED)
     rejected = sum(1 for r in results if r.status == PACKET_STATUS_REJECTED)
+    ineligible = sum(1 for r in results if r.status == PACKET_STATUS_INELIGIBLE)
     pending = sum(1 for r in results if r.status == PACKET_STATUS_PENDING)
     n_props = sum(len(r.proposals) for r in results)
+    all_terminal_valid = bool(results) and not (pending or rejected or ineligible)
+    complete_all_abstain = all_terminal_valid and abstained == len(results)
+    has_publishable_proposals = bool(completed and n_props)
+    publish_ready = all_terminal_valid and (
+        has_publishable_proposals
+        or (complete_all_abstain and quarantine_on_all_abstain)
+    )
+    keep = {
+        p.id
+        for r in results
+        if r.status == PACKET_STATUS_COMPLETED
+        for p in r.proposals
+    }
+    pruned = 0
+    proposals_upserted = 0
+    if publish_ready:
+        if has_publishable_proposals:
+            all_proposals = [
+                proposal
+                for result in results
+                if result.status == PACKET_STATUS_COMPLETED
+                for proposal in result.proposals
+            ]
+            all_claims = [
+                claim
+                for result in results
+                if result.status == PACKET_STATUS_COMPLETED
+                for claim in result.claims
+            ]
+            _record_superseded_evidence_versions(conn, all_proposals)
+            upsert_claims(conn, all_claims)
+            proposals_upserted = upsert_proposals(conn, all_proposals)
+            pruned = _supersede_prior_pending_llm_proposals(conn, keep)
+        else:
+            themes = {
+                str(result.theme)
+                for result in results
+                if result.status == PACKET_STATUS_ABSTAINED and result.theme
+            }
+            pruned = _quarantine_prior_pending_llm_proposals(conn, themes)
+        conn.commit()
+    if pending or rejected or ineligible:
+        publication_block_reason = "run_incomplete_or_invalid"
+    elif complete_all_abstain:
+        publication_block_reason = (
+            None if quarantine_on_all_abstain else "complete_all_abstain"
+        )
+    elif not has_publishable_proposals:
+        publication_block_reason = "run_without_valid_proposals"
+    else:
+        publication_block_reason = None
     return {
         "run_dir": str(run_dir),
         "packets_completed": completed,
         "packets_abstained": abstained,
         "packets_rejected": rejected,
+        "packets_ineligible": ineligible,
         "packets_pending": pending,
-        "proposals_upserted": n_props,
+        "proposals_staged": n_props,
+        "proposals_upserted": proposals_upserted,
         "proposals_pruned": pruned,
+        "publish_ready": publish_ready,
+        "publication_block_reason": publication_block_reason,
+        "complete_all_abstain": complete_all_abstain,
+        "all_abstain_quarantine_authorized": (
+            complete_all_abstain and quarantine_on_all_abstain
+        ),
         "results": [r.to_dict() for r in results],
         "empty_board_reason": (
             None
