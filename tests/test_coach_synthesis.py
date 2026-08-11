@@ -341,6 +341,115 @@ class CoachSynthesisTests(unittest.TestCase):
         self.assertEqual(failures, [])
         self.assertEqual(cleaned["candidates"][0]["n"], 5)
 
+    def test_verified_assertion_variants_are_server_grouped_but_configuration_checks_are_not(self):
+        def sealed_record(number, assertion_key, request_text):
+            window_id = f"window-{number}"
+            request_id = f"request-{number}"
+            assistant_id = f"assistant-{number}"
+            packet = {
+                "packet_id": f"packet-{number}",
+                "windows": [{
+                    "window_id": window_id,
+                    "session_id": f"session-{number}",
+                    "root_session_id": f"root-{number}",
+                    "harness": "codex",
+                    "repo": "demo",
+                    "timestamp": "2026-08-01T00:00:00Z",
+                    "messages": [
+                        {
+                            "message_id": request_id,
+                            "role": "user",
+                            "seq": 1,
+                            "timestamp": "2026-08-01T00:00:00Z",
+                            "source_text": request_text,
+                        },
+                        {
+                            "message_id": assistant_id,
+                            "role": "assistant",
+                            "seq": 2,
+                            "timestamp": "2026-08-01T00:00:01Z",
+                            "source_text": "I ran the requested command.",
+                        },
+                    ],
+                }],
+            }
+            observation = {
+                "kind": "instruction_miss",
+                "assertion_key": assertion_key,
+                "assertion_theme": "verification",
+                "confidence": 0.8,
+                "does_not_prove": "This bounded evidence does not establish a cause.",
+                "evidence": [
+                    {
+                        "ref": "request",
+                        "evidence_type": "message",
+                        "window_id": window_id,
+                        "message_id": request_id,
+                        "role": "user",
+                        "seq": 1,
+                        "quote": request_text.split()[0],
+                    },
+                    {
+                        "ref": "gap",
+                        "evidence_type": "tool",
+                        "window_id": window_id,
+                        "message_id": assistant_id,
+                        "tool_event_id": f"tool-{number}",
+                        "fact": {
+                            "tool_event_id": f"tool-{number}",
+                            "tool_name": "pytest",
+                            "action": "end",
+                            "success": False,
+                            "operation_kind": "verification",
+                        },
+                    },
+                ],
+                "proof_arcs": [
+                    {"arc": "request", "evidence_refs": ["request"]},
+                    {"arc": "gap", "evidence_refs": ["gap"]},
+                ],
+            }
+            record, failure = _record_from_observation(observation, packet, f"result-{number}")
+            self.assertIsNone(failure)
+            self.assertIsNotNone(record)
+            return record
+
+        verification_records = [
+            sealed_record(0, "verification", "Verify the requested work before completion."),
+            sealed_record(1, "checks", "Run the requested tests before completion."),
+            sealed_record(2, "pytest", "Run pytest before completion."),
+            sealed_record(3, "validation_finish", "Validate the requested work before completion."),
+            sealed_record(4, "run_checks_before_done", "Run the requested checks before completion."),
+        ]
+        configuration = sealed_record(
+            99,
+            "validation_finish",
+            "Check deployment configuration.",
+        )
+        self.assertEqual({record["server_theme"] for record in verification_records}, {"verification"})
+        self.assertEqual(configuration["server_theme"], "deployment_configuration")
+        packets = build_synthesis_packets([*verification_records, configuration], _manifest())
+        verification = next(
+            packet
+            for packet in packets
+            if packet["group"]["scope"] == "harness_codex"
+            and packet["group"]["polarity"] == "negative"
+            and packet["group"]["assertion_theme"] == "verification"
+        )
+        self.assertEqual(len(verification["supporting_observations"]), 5)
+        self.assertEqual(
+            verification["group"]["assertion_keys"],
+            ["checks", "pytest", "run_checks_before_done", "validation_finish", "verification"],
+        )
+        configuration_packet = next(
+            packet
+            for packet in packets
+            if packet["group"]["scope"] == "harness_codex"
+            and packet["group"]["polarity"] == "negative"
+            and "deployment_configuration" in packet["group"]["assertion_theme"]
+        )
+        self.assertEqual(len(configuration_packet["supporting_observations"]), 1)
+
     def test_processed_and_eligible_denominators_remain_distinct(self):
         records = [_record(number) for number in range(5)]
         packet = next(
