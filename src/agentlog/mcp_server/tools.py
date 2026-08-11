@@ -15,11 +15,14 @@ from urllib.parse import urlparse
 
 from agentlog.analysis.attention import derive_attention
 from agentlog.analysis.skills import list_skill_profiles
+from agentlog.api.identity_aggregates import visible_logical_sessions
+from agentlog.session_identity import logical_projection
 from agentlog.api.model_rollup import (
     GRAIN_DESCRIPTIONS,
     SESSION_START_MODEL,
     SESSION_START_MODEL_SQL,
 )
+from agentlog.source_reader import read_source_transcript
 
 DEFAULT_SESSION_LIMIT = 10
 MAX_SESSION_LIMIT = 50
@@ -78,6 +81,19 @@ def _duration_seconds_sql(alias: str = "s") -> str:
 
 
 def _first_user_preview(conn: sqlite3.Connection, session_id: str) -> str | None:
+    storage = conn.execute(
+        "SELECT transcript_storage FROM sessions WHERE id = ?", (session_id,)
+    ).fetchone()
+    if storage is not None and storage["transcript_storage"] == "source_backed":
+        source = read_source_transcript(conn, session_id)
+        if not source.ready:
+            return None
+        for message in source.messages:
+            if message.get("role") == "user" and not message.get("is_tool_plumbing"):
+                preview = _clip(str(message.get("text") or ""), 120)
+                if preview:
+                    return preview
+        return None
     row = conn.execute(
         """
         SELECT text FROM messages
@@ -101,7 +117,7 @@ def _session_meta(conn: sqlite3.Connection, session_id: str) -> dict[str, Any] |
             s.id, s.harness, s.external_id, s.parent_session_id,
             s.started_at, s.ended_at, s.repo, s.cwd, s.branch,
             s.commit_sha, s.model_canonical, s.model AS model_raw,
-            s.provider, s.agent_profile, s.effort,
+            s.provider, s.agent_profile, s.effort, s.transcript_storage,
             {_duration_seconds_sql()} AS duration_seconds,
             (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id)
                 AS message_count,
@@ -115,6 +131,38 @@ def _session_meta(conn: sqlite3.Connection, session_id: str) -> dict[str, Any] |
     if row is None:
         return None
     dur = row["duration_seconds"]
+    projection = logical_projection(conn, str(row["id"]), str(row["harness"]))
+    transcript_id = str(projection["transcript_session_id"] or row["id"])
+    transcript_storage = row["transcript_storage"]
+    if transcript_id != str(row["id"]):
+        transcript_storage = conn.execute(
+            "SELECT transcript_storage FROM sessions WHERE id = ?", (transcript_id,)
+        ).fetchone()["transcript_storage"]
+    source = None
+    source_read = None
+    if transcript_storage == "source_backed":
+        source_read = read_source_transcript(conn, transcript_id)
+        source = {
+            "status": source_read.status,
+            "identity": source_read.source_identity,
+            "unit_id": source_read.source_unit_id,
+            "warning": source_read.warning,
+        }
+        title = next(
+            (
+                _clip(str(message.get("text") or ""), 120)
+                for message in source_read.messages
+                if message.get("role") == "user"
+                and not message.get("is_tool_plumbing")
+                and str(message.get("text") or "").strip()
+            ),
+            None,
+        )
+    else:
+        title = _first_user_preview(conn, transcript_id)
+    message_count = int(row["message_count"])
+    if source_read is not None and source_read.ready:
+        message_count = len(source_read.messages)
     return {
         "id": row["id"],
         "harness": row["harness"],
@@ -133,9 +181,10 @@ def _session_meta(conn: sqlite3.Connection, session_id: str) -> dict[str, Any] |
         "agent_profile": row["agent_profile"],
         "effort": row["effort"],
         "duration_seconds": int(dur) if dur is not None and int(dur) >= 0 else None,
-        "message_count": int(row["message_count"]),
+        "message_count": message_count,
         "tool_count": int(row["tool_count"]),
-        "title": _first_user_preview(conn, session_id),
+        "title": title,
+        "source": source,
     }
 
 
@@ -165,7 +214,16 @@ def search_sessions(
 
     session_ids: list[str] = []
     seen: set[str] = set()
+    provenance: dict[str, str] = {}
     match = _fts_match(q)
+    session_columns = {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(sessions)").fetchall()
+    }
+    storage_filter = (
+        " AND COALESCE(s.transcript_storage, 'legacy_materialized') = 'legacy_materialized'"
+        if "transcript_storage" in session_columns
+        else ""
+    )
 
     if match is not None:
         try:
@@ -175,7 +233,7 @@ def search_sessions(
                 FROM messages_fts
                 JOIN messages m ON m.rowid = messages_fts.rowid
                 JOIN sessions s ON s.id = m.session_id
-                WHERE messages_fts MATCH :match{filter_sql}
+                WHERE messages_fts MATCH :match{filter_sql}{storage_filter}
                 ORDER BY rank
                 LIMIT :lim
                 """,
@@ -186,8 +244,52 @@ def search_sessions(
                 if sid not in seen:
                     seen.add(sid)
                     session_ids.append(sid)
+                    provenance[sid] = "materialized_fts"
         except sqlite3.OperationalError:
             pass
+
+    if "transcript_storage" in session_columns and match is not None:
+        source_clauses: list[str] = []
+        source_params: dict[str, Any] = {}
+        if since:
+            source_clauses.append("COALESCE(s.started_at, '') >= :since")
+            source_params["since"] = since
+        source_where = (
+            " WHERE " + " AND ".join(source_clauses) if source_clauses else ""
+        )
+        source_rows = conn.execute(
+            f"""
+            SELECT s.* FROM sessions s{source_where}
+            ORDER BY COALESCE(s.started_at, '') DESC
+            """,
+            source_params,
+        ).fetchall()
+        source_visible = [
+            session
+            for session in visible_logical_sessions(conn, source_rows)
+            if harness is None or session.logical_harness == harness
+        ][: min(MAX_SESSION_LIMIT * 5, 200)]
+        query_tokens = _FTS_TOKEN_RE.findall(q)[:24]
+        for source_session in source_visible:
+            metric_row = conn.execute(
+                "SELECT transcript_storage FROM sessions WHERE id = ?",
+                (source_session.metric_session_id,),
+            ).fetchone()
+            if metric_row is None or metric_row["transcript_storage"] != "source_backed":
+                continue
+            result = read_source_transcript(conn, source_session.metric_session_id)
+            if not result.ready:
+                continue
+            if not any(
+                all(token.casefold() in str(message.get("text") or "").casefold() for token in query_tokens)
+                for message in result.messages
+            ):
+                continue
+            sid = source_session.session_id
+            if sid not in seen:
+                seen.add(sid)
+                session_ids.append(sid)
+            provenance[sid] = "source_scan"
 
     like = f"%{q}%"
     meta_rows = conn.execute(
@@ -213,12 +315,32 @@ def search_sessions(
             seen.add(sid)
             session_ids.append(sid)
 
+    if session_ids:
+        candidate_rows = conn.execute("SELECT * FROM sessions").fetchall()
+        candidate_ids = set(session_ids)
+        canonical_ids: list[str] = []
+        canonical_provenance: dict[str, str] = {}
+        for candidate in visible_logical_sessions(conn, candidate_rows):
+            if candidate.session_id not in candidate_ids and candidate.metric_session_id not in candidate_ids:
+                continue
+            if candidate.session_id in canonical_ids:
+                continue
+            canonical_ids.append(candidate.session_id)
+            source_ids = {candidate.session_id, candidate.metric_session_id}
+            canonical_provenance[candidate.session_id] = next(
+                (provenance[source_id] for source_id in source_ids if source_id in provenance),
+                "metadata",
+            )
+        session_ids = canonical_ids
+        provenance = canonical_provenance
+
     sessions: list[dict[str, Any]] = []
     for sid in session_ids:
         if len(sessions) >= limit:
             break
         meta = _session_meta(conn, sid)
         if meta is not None:
+            meta["provenance"] = provenance.get(sid, "metadata")
             sessions.append(meta)
 
     return {
@@ -247,28 +369,51 @@ def get_session(
     if meta is None:
         return {"error": "not_found", "session_id": session_id}
 
+    session_row = conn.execute(
+        "SELECT id, harness FROM sessions WHERE id = ?", (session_id,)
+    ).fetchone()
+    projection = logical_projection(conn, session_id, str(session_row["harness"]))
+    transcript_id = str(projection["transcript_session_id"] or session_id)
+    source_read = read_source_transcript(conn, transcript_id)
+    if source_read.status == "source_unavailable":
+        return {
+            "error": "source_unavailable",
+            "session_id": session_id,
+            "warning": source_read.warning,
+        }
+    if source_read.status == "source_changed":
+        return {
+            "error": "source_changed",
+            "session_id": session_id,
+            "warning": source_read.warning,
+        }
+
     out: dict[str, Any] = {"session": meta}
     if not include_messages:
         return out
 
     truncate = max(40, min(int(message_truncate), 500))
     limit = max(1, min(int(message_limit), MAX_MESSAGE_LIMIT))
-    rows = conn.execute(
-        """
-        SELECT id, seq, role, timestamp, model, text, is_tool_plumbing
-        FROM messages
-        WHERE session_id = ?
-        ORDER BY seq ASC
-        LIMIT ?
-        """,
-        (session_id, limit),
-    ).fetchall()
-    total = int(
-        conn.execute(
-            "SELECT COUNT(*) AS n FROM messages WHERE session_id = ?",
-            (session_id,),
-        ).fetchone()["n"]
-    )
+    if source_read.ready:
+        rows = source_read.messages[:limit]
+        total = len(source_read.messages)
+    else:
+        rows = conn.execute(
+            """
+            SELECT id, seq, role, timestamp, model, text, is_tool_plumbing
+            FROM messages
+            WHERE session_id = ?
+            ORDER BY seq ASC
+            LIMIT ?
+            """,
+            (transcript_id, limit),
+        ).fetchall()
+        total = int(
+            conn.execute(
+                "SELECT COUNT(*) AS n FROM messages WHERE session_id = ?",
+                (transcript_id,),
+            ).fetchone()["n"]
+        )
     messages = [
         {
             "id": r["id"],

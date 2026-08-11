@@ -9,7 +9,11 @@ from rich.progress import BarColumn, Progress, TextColumn, TimeElapsedColumn
 
 from agentlog.analysis.windows import build_exchange_windows
 from agentlog.config import PARSER_VERSION
-from agentlog.db.repository import Repository
+from agentlog.db.repository import (
+    LEGACY_MATERIALIZED,
+    SOURCE_BACKED,
+    Repository,
+)
 from agentlog.ingest.base import (
     TranscriptAdapter,
     file_stat,
@@ -29,6 +33,7 @@ from agentlog.ingest.cursor import CursorAdapter
 from agentlog.ingest.hermes import HermesAdapter
 from agentlog.ingest.t3code import T3CodeAdapter
 from agentlog.ingest.warp import WarpAdapter
+from agentlog.normalize.models import ParseResult
 
 log = logging.getLogger("agentlog.ingest")
 
@@ -143,6 +148,36 @@ def _session_message_count(repo: Repository, session_id: str) -> int:
     return int(row["c"]) if row else 0
 
 
+def _source_backed_windows(
+    repo: Repository, session_id: str, result: ParseResult
+) -> list[tuple[str, str, str, str, str]]:
+    stored = repo.list_messages(session_id)
+    if len(stored) != len(result.messages):
+        raise RuntimeError(
+            f"source-backed session {session_id} metadata does not match source"
+        )
+    hydrated: list[dict[str, object]] = []
+    for row, message in zip(stored, result.messages, strict=True):
+        if row["role"] != message.role or row["content_hash"] != message.content_hash:
+            raise RuntimeError(
+                f"source-backed session {session_id} changed during window build"
+            )
+        item = dict(row)
+        item["text"] = message.text
+        hydrated.append(item)
+    return build_exchange_windows(hydrated)  # type: ignore[arg-type]
+
+
+def _full_source_results(
+    adapter: TranscriptAdapter, path
+) -> dict[str, ParseResult]:
+    data = read_slice(path, 0) if adapter.supports_byte_append else b""
+    return {
+        result.session.external_id: result
+        for result in adapter.parse_path(path, data, start_offset=0)
+    }
+
+
 def _ingest_one(
     repo: Repository,
     adapter: TranscriptAdapter,
@@ -185,6 +220,7 @@ def _ingest_one(
                     content_hash=decision.artifact.content_hash,
                     parsed_offset=decision.artifact.parsed_offset,
                     parser_version=PARSER_VERSION,
+                    transcript_storage=decision.artifact.transcript_storage,
                 )
                 stats.skipped += 1
                 return
@@ -251,6 +287,11 @@ def _ingest_one(
         raise RuntimeError(f"source changed while ingesting: {path}")
 
     append = decision.action == IngestAction.APPEND
+    artifact_storage = (
+        decision.artifact.transcript_storage
+        if decision.artifact is not None
+        else SOURCE_BACKED
+    )
     artifact_id = (
         decision.artifact.id
         if decision.artifact is not None
@@ -272,9 +313,6 @@ def _ingest_one(
         if not existed:
             prior_sessions[session_key] = -1  # sentinel: did not exist
 
-    if not append and artifact_id is not None:
-        repo.delete_sessions_for_artifact(artifact_id)
-
     artifact_id = repo.upsert_artifact(
         harness=adapter.harness.value,
         path=str(path),
@@ -283,6 +321,7 @@ def _ingest_one(
         content_hash=content_hash,
         parsed_offset=parsed_offset,
         parser_version=PARSER_VERSION,
+        transcript_storage=artifact_storage,
     )
 
     if not results:
@@ -292,6 +331,7 @@ def _ingest_one(
             stats.parsed += 1
         return
 
+    full_source_results: dict[str, ParseResult] | None = None
     for result in results:
         if result.session.external_id == "empty" and not result.messages:
             continue
@@ -302,6 +342,9 @@ def _ingest_one(
         prior = prior_sessions.get(session_key, -1)
         existed = prior >= 0
         msg_before = max(prior, 0)
+        session_storage = (
+            repo.session_transcript_storage(session_key) or SOURCE_BACKED
+        )
 
         session_id = repo.save_parse_result(
             artifact_id=artifact_id,
@@ -310,11 +353,37 @@ def _ingest_one(
             base_seq=base_seq,
             base_tool_seq=base_tool,
             base_token_seq=base_token,
+            transcript_storage=session_storage,
+            preserve_existing_legacy=True,
         )
 
-        messages = repo.list_messages(session_id)
-        windows = build_exchange_windows(messages)
-        repo.replace_exchange_windows(session_id, windows)
+        if (
+            session_storage == SOURCE_BACKED
+            and repo.session_artifact_id(session_id) == artifact_id
+        ):
+            if full_source_results is None:
+                full_source_results = _full_source_results(adapter, path)
+                if sqlite_source:
+                    snapshot = _sqlite_logical_snapshot(path)
+                    if snapshot is None or snapshot[1] != content_hash:
+                        raise RuntimeError(
+                            f"source changed during window build: {path}"
+                        )
+                elif file_stat(path) != (decision.size, decision.mtime_ns):
+                    raise RuntimeError(
+                        f"source changed during window build: {path}"
+                    )
+            full_result = full_source_results.get(result.session.external_id)
+            if full_result is None:
+                raise RuntimeError(
+                    f"source-backed session missing from source: {session_id}"
+                )
+            windows = _source_backed_windows(repo, session_id, full_result)
+            repo.replace_exchange_windows(session_id, windows)
+        elif session_storage == LEGACY_MATERIALIZED and not existed:
+            messages = repo.list_messages(session_id)
+            windows = build_exchange_windows(messages)
+            repo.replace_exchange_windows(session_id, windows)
         stats.sessions_upserted += 1
         if existed:
             stats.sessions_updated += 1

@@ -5,13 +5,19 @@ import {
   fetchSessionDetail,
   logicalHarness,
   runtimeHarness,
+  type TranscriptSource,
   type TimelineMessage,
 } from "@/lib/api";
 import { CopyPath } from "@/components/CopyPath";
 import { EmptyState } from "@/components/EmptyState";
 import { Transcript } from "@/components/Transcript";
 import { Card, CardTitle, PanelCard } from "@/components/ui/card";
-import { HarnessTag, ModelBadge, RuntimeHarnessLabel } from "@/components/ui/badges";
+import {
+  HarnessTag,
+  ModelBadge,
+  RuntimeHarnessLabel,
+  TranscriptStorageBadge,
+} from "@/components/ui/badges";
 import { classifySpeaker, SPEAKER_LEGEND, type SpeakerKind } from "@/lib/speaker";
 import { formatDuration, formatDayTime, harnessColor } from "@/lib/utils";
 
@@ -89,6 +95,8 @@ export function SessionDetail() {
   }
 
   const { session, timeline, anatomy, children, skills } = q.data;
+  const source: TranscriptSource | null = session.source ?? q.data.transcript?.source ?? null;
+  const sourceWarning = sourceWarningText(source);
   const transcriptId = session.transcript_session_id ?? q.data.transcript?.id ?? session.id;
   const orchestratorId = session.orchestrator_session_id;
   const isBackingSession = Boolean(orchestratorId && orchestratorId !== session.id);
@@ -123,6 +131,10 @@ export function SessionDetail() {
             harness={runtimeHarness(session)}
             effort={session.effort}
           />
+          <TranscriptStorageBadge
+            storage={session.transcript_storage}
+            sourceStatus={source?.status}
+          />
         </div>
         <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[12px] text-muted-foreground">
           <span className="text-foreground/90">{session.project}</span>
@@ -143,6 +155,16 @@ export function SessionDetail() {
           <span className="tabular">{formatDuration(session.duration_seconds)}</span>
         </div>
       </div>
+
+      {sourceWarning ? (
+        <div
+          role="alert"
+          className="flex items-start gap-2 rounded-card border border-status-warn/40 bg-status-warn/5 px-3 py-2 text-[12px] text-muted-foreground"
+        >
+          <span className="shrink-0 text-status-warn">!</span>
+          <span>{sourceWarning}</span>
+        </div>
+      ) : null}
 
       <div className="grid grid-cols-[minmax(0,1fr)_300px] items-start gap-3">
         {/* Left: the transcript. */}
@@ -401,6 +423,12 @@ export function SessionDetail() {
       </div>
     </div>
   );
+}
+
+function sourceWarningText(source: TranscriptSource | null): string | null {
+  if (!source || source.status === "ready" || source.status === "legacy") return null;
+  const prefix = source.status === "source_changed" ? "Source changed" : "Source unavailable";
+  return `${prefix}: ${source.warning ?? "the canonical transcript could not be read safely."}`;
 }
 
 function Anat({ label, value }: { label: string; value: number }) {

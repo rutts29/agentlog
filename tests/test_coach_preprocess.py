@@ -6,6 +6,7 @@ from pathlib import Path
 
 from agentlog.analysis.coach import CoachPreprocessConfig, emit_coach_packets, validate_coach_result as _validate_coach_result
 from agentlog.db.schema import init_db
+from agentlog.source_reader import SourceReadResult
 
 
 def _legacy_result_with_dispositions(raw, packet):
@@ -56,10 +57,10 @@ class CoachPreprocessTests(unittest.TestCase):
     def tearDown(self):
         self.conn.close()
 
-    def add_session(self, sid, parent=None, *, profile="codex"):
+    def add_session(self, sid, parent=None, *, profile="codex", transcript_storage="legacy_materialized"):
         self.conn.execute(
-            "INSERT INTO sessions(id,harness,external_id,parent_session_id,repo,agent_profile) VALUES(?,?,?,?,?,?)",
-            (sid, "codex", sid, parent, "demo", profile),
+            "INSERT INTO sessions(id,harness,external_id,parent_session_id,repo,agent_profile,transcript_storage) VALUES(?,?,?,?,?,?,?)",
+            (sid, "codex", sid, parent, "demo", profile, transcript_storage),
         )
 
     def add_window(self, sid, number, *, authored=False):
@@ -144,6 +145,102 @@ class CoachPreprocessTests(unittest.TestCase):
         _, packet = self.packet()
         self.assertEqual(len(packet["root_session_ids"]), 1)
         self.assertIn("Please verify", packet["windows"][0]["messages"][0]["source_text"])
+
+    def test_source_backed_session_hydrates_without_reading_message_text_or_fts(self):
+        self.add_session("source", transcript_storage="source_backed")
+        self.conn.executemany(
+            "INSERT INTO messages(id,session_id,seq,role,text,content_hash) VALUES(?,?,?,?,?,?)",
+            [
+                ("source:m:1", "source", 1, "user", "persisted text must not be read", "request-hash"),
+                ("source:m:2", "source", 2, "assistant", "persisted text must not be read", "response-hash"),
+            ],
+        )
+        self.conn.execute(
+            "INSERT INTO exchange_windows(id,session_id,request_message_id,response_message_id,input_hash,content_hash) VALUES(?,?,?,?,?,?)",
+            ("persisted-window", "source", "source:m:1", "source:m:2", "request-hash", "persisted-content"),
+        )
+        source_messages = [
+            {"id": "source:m:1", "seq": 1, "role": "user", "timestamp": None,
+             "model": None, "model_canonical": None, "effort": None,
+             "text": "Please verify the source-backed tests.", "content_hash": "request-hash",
+             "is_tool_plumbing": False, "authored_by_agent": False},
+            {"id": "source:m:2", "seq": 2, "role": "assistant", "timestamp": None,
+             "model": None, "model_canonical": None, "effort": None,
+             "text": "The source-backed tests passed.", "content_hash": "response-hash",
+             "is_tool_plumbing": False, "authored_by_agent": False},
+        ]
+        calls = []
+
+        def reader(conn, session_id):
+            calls.append(session_id)
+            return SourceReadResult(
+                "ready", source_messages, source_identity="source-identity", source_hash="source-hash"
+            )
+
+        statements = []
+        self.conn.commit()
+        self.conn.set_trace_callback(statements.append)
+        root = Path(tempfile.mkdtemp())
+        manifest = emit_coach_packets(
+            self.conn,
+            root,
+            config=CoachPreprocessConfig(source_transcript_reader=reader),
+        )
+        self.conn.set_trace_callback(None)
+        packet = json.loads((root / manifest["packets"][0]["path"]).read_text())
+        self.assertEqual(calls, ["source"])
+        self.assertEqual(packet["windows"][0]["messages"][0]["source_text"], source_messages[0]["text"])
+        self.assertEqual(packet["windows"][0]["messages"][0]["content_hash"], "request-hash")
+        self.assertEqual(packet["windows"][0]["source_provenance"], {
+            "source_identity": "source-identity", "source_hash": "source-hash",
+        })
+        self.assertFalse(any("messages_fts" in statement.lower() for statement in statements))
+        self.assertFalse(any("select id, text from messages" in statement.lower() for statement in statements))
+
+    def test_source_backed_session_fails_closed_when_reader_is_unavailable(self):
+        self.add_session("source", transcript_storage="source_backed")
+        self.conn.commit()
+        root = Path(tempfile.mkdtemp())
+
+        def reader(conn, session_id):
+            return SourceReadResult("source_changed", [], warning="source changed")
+
+        with self.assertRaisesRegex(ValueError, "coach_source_transcript_unavailable.*status=source_changed"):
+            emit_coach_packets(
+                self.conn,
+                root,
+                config=CoachPreprocessConfig(source_transcript_reader=reader),
+            )
+
+    def test_source_backed_append_ahead_of_the_ledger_fails_closed(self):
+        self.add_session("source", transcript_storage="source_backed")
+        self.conn.executemany(
+            "INSERT INTO messages(id,session_id,seq,role,text,content_hash) VALUES(?,?,?,?,?,?)",
+            [
+                ("source:m:1", "source", 1, "user", "", "request-hash"),
+                ("source:m:2", "source", 2, "assistant", "", "response-hash"),
+            ],
+        )
+        self.conn.execute(
+            "INSERT INTO exchange_windows(id,session_id,request_message_id,response_message_id,input_hash,content_hash) VALUES(?,?,?,?,?,?)",
+            ("source-window", "source", "source:m:1", "source:m:2", "request-hash", "window-hash"),
+        )
+        self.conn.commit()
+
+        def reader(conn, session_id):
+            messages = [
+                {"id": "source:m:1", "seq": 1, "role": "user", "timestamp": None, "model": None, "model_canonical": None, "effort": None, "text": "Verify.", "content_hash": "request-hash", "is_tool_plumbing": False, "authored_by_agent": False},
+                {"id": "source:m:2", "seq": 2, "role": "assistant", "timestamp": None, "model": None, "model_canonical": None, "effort": None, "text": "Passed.", "content_hash": "response-hash", "is_tool_plumbing": False, "authored_by_agent": False},
+                {"id": "source:m:3", "seq": 3, "role": "user", "timestamp": None, "model": None, "model_canonical": None, "effort": None, "text": "Un-ingested append.", "content_hash": "append-hash", "is_tool_plumbing": False, "authored_by_agent": False},
+            ]
+            return SourceReadResult("ready", messages, source_identity="source-identity", source_hash="source-hash")
+
+        with self.assertRaisesRegex(ValueError, "coach_source_transcript_ledger_mismatch"):
+            emit_coach_packets(
+                self.conn,
+                Path(tempfile.mkdtemp()),
+                config=CoachPreprocessConfig(source_transcript_reader=reader),
+            )
 
     def test_ancestral_copied_history_window_is_excluded_but_same_session_repeats_remain(self):
         self.add_session("parent")

@@ -56,6 +56,7 @@ from agentlog.analysis.coach.preprocess import (
     build_preprocess_coverage,
     build_root_request_index,
 )
+from agentlog.source_reader import read_source_transcript
 from agentlog.safety.redaction import REDACTION_VERSION
 from agentlog.registry import supports as harness_supports
 from agentlog.session_identity import (
@@ -1352,16 +1353,98 @@ def _artifact_matches(
     )
 
 
+def _source_replay_messages(
+    conn: sqlite3.Connection,
+    session_id: str,
+    cache: dict[str, dict[str, Mapping[str, Any]]],
+) -> dict[str, Mapping[str, Any]] | None:
+    row = conn.execute(
+        "SELECT transcript_storage FROM sessions WHERE id = ?", (session_id,)
+    ).fetchone()
+    if row is None:
+        raise MaterializationError("source-backed evidence session does not exist")
+    if str(row["transcript_storage"] or "legacy_materialized") != "source_backed":
+        return None
+    if session_id not in cache:
+        result = read_source_transcript(conn, session_id)
+        if str(getattr(result, "status", "source_unavailable")) != "ready":
+            raise MaterializationError("source-backed evidence source is unavailable")
+        messages = getattr(result, "messages", None)
+        if not isinstance(messages, list):
+            raise MaterializationError("source-backed evidence source is invalid")
+        indexed: dict[str, Mapping[str, Any]] = {}
+        for message in messages:
+            if not isinstance(message, Mapping):
+                raise MaterializationError("source-backed evidence source is invalid")
+            message_id = str(message.get("id") or "")
+            if not message_id or message_id in indexed:
+                raise MaterializationError("source-backed evidence source is invalid")
+            indexed[message_id] = dict(message, session_id=session_id)
+        persisted = conn.execute(
+            "SELECT id, seq, role, timestamp, content_hash, is_tool_plumbing, authored_by_agent "
+            "FROM messages WHERE session_id = ? ORDER BY seq, id",
+            (session_id,),
+        ).fetchall()
+        source_ordered = sorted(
+            indexed.values(), key=lambda message: (int(message["seq"]), str(message["id"]))
+        )
+        if len(persisted) != len(source_ordered):
+            raise MaterializationError("source-backed evidence differs from the ledger")
+        for stored, source in zip(persisted, source_ordered):
+            if (
+                str(stored["id"]) != str(source["id"])
+                or int(stored["seq"]) != int(source["seq"])
+                or str(stored["role"] or "") != str(source["role"] or "")
+                or str(stored["timestamp"] or "") != str(source["timestamp"] or "")
+                or str(stored["content_hash"] or "") != str(source["content_hash"] or "")
+                or bool(stored["is_tool_plumbing"]) != bool(source["is_tool_plumbing"])
+                or bool(stored["authored_by_agent"]) != bool(source["authored_by_agent"])
+            ):
+                raise MaterializationError("source-backed evidence differs from the ledger")
+        cache[session_id] = indexed
+    return cache[session_id]
+
+
+def _replay_message(
+    conn: sqlite3.Connection,
+    session_id: str,
+    message_id: str,
+    cache: dict[str, dict[str, Mapping[str, Any]]],
+) -> Mapping[str, Any] | None:
+    source_messages = _source_replay_messages(conn, session_id, cache)
+    if source_messages is not None:
+        return source_messages.get(message_id)
+    return conn.execute(
+        "SELECT session_id, seq, role, timestamp, text, content_hash, "
+        "is_tool_plumbing, authored_by_agent FROM messages WHERE id = ?",
+        (message_id,),
+    ).fetchone()
+
+
 def _window_message_bounds(
     conn: sqlite3.Connection,
     session_id: str,
     window: sqlite3.Row,
+    source_cache: dict[str, dict[str, Mapping[str, Any]]] | None = None,
 ) -> tuple[int, int, int]:
-    rows = conn.execute(
-        "SELECT id, session_id, seq, role FROM messages WHERE id IN (?, ?)",
-        (window["request_message_id"], window["response_message_id"]),
-    ).fetchall()
-    by_id = {str(row["id"]): row for row in rows}
+    source_cache = source_cache if source_cache is not None else {}
+    source_messages = _source_replay_messages(conn, session_id, source_cache)
+    if source_messages is None:
+        rows = conn.execute(
+            "SELECT id, session_id, seq, role, text, is_tool_plumbing, authored_by_agent "
+            "FROM messages WHERE id IN (?, ?)",
+            (window["request_message_id"], window["response_message_id"]),
+        ).fetchall()
+        by_id: Mapping[str, Mapping[str, Any]] = {str(row["id"]): row for row in rows}
+        session_messages: Iterable[Mapping[str, Any]] = conn.execute(
+            "SELECT id, seq, role, text, is_tool_plumbing, authored_by_agent "
+            "FROM messages WHERE session_id = ? AND seq > ? AND role = 'user' "
+            "ORDER BY seq, id",
+            (session_id, 0),
+        ).fetchall()
+    else:
+        by_id = source_messages
+        session_messages = source_messages.values()
     request = by_id.get(str(window["request_message_id"]))
     response = by_id.get(str(window["response_message_id"]))
     if (
@@ -1379,13 +1462,10 @@ def _window_message_bounds(
     next_owner = next(
         (
             row
-            for row in conn.execute(
-                "SELECT seq, text, is_tool_plumbing, authored_by_agent "
-                "FROM messages WHERE session_id = ? AND seq > ? AND role = 'user' "
-                "ORDER BY seq, id",
-                (session_id, int(request["seq"])),
-            ).fetchall()
-            if not bool(row["is_tool_plumbing"])
+            for row in session_messages
+            if int(row["seq"]) > int(request["seq"])
+            and str(row["role"] or "") == "user"
+            and not bool(row["is_tool_plumbing"])
             and not bool(row["authored_by_agent"])
             and not _synthetic_request_kind(str(row["text"] or ""))
         ),
@@ -1402,17 +1482,15 @@ def _verify_message_evidence(
     evidence: Mapping[str, Any],
     session_id: str,
     window: sqlite3.Row,
+    source_cache: dict[str, dict[str, Mapping[str, Any]]] | None = None,
 ) -> str:
+    source_cache = source_cache if source_cache is not None else {}
     message_id = str(evidence.get("message_id") or "")
     if not message_id or evidence.get("tool_event_id") or evidence.get("skill_exposure_id"):
         raise MaterializationError("message evidence is not owned by its window")
-    message = conn.execute(
-        "SELECT session_id, seq, role, timestamp, text, content_hash "
-        "FROM messages WHERE id = ?",
-        (message_id,),
-    ).fetchone()
+    message = _replay_message(conn, session_id, message_id, source_cache)
     request_seq, _response_seq, window_end = _window_message_bounds(
-        conn, session_id, window
+        conn, session_id, window, source_cache
     )
     if (
         message is None
@@ -1456,7 +1534,9 @@ def _verify_tool_evidence(
     session_id: str,
     window: sqlite3.Row,
     window_timestamp: str,
+    source_cache: dict[str, dict[str, Mapping[str, Any]]] | None = None,
 ) -> str:
+    source_cache = source_cache if source_cache is not None else {}
     tool_event_id = str(evidence.get("tool_event_id") or "")
     if not tool_event_id or evidence.get("skill_exposure_id"):
         raise MaterializationError("tool evidence identity is malformed")
@@ -1471,7 +1551,7 @@ def _verify_tool_evidence(
         (tool_event_id,),
     ).fetchone()
     _request_seq, _response_seq, window_end = _window_message_bounds(
-        conn, session_id, window
+        conn, session_id, window, source_cache
     )
     linked_message = (
         conn.execute(
@@ -1533,7 +1613,9 @@ def _verify_skill_evidence(
     session_id: str,
     window: sqlite3.Row,
     window_timestamp: str,
+    source_cache: dict[str, dict[str, Mapping[str, Any]]] | None = None,
 ) -> str:
+    source_cache = source_cache if source_cache is not None else {}
     exposure_id = str(evidence.get("skill_exposure_id") or "")
     if not exposure_id or evidence.get("tool_event_id"):
         raise MaterializationError("skill evidence identity is malformed")
@@ -1543,7 +1625,7 @@ def _verify_skill_evidence(
         (exposure_id,),
     ).fetchone()
     request_seq, _response_seq, window_end = _window_message_bounds(
-        conn, session_id, window
+        conn, session_id, window, source_cache
     )
     linked_message = (
         conn.execute(
@@ -1617,6 +1699,7 @@ def _verify_catalog_evidence(
     if not isinstance(coverage, Mapping) or not isinstance(packet_provenance, Mapping):
         raise MaterializationError("candidate catalog packet provenance is missing")
     sessions, logical_roots, backing_shadows = _session_roots(conn)
+    source_cache: dict[str, dict[str, Mapping[str, Any]]] = {}
     for observation_id, raw_observation in observation_index.items():
         if not isinstance(raw_observation, Mapping):
             raise MaterializationError("catalog observation is not an object")
@@ -1698,15 +1781,15 @@ def _verify_catalog_evidence(
             window_timestamp = str((request["timestamp"] if request else None) or session["started_at"] or "")
             if evidence_type == "message":
                 timestamp = _verify_message_evidence(
-                    conn, evidence, session_id, window
+                    conn, evidence, session_id, window, source_cache
                 )
             elif evidence_type == "tool":
                 timestamp = _verify_tool_evidence(
-                    conn, evidence, session_id, window, window_timestamp
+                    conn, evidence, session_id, window, window_timestamp, source_cache
                 )
             elif evidence_type == "skill":
                 timestamp = _verify_skill_evidence(
-                    conn, evidence, session_id, window, window_timestamp
+                    conn, evidence, session_id, window, window_timestamp, source_cache
                 )
             else:
                 raise MaterializationError("catalog evidence type is unsupported")

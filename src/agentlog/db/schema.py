@@ -17,7 +17,9 @@ CREATE TABLE IF NOT EXISTS artifacts (
     mtime_ns INTEGER NOT NULL,
     content_hash TEXT NOT NULL,
     parsed_offset INTEGER NOT NULL DEFAULT 0,
-    parser_version TEXT NOT NULL
+    parser_version TEXT NOT NULL,
+    transcript_storage TEXT NOT NULL DEFAULT 'legacy_materialized'
+        CHECK (transcript_storage IN ('legacy_materialized', 'source_backed'))
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -38,6 +40,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     agent_profile TEXT,
     effort TEXT,
     effort_source TEXT,
+    transcript_storage TEXT NOT NULL DEFAULT 'legacy_materialized'
+        CHECK (transcript_storage IN ('legacy_materialized', 'source_backed')),
     UNIQUE (harness, external_id)
 );
 
@@ -108,16 +112,23 @@ CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
     tokenize='porter unicode61'
 );
 
-CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
+CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages
+WHEN new.text != '' BEGIN
     INSERT INTO messages_fts(rowid, text) VALUES (new.rowid, new.text);
 END;
 
-CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
+CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages
+WHEN old.text != '' BEGIN
     INSERT INTO messages_fts(messages_fts, rowid, text) VALUES ('delete', old.rowid, old.text);
 END;
 
-CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
+CREATE TRIGGER IF NOT EXISTS messages_au_delete AFTER UPDATE OF text ON messages
+WHEN old.text != '' BEGIN
     INSERT INTO messages_fts(messages_fts, rowid, text) VALUES ('delete', old.rowid, old.text);
+END;
+
+CREATE TRIGGER IF NOT EXISTS messages_au_insert AFTER UPDATE OF text ON messages
+WHEN new.text != '' BEGIN
     INSERT INTO messages_fts(rowid, text) VALUES (new.rowid, new.text);
 END;
 """

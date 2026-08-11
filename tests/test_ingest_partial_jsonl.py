@@ -119,8 +119,8 @@ class PartialTailIngestTests(unittest.TestCase):
                     self.assertEqual(
                         [(r["role"], r["text"]) for r in rows],
                         [
-                            ("user", "please summarise"),
-                            ("assistant", "réponse: 日本語 ✅ done"),
+                            ("user", ""),
+                            ("assistant", ""),
                         ],
                     )
 

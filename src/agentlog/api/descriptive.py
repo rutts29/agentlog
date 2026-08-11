@@ -19,6 +19,7 @@ from agentlog.api.identity_aggregates import (
 )
 from agentlog.api.model_rollup import collapse_by_model, strict_message_model_sql
 from agentlog.api.ranges import TimeRange, session_time_clause as _session_time_clause
+from agentlog.api.search import SourceReader, search_messages as _dual_search_messages
 from agentlog.session_identity import (
     build_identity_context,
     logical_orchestrator_id,
@@ -29,6 +30,7 @@ from agentlog.session_identity import (
     provider_root_shadow_ids,
 )
 from agentlog.normalize.model_identity import display_model
+from agentlog.source_reader import read_source_transcript
 
 _SORT_COLUMNS = {
     "started_at": "COALESCE(s.started_at, '')",
@@ -768,6 +770,9 @@ def session_detail_v2(
         """,
         (transcript_id,),
     ).fetchall()
+    source_read = read_source_transcript(conn, transcript_id)
+    if source_read.status != "legacy":
+        messages = source_read.messages
     tools = conn.execute(
         """
         SELECT id, message_id, seq, tool_name, action, success, duration_ms,
@@ -885,6 +890,21 @@ def session_detail_v2(
         except ValueError:
             dur = None
 
+    transcript_payload: dict[str, Any] = {
+        "id": transcript["id"],
+        "harness": transcript["harness"],
+        "artifact_id": transcript["artifact_id"],
+        "artifact_path": transcript["artifact_path"],
+    }
+    if source_read.status != "legacy":
+        transcript_payload["source"] = {
+            "status": source_read.status,
+            "unit_id": source_read.source_unit_id,
+            "identity": source_read.source_identity,
+            "hash": source_read.source_hash,
+            "warning": source_read.warning,
+        }
+
     return {
         "session": {
             "id": s["id"],
@@ -906,12 +926,7 @@ def session_detail_v2(
             "artifact_path": s["artifact_path"],
             "external_id": s["external_id"],
         },
-        "transcript": {
-            "id": transcript["id"],
-            "harness": transcript["harness"],
-            "artifact_id": transcript["artifact_id"],
-            "artifact_path": transcript["artifact_path"],
-        },
+        "transcript": transcript_payload,
         "timeline": timeline,
         "messages": [_with_display_model(m) for m in messages],
         "tool_events": [dict(t) for t in tools],
@@ -946,114 +961,21 @@ def search_messages(
     project: list[str] | None = None,
     cursor: int = 0,
     limit: int = 40,
+    source_reader: SourceReader | None = None,
+    source_scan_limit: int = 200,
 ) -> dict[str, Any]:
-    match = _fts_match_query(q)
-    if match is None:
-        return {
-            "q": q,
-            "total": 0,
-            "cursor": 0,
-            "next_cursor": None,
-            "items": [],
-            "note": "Enter a search term to query messages_fts.",
-        }
-    sessions = _aggregate_sessions(conn, tr)
-    by_metric = {session.metric_session_id: session for session in sessions}
-    if not by_metric:
-        return {
-            "q": q,
-            "match": match,
-            "total": 0,
-            "cursor": max(0, cursor),
-            "next_cursor": None,
-            "items": [],
-            "note": "Full-text search over canonical logical transcripts.",
-            "truncated": False,
-        }
-    params: dict[str, Any] = {"match": match}
-    metric_ph = ",".join(f":metric{i}" for i in range(len(by_metric)))
-    for i, session_id in enumerate(sorted(by_metric)):
-        params[f"metric{i}"] = session_id
-    clauses = ["messages_fts MATCH :match", f"m.session_id IN ({metric_ph})"]
-    where_sql = " AND ".join(clauses)
-    metrics = _metric_rows(conn, sessions)
-    # Fetch a bounded candidate set then project-filter in Python.
-    fetch_n = min(2000, max(limit * 5, cursor + limit + 200))
-    rows = conn.execute(
-        f"""
-        SELECT
-            m.id AS message_id,
-            m.session_id,
-            m.seq,
-            m.role,
-            m.timestamp,
-            m.model_canonical AS message_model,
-            snippet(messages_fts, 0, '«', '»', '…', 18) AS snippet,
-            bm25(messages_fts) AS rank,
-            s.harness,
-            s.model_canonical AS session_model,
-            s.effort,
-            s.repo,
-            s.cwd,
-            s.started_at
-        FROM messages_fts
-        JOIN messages m ON m.rowid = messages_fts.rowid
-        JOIN sessions s ON s.id = m.session_id
-        WHERE {where_sql}
-        ORDER BY rank
-        LIMIT :fetch_n
-        """,
-        {**params, "fetch_n": fetch_n},
-    ).fetchall()
-
-    items: list[dict[str, Any]] = []
-    for r in rows:
-        session = by_metric.get(str(r["session_id"]))
-        if session is None:
-            continue
-        if harness and session.logical_harness not in harness:
-            continue
-        source_model = _model_label(metrics.get(session.metric_session_id))
-        if model and source_model not in model:
-            continue
-        label = _project_label(session.row["repo"], session.row["cwd"])
-        if project and label not in project:
-            continue
-        items.append(
-            {
-                "message_id": r["message_id"],
-                "session_id": session.session_id,
-                "physical_session_id": r["session_id"],
-                "seq": r["seq"],
-                "role": r["role"],
-                "timestamp": r["timestamp"],
-                "snippet": r["snippet"],
-                "harness": session.logical_harness,
-                "runtime_harness": session.runtime_harness,
-                "orchestrator_session_id": session.orchestrator_session_id,
-                "transcript_session_id": session.metric_session_id,
-                "model": display_model(source_model),
-                "effort": session.row["effort"],
-                "project": label,
-                "started_at": session.row["started_at"],
-            }
-        )
-    total = len(items)
-    offset = max(0, cursor)
-    page = items[offset : offset + limit]
-    return {
-        "q": q,
-        "match": match,
-        "total": total,
-        "cursor": offset,
-        "next_cursor": offset + limit if offset + limit < total else None,
-        "items": page,
-        "note": (
-            "Full-text search over canonical logical transcripts. Snippets use « » "
-            "around matches. Click through to the logical session at the matching message."
-        ),
-        "truncated": total >= fetch_n,
-    }
+    return _dual_search_messages(
+        conn,
+        tr,
+        q=q,
+        harness=harness,
+        model=model,
+        project=project,
+        cursor=cursor,
+        limit=limit,
+        source_reader=source_reader,
+        source_scan_limit=source_scan_limit,
+    )
 
 
 def _parent_match_sql(parent_alias: str = "p", child_alias: str = "c") -> str:

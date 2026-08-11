@@ -6,6 +6,7 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from agentlog.analysis.claims.models import Claim, Proposal
 from agentlog.analysis.claims.store import upsert_claims, upsert_proposals
@@ -23,6 +24,7 @@ from agentlog.analysis.coach.materialize import (
     _validate_proposal_destination,
     _validate_sampling_gate,
     _validate_theme_binding,
+    _verify_message_evidence,
     _verify_tool_evidence,
     MATERIALIZER_VERSION,
     apply_materialization_plan,
@@ -40,6 +42,7 @@ from agentlog.analysis.coach.synthesis import (
 from agentlog.api.queries import insights_feed
 from agentlog.api.ranges import parse_range
 from agentlog.db.schema import init_db
+from agentlog.source_reader import SourceReadResult
 
 
 def _sha256(value):
@@ -142,6 +145,7 @@ class CoachMaterializeTests(unittest.TestCase):
                     operation_kind,
                 ),
             )
+
             if skill:
                 self.conn.execute(
                     "INSERT INTO skill_exposures "
@@ -155,6 +159,46 @@ class CoachMaterializeTests(unittest.TestCase):
                     ),
                 )
         self.conn.commit()
+
+    def test_source_backed_message_evidence_replays_transient_source_text(self):
+        source_text = "Please verify the transient source-backed result."
+        response_text = "The source-backed result passed."
+        self.conn.execute(
+            "INSERT INTO sessions(id,harness,external_id,repo,transcript_storage) VALUES(?,?,?,?,?)",
+            ("source", "codex", "source", "demo", "source_backed"),
+        )
+        self.conn.executemany(
+            "INSERT INTO messages(id,session_id,seq,role,text,content_hash) VALUES(?,?,?,?,?,?)",
+            [
+                ("source:m:1", "source", 1, "user", "", _sha256(source_text)),
+                ("source:m:2", "source", 2, "assistant", "", _sha256(response_text)),
+            ],
+        )
+        self.conn.execute(
+            "INSERT INTO exchange_windows(id,session_id,request_message_id,response_message_id,input_hash,content_hash) VALUES(?,?,?,?,?,?)",
+            ("source-window", "source", "source:m:1", "source:m:2", _sha256(source_text), "source-window-hash"),
+        )
+        self.conn.commit()
+        window = self.conn.execute(
+            "SELECT id, session_id, request_message_id, response_message_id FROM exchange_windows WHERE id = 'source-window'"
+        ).fetchone()
+        result = SourceReadResult(
+            "ready",
+            [
+                {"id": "source:m:1", "seq": 1, "role": "user", "timestamp": None, "model": None, "model_canonical": None, "effort": None, "text": source_text, "content_hash": _sha256(source_text), "is_tool_plumbing": False, "authored_by_agent": False},
+                {"id": "source:m:2", "seq": 2, "role": "assistant", "timestamp": None, "model": None, "model_canonical": None, "effort": None, "text": response_text, "content_hash": _sha256(response_text), "is_tool_plumbing": False, "authored_by_agent": False},
+            ],
+            source_identity="source-identity", source_hash="source-hash",
+        )
+        evidence = {
+            "message_id": "source:m:1", "role": "user", "seq": 1, "timestamp": "",
+            "source_hash": _sha256(source_text), "content_hash": _sha256(source_text),
+            "emitted_source_hash": _sha256(source_text), "quote": "Please verify",
+            "quote_start": 0, "quote_end": len("Please verify"),
+        }
+        with patch("agentlog.analysis.coach.materialize.read_source_transcript", return_value=result) as reader:
+            self.assertEqual(_verify_message_evidence(self.conn, evidence, "source", window, {}), "")
+        reader.assert_called_once_with(self.conn, "source")
 
     def _write_luna_results(
         self, run_dir, manifest, kind="instruction_miss", abstain_roots=()
