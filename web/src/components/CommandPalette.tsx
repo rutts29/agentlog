@@ -32,7 +32,7 @@ const VIEWS: Array<{ label: string; path: string }> = [
   { label: "Skills", path: "/skills" },
   { label: "Insights", path: "/insights" },
   { label: "Proposals", path: "/proposals" },
-  { label: "Adjudicate", path: "/adjudicate" },
+  { label: "Manual review", path: "/adjudicate" },
 ];
 
 export function CommandPalette({

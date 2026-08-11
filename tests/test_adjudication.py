@@ -14,7 +14,6 @@ from fastapi.testclient import TestClient
 from agentlog.api.adjudication import (
     build_report,
     is_adjudicable_request,
-    rebuild_adjudicable_pack,
 )
 from agentlog.api.app import create_app
 from agentlog.db.schema import connect, init_db
@@ -209,15 +208,10 @@ class AdjudicationApiTests(unittest.TestCase):
             )
         self.conn.commit()
 
-        original = self.root / "original.jsonl"
-        with original.open("w", encoding="utf-8") as f:
-            for wid in ("w0", "w1", "w2", "w3"):
-                f.write(json.dumps({"window_id": wid}) + "\n")
-
-        pack_path = self.root / "pack.jsonl"
-        self.app = create_app(self.db_path)
-        self.app.state.audit_pack_path = pack_path
-        self.app.state.original_audit_pack_path = original
+        self.app = create_app(
+            self.db_path,
+            adjudication_window_ids=("w0", "w1"),
+        )
         self.client = TestClient(self.app)
 
     def tearDown(self) -> None:
@@ -227,22 +221,33 @@ class AdjudicationApiTests(unittest.TestCase):
             pass
         self._tmp.cleanup()
 
-    def test_rebuild_excludes_ineligible_and_reports_original(self) -> None:
-        res = self.client.get("/api/adjudication/queue?rebuild=true")
+    def test_queue_contains_only_explicit_escalations(self) -> None:
+        res = self.client.get("/api/adjudication/queue")
         self.assertEqual(res.status_code, 200)
         data = res.json()
         ids = {i["window_id"] for i in data["items"]}
-        self.assertIn("w0", ids)
-        self.assertIn("w1", ids)
-        self.assertNotIn("w2", ids)
-        self.assertNotIn("w3", ids)
-        elig = data["original_pack_eligibility"]
-        self.assertEqual(elig["total"], 4)
-        self.assertEqual(elig["eligible"], 2)
-        self.assertEqual(elig["ineligible"], 2)
+        self.assertEqual(ids, {"w0", "w1"})
+        self.assertEqual(data["pack"]["mode"], "explicit_escalations")
+        self.assertEqual(data["pack"]["configured"], 2)
+        self.assertFalse(data["pack"]["rebuilt"])
+
+    def test_scalar_window_id_is_one_exact_escalation(self) -> None:
+        app = create_app(self.db_path, adjudication_window_ids="w0")
+        self.assertEqual(app.state.adjudication_window_ids, ("w0",))
+        data = TestClient(app).get("/api/adjudication/queue").json()
+        self.assertEqual([item["window_id"] for item in data["items"]], ["w0"])
+
+    def test_save_rejects_window_outside_exact_allowlist(self) -> None:
+        response = self.client.post(
+            "/api/adjudication/w2",
+            json={"triage": "no", "source": "ad_hoc"},
+        )
+        self.assertEqual(response.status_code, 403)
+        count = self.conn.execute("SELECT COUNT(*) AS c FROM adjudications").fetchone()
+        self.assertEqual(count["c"], 0)
 
     def test_queue_hides_llm_until_saved_and_includes_turns(self) -> None:
-        data = self.client.get("/api/adjudication/queue?rebuild=true").json()
+        data = self.client.get("/api/adjudication/queue").json()
         item = next(i for i in data["items"] if i["window_id"] == "w0")
         self.assertIsNone(item["llm"])
         self.assertFalse(item["adjudicated"])
@@ -295,8 +300,7 @@ class AdjudicationApiTests(unittest.TestCase):
         self.assertEqual(res2.status_code, 200)
         self.assertIn("vague:user_stance", res2.json()["notes"])
 
-    def test_keeps_existing_adjudication_when_rebuilding(self) -> None:
-        self.client.get("/api/adjudication/queue?rebuild=true")
+    def test_keeps_existing_adjudication_across_queue_reads(self) -> None:
         self.client.post(
             "/api/adjudication/w0",
             json={
@@ -309,7 +313,7 @@ class AdjudicationApiTests(unittest.TestCase):
                 "source": "audit_pack",
             },
         )
-        self.client.get("/api/adjudication/queue?rebuild=true")
+        self.client.get("/api/adjudication/queue")
         row = self.conn.execute(
             "SELECT notes, turn_kind FROM adjudications WHERE window_id='w0'"
         ).fetchone()
@@ -317,7 +321,6 @@ class AdjudicationApiTests(unittest.TestCase):
         self.assertEqual(json.loads(row["turn_kind"]), ["correction"])
 
     def test_report_counts_saved_even_without_enough_llm_pairs(self) -> None:
-        self.client.get("/api/adjudication/queue?rebuild=true")
         self.client.post(
             "/api/adjudication/w0",
             json={"triage": "no", "source": "audit_pack"},
@@ -332,24 +335,54 @@ class AdjudicationApiTests(unittest.TestCase):
         self.assertEqual(labels["dont_act_yet"], "told the agent to stop or wait")
         self.assertTrue(any(o["key"] == "v" for o in data["user_stance"]))
 
-    def test_stale_pack_ids_are_dropped_and_refilled(self) -> None:
-        # Write a pack that includes a missing window id + one good id.
-        pack_path = Path(self.app.state.audit_pack_path)
-        with pack_path.open("w", encoding="utf-8") as f:
-            f.write(json.dumps({"window_id": "does-not-exist-anymore"}) + "\n")
-            f.write(json.dumps({"window_id": "w0"}) + "\n")
-        data = self.client.get("/api/adjudication/queue").json()
-        ids = {i["window_id"] for i in data["items"]}
-        self.assertNotIn("does-not-exist-anymore", ids)
-        self.assertTrue(all(i["payload"]["turns"] for i in data["items"]))
-        self.assertTrue(
-            all(any(t["slot"] == "human" for t in i["payload"]["turns"]) for i in data["items"])
+    def test_missing_escalation_is_skipped_without_general_backfill(self) -> None:
+        app = create_app(
+            self.db_path,
+            adjudication_window_ids=("does-not-exist-anymore", "w0"),
         )
-        # Refilled from live eligible population (w0, w1).
-        self.assertGreaterEqual(len(data["items"]), 2)
+        data = TestClient(app).get("/api/adjudication/queue").json()
+        ids = {i["window_id"] for i in data["items"]}
+        self.assertEqual(ids, {"w0"})
+        self.assertEqual(data["pack"]["configured"], 2)
+        self.assertEqual(data["pack"]["skipped_stale"], 1)
+        self.assertTrue(all(i["payload"]["turns"] for i in data["items"]))
+        self.assertNotIn("w1", ids)
+        report = TestClient(app).get("/api/adjudication/report").json()
+        self.assertEqual(report["configured"], 2)
+        self.assertEqual(report["total_queue"], 1)
+        self.assertEqual(report["skipped_stale"], 1)
+
+    def test_default_mode_is_empty_and_cannot_write_or_rebuild(self) -> None:
+        paused = TestClient(create_app(self.db_path))
+        queue = paused.get("/api/adjudication/queue")
+        self.assertEqual(queue.status_code, 200)
+        self.assertEqual(queue.json()["items"], [])
+        self.assertEqual(
+            queue.json()["progress"],
+            {"done": 0, "total": 0, "remaining": 0},
+        )
+
+        report = paused.get("/api/adjudication/report")
+        self.assertEqual(report.status_code, 200)
+        self.assertEqual(report.json()["adjudicated"], 0)
+        self.assertEqual(report.json()["total_queue"], 0)
+        self.assertEqual(report.json()["configured"], 0)
+
+        rebuild = paused.post("/api/adjudication/rebuild")
+        self.assertEqual(rebuild.status_code, 409)
+        self.assertEqual(
+            paused.get("/api/adjudication/queue?rebuild=true").status_code,
+            409,
+        )
+        save = paused.post(
+            "/api/adjudication/w0",
+            json={"triage": "no", "source": "ad_hoc"},
+        )
+        self.assertEqual(save.status_code, 403)
+        count = self.conn.execute("SELECT COUNT(*) AS c FROM adjudications").fetchone()
+        self.assertEqual(count["c"], 0)
 
     def test_save_waits_out_competing_write_lock(self) -> None:
-        self.client.get("/api/adjudication/queue?rebuild=true")
         # Close the setUp handle so BEGIN EXCLUSIVE can take the file.
         self.conn.close()
 

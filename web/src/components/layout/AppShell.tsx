@@ -34,7 +34,7 @@ const NAV_SECTIONS: Array<{
       { to: "/skills", label: "Skills" },
       { to: "/insights", label: "Insights" },
       { to: "/proposals", label: "Proposals" },
-      { to: "/adjudicate", label: "Adjudicate" },
+      { to: "/adjudicate", label: "Manual review" },
     ],
   },
 ];
@@ -65,9 +65,8 @@ export function AppShell() {
       }
       if (paletteOpen || isEditable(e.target) || e.metaKey || e.ctrlKey || e.altKey)
         return;
-      /* View-local shortcuts (Adjudicate `]`, etc.) win via capture-phase
-         handlers; also skip here so a missed stopImmediatePropagation cannot
-         silently mutate the global range. */
+      /* Active manual-review shortcuts win via capture-phase handlers; skip
+         here if a review handler misses the event boundary. */
       if (e.key === "[" || e.key === "]") {
         if (location.pathname.startsWith("/adjudicate")) return;
         e.preventDefault();

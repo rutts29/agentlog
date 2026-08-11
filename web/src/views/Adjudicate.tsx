@@ -224,20 +224,22 @@ function CompareField({
 
 export function Adjudicate() {
   const qc = useQueryClient();
-  const taxonomy = useQuery({
-    queryKey: ["adjudication-taxonomy"],
-    queryFn: fetchAdjudicationTaxonomy,
-  });
   const queue = useQuery({
     queryKey: ["adjudication-queue"],
     queryFn: () => fetchAdjudicationQueue(false),
   });
+  const items = queue.data?.items ?? [];
+  const taxonomy = useQuery({
+    queryKey: ["adjudication-taxonomy"],
+    queryFn: fetchAdjudicationTaxonomy,
+    enabled: items.length > 0,
+  });
   const report = useQuery({
     queryKey: ["adjudication-report"],
     queryFn: fetchAdjudicationReport,
+    enabled: items.length > 0,
   });
 
-  const items = queue.data?.items ?? [];
   // Single source of truth for completed count and position.
   const done = queue.data?.progress.done ?? items.filter((i) => i.adjudicated).length;
   const total = queue.data?.progress.total ?? items.length;
@@ -498,14 +500,48 @@ export function Adjudicate() {
     return true;
   });
 
-  if (queue.isLoading || taxonomy.isLoading) {
+  if (queue.isLoading) {
     return <div className="text-[13px] text-muted-foreground">Loading…</div>;
   }
-  if (queue.isError || !queue.data || taxonomy.isError || !taxonomy.data) {
+  if (queue.isError || !queue.data) {
     return (
       <EmptyState
-        title="Could not load adjudication queue"
-        body="Check that the audit pack exists and agentlog serve is running."
+        title="Could not load manual-review queue"
+        body="Refresh or check that agentlog serve is running."
+      />
+    );
+  }
+  if (items.length === 0) {
+    return (
+      <div className="space-y-3">
+        <div className="flex items-baseline justify-between gap-3">
+          <div>
+            <h1 className="text-[18px] font-semibold tracking-tight">Manual review</h1>
+            <p className="mt-0.5 text-[12px] text-faint-foreground">
+              Reserved for exceptional cases that need an explicit human decision
+            </p>
+          </div>
+          <span className="text-right text-[12px] text-faint-foreground">
+            historical sessions are not queued
+          </span>
+        </div>
+        <EmptyState
+          title="No manual escalations"
+          body="Routine session analysis does not populate this page. Ambiguous or high-risk items may appear here when explicitly escalated for human review."
+          missing={["manual escalation only", "automatic population off"]}
+          className="min-h-[240px]"
+        />
+      </div>
+    );
+  }
+  if (taxonomy.isLoading) {
+    return <div className="text-[13px] text-muted-foreground">Loading…</div>;
+  }
+  if (taxonomy.isError || !taxonomy.data) {
+    return (
+      <EmptyState
+        title="Could not load review taxonomy"
+        body="Refresh or check that agentlog serve is running."
       />
     );
   }
@@ -521,9 +557,9 @@ export function Adjudicate() {
     <div className="space-y-3">
       <div className="flex items-baseline justify-between gap-3">
         <div>
-          <h1 className="text-[18px] font-semibold tracking-tight">Adjudicate</h1>
+          <h1 className="text-[18px] font-semibold tracking-tight">Manual review</h1>
           <p className="mt-0.5 text-[12px] text-faint-foreground">
-            Blind review — commit before the LLM answer is revealed
+            Escalated blind review — commit before the LLM answer is revealed
           </p>
         </div>
         <div className="text-right text-[12px] text-muted-foreground">

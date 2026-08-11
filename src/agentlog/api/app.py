@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from collections.abc import Iterable
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -77,6 +78,7 @@ def create_app(
     *,
     security: SecurityConfig | None = None,
     dist_dir: Path | None = None,
+    adjudication_window_ids: Iterable[str] | None = None,
 ) -> FastAPI:
     path = Path(db_path or DEFAULT_DB_PATH)
 
@@ -87,6 +89,18 @@ def create_app(
 
     app = FastAPI(title="agentlog", version="0.1.0", lifespan=lifespan)
     app.state.db_path = path
+    configured_adjudications = (
+        (adjudication_window_ids,)
+        if isinstance(adjudication_window_ids, str)
+        else (adjudication_window_ids or ())
+    )
+    app.state.adjudication_window_ids = tuple(
+        dict.fromkeys(
+            window_id.strip()
+            for value in configured_adjudications
+            if (window_id := str(value)).strip()
+        )
+    )
 
     sec = security or SecurityConfig()
     # Security first (inner), CORS last (outer). Deny responses from the

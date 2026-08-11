@@ -136,6 +136,18 @@ def _original_pack_path(request: Request) -> Path:
     return ORIGINAL_AUDIT_PACK
 
 
+def _configured_window_ids(request: Request) -> list[str]:
+    raw = getattr(request.app.state, "adjudication_window_ids", ())
+    values = (raw,) if isinstance(raw, str) else (raw or ())
+    return list(
+        dict.fromkeys(
+            window_id.strip()
+            for value in values
+            if (window_id := str(value)).strip()
+        )
+    )
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -287,6 +299,36 @@ def _adjudications(
             "source": row["source"],
         }
     return out
+
+
+def _queue_items_for_ids(
+    conn: sqlite3.Connection, window_ids: list[str]
+) -> tuple[list[dict[str, Any]], int]:
+    llm_by_id = _llm_labels(conn, window_ids)
+    adj_by_id = _adjudications(conn, window_ids)
+    items: list[dict[str, Any]] = []
+    skipped_stale = 0
+    for wid in window_ids:
+        payload = load_window_turns(conn, wid)
+        if not payload_has_human_turn(payload):
+            skipped_stale += 1
+            continue
+        assert payload is not None
+        adj = adj_by_id.get(wid)
+        items.append(
+            {
+                "window_id": wid,
+                "index": len(items),
+                "position": len(items) + 1,
+                "harness": payload.get("harness"),
+                "session_id": payload.get("session_id"),
+                "payload": payload,
+                "llm": llm_by_id.get(wid) if adj is not None else None,
+                "adjudication": adj,
+                "adjudicated": adj is not None,
+            }
+        )
+    return items, skipped_stale
 
 
 def _month_key(started_at: str | None) -> str:
@@ -950,20 +992,14 @@ def adjudication_taxonomy() -> dict:
 
 
 @router.post("/api/adjudication/rebuild")
-def adjudication_rebuild(
-    request: Request,
-    conn: sqlite3.Connection = Depends(get_conn),
-) -> dict:
-    pack_path = _audit_pack_path(request)
-    meta = rebuild_adjudicable_pack(conn, pack_path)
-    original_ids = [
-        str(r["window_id"]) for r in _load_jsonl(_original_pack_path(request))
-    ]
-    return {
-        **meta,
-        "original_pack_eligibility": evaluate_pack_eligibility(conn, original_ids),
-        "rebuilt": True,
-    }
+def adjudication_rebuild() -> dict:
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            "automatic adjudication packs are paused; configure exact escalated "
+            "window ids when manual review is required"
+        ),
+    )
 
 
 @router.get("/api/adjudication/queue")
@@ -972,77 +1008,15 @@ def adjudication_queue(
     rebuild: bool = Query(False),
     conn: sqlite3.Connection = Depends(get_conn),
 ) -> dict:
-    pack_path = _audit_pack_path(request)
-    pack_meta = _ensure_pack(conn, pack_path, rebuild=rebuild)
-    pack = _load_jsonl(pack_path)
-    if not pack:
-        pack_meta = rebuild_adjudicable_pack(conn, pack_path)
-        pack = _load_jsonl(pack_path)
-
-    window_ids = [str(r["window_id"]) for r in pack]
-    llm_by_id = _llm_labels(conn, window_ids)
-    adj_by_id = _adjudications(conn, window_ids)
-
-    items: list[dict[str, Any]] = []
-    skipped_stale = 0
-    for row in pack:
-        wid = str(row["window_id"])
-        payload = load_window_turns(conn, wid)
-        if not payload_has_human_turn(payload):
-            skipped_stale += 1
-            continue
-        assert payload is not None
-        adj = adj_by_id.get(wid)
-        # Blind-first: never send LLM labels until the human has committed.
-        items.append(
-            {
-                "window_id": wid,
-                "index": len(items),
-                "position": len(items) + 1,
-                "harness": payload.get("harness") or row.get("harness"),
-                "session_id": payload.get("session_id") or row.get("session_id"),
-                "payload": payload,
-                "llm": llm_by_id.get(wid) if adj is not None else None,
-                "adjudication": adj,
-                "adjudicated": adj is not None,
-            }
+    if rebuild:
+        raise HTTPException(
+            status_code=409,
+            detail="automatic adjudication pack rebuilds are paused",
         )
-
-    # If filtering hollowed the queue, rebuild once to a full adjudicable 100.
-    if skipped_stale or len(items) < QUEUE_TARGET:
-        pack_meta = rebuild_adjudicable_pack(conn, pack_path)
-        pack = _load_jsonl(pack_path)
-        window_ids = [str(r["window_id"]) for r in pack]
-        llm_by_id = _llm_labels(conn, window_ids)
-        adj_by_id = _adjudications(conn, window_ids)
-        items = []
-        skipped_stale = 0
-        for row in pack:
-            wid = str(row["window_id"])
-            payload = load_window_turns(conn, wid)
-            if not payload_has_human_turn(payload):
-                skipped_stale += 1
-                continue
-            assert payload is not None
-            adj = adj_by_id.get(wid)
-            items.append(
-                {
-                    "window_id": wid,
-                    "index": len(items),
-                    "position": len(items) + 1,
-                    "harness": payload.get("harness") or row.get("harness"),
-                    "session_id": payload.get("session_id") or row.get("session_id"),
-                    "payload": payload,
-                    "llm": llm_by_id.get(wid) if adj is not None else None,
-                    "adjudication": adj,
-                    "adjudicated": adj is not None,
-                }
-            )
+    window_ids = _configured_window_ids(request)
+    items, skipped_stale = _queue_items_for_ids(conn, window_ids)
 
     done = sum(1 for i in items if i["adjudicated"])
-    original_ids = [
-        str(r["window_id"]) for r in _load_jsonl(_original_pack_path(request))
-    ]
     return {
         "items": items,
         "progress": {
@@ -1050,9 +1024,14 @@ def adjudication_queue(
             "total": len(items),
             "remaining": max(0, len(items) - done),
         },
-        "audit_pack": str(pack_path),
-        "pack": {**pack_meta, "skipped_stale": skipped_stale},
-        "original_pack_eligibility": evaluate_pack_eligibility(conn, original_ids),
+        "audit_pack": "",
+        "pack": {
+            "mode": "explicit_escalations",
+            "configured": len(window_ids),
+            "selected": len(items),
+            "skipped_stale": skipped_stale,
+            "rebuilt": False,
+        },
         "integrity": {
             "note": (
                 "exchange_windows.id = content hash over session + request/response "
@@ -1151,8 +1130,14 @@ def _upsert_adjudication(
 def save_adjudication(
     window_id: str,
     body: dict[str, Any],
+    request: Request,
     conn: sqlite3.Connection = Depends(get_write_conn),
 ) -> dict:
+    if window_id not in set(_configured_window_ids(request)):
+        raise HTTPException(
+            status_code=403,
+            detail="window is not configured for escalated manual review",
+        )
     labels = _validate_labels(body)
     now = _utc_now()
 
@@ -1203,11 +1188,9 @@ def adjudication_report(
     request: Request,
     conn: sqlite3.Connection = Depends(get_conn),
 ) -> dict:
-    pack_path = _audit_pack_path(request)
-    if not pack_path.is_file():
-        rebuild_adjudicable_pack(conn, pack_path)
-    pack = _load_jsonl(pack_path)
-    window_ids = [str(r["window_id"]) for r in pack]
+    configured_ids = _configured_window_ids(request)
+    items, skipped_stale = _queue_items_for_ids(conn, configured_ids)
+    window_ids = [str(item["window_id"]) for item in items]
     llm_by_id = _llm_labels(conn, window_ids)
     adj_by_id = _adjudications(conn, window_ids)
 
@@ -1223,9 +1206,14 @@ def adjudication_report(
             continue
         pairs.append((human, llm))
 
-    return build_report(
-        pairs,
-        queue_total=len(window_ids),
-        adjudicated=sum(1 for wid in window_ids if wid in adj_by_id),
-        with_llm=len(pairs),
-    )
+    return {
+        **build_report(
+            pairs,
+            queue_total=len(window_ids),
+            adjudicated=sum(1 for wid in window_ids if wid in adj_by_id),
+            with_llm=len(pairs),
+        ),
+        "mode": "explicit_escalations",
+        "configured": len(configured_ids),
+        "skipped_stale": skipped_stale,
+    }
