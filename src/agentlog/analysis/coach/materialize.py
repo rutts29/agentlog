@@ -28,6 +28,7 @@ from agentlog.analysis.coach.synthesis import (
     build_synthesis_packets,
     exact_deduplicate_observations,
     load_validated_observation_records,
+    luna_result_paths,
     summarize_result_processing_coverage,
     validate_second_review_result,
     validate_terra_result,
@@ -975,15 +976,18 @@ def verify_coach_run(
         raise MaterializationError("coach run is missing a Luna result or abstention")
     preprocess_result_hashes: dict[str, str] = {}
     luna_results: list[dict[str, Any]] = []
-    result_paths = (
-        sorted((root / "results").glob("**/*.json"))
-        if (root / "results").is_dir()
-        else []
-    )
-    expected_result_paths = {
+    result_paths = luna_result_paths(root)
+    legacy_result_paths = {
         root / "results" / f"{packet_id}.json" for packet_id in manifest_packet_ids
     }
-    if set(result_paths) != expected_result_paths:
+    scoped_result_paths = {
+        root / "results" / "luna" / f"{packet_id}.json"
+        for packet_id in manifest_packet_ids
+    }
+    if (
+        set(result_paths) != legacy_result_paths
+        and set(result_paths) != scoped_result_paths
+    ):
         raise MaterializationError("coach preprocess result paths are incomplete or unexpected")
     for path in result_paths:
         parsed = _read_json(path, "coach preprocess result")

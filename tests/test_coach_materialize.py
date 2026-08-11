@@ -631,6 +631,77 @@ class CoachMaterializeTests(unittest.TestCase):
         self.assertEqual(repeated.unchanged_claim_ids, [plan.claims[0].id])
         self.assertEqual(repeated.unchanged_proposal_ids, [plan.proposals[0].id])
 
+    def test_duplicate_identical_inventory_entries_keep_bundle_verifiable(self):
+        self._seed_roots(10)
+        run_dir = self.base / "duplicate-identical-inventory"
+        run_dir.mkdir()
+        target = run_dir / "AGENTS.md"
+        target.write_text("# Existing rules\n")
+        entry = {
+            "path": str(target),
+            "content": target.read_text(),
+            "fingerprint": hashlib.sha256(target.read_bytes()).hexdigest(),
+            "target_kind": "instruction_file",
+        }
+        manifest = emit_coach_packets(self.conn, run_dir)
+        self._write_luna_results(run_dir, manifest, "instruction_miss")
+        self._finalize_run(run_dir, [entry, dict(entry)])
+
+        target_map = json.loads((run_dir / "synthesis_config_targets.json").read_text())
+        self.assertEqual(len(target_map["targets"]), 1)
+        verified = verify_coach_run(self.conn, run_dir)
+        self.assertTrue(verified.bundle_hash)
+        plan = plan_materialization(self.conn, run_dir)
+        self.assertEqual(len(plan.claims), 1)
+        self.assertEqual(len(plan.proposals), 1)
+
+    def test_verify_accepts_scoped_luna_results_and_ignores_terra_artifacts(self):
+        self._seed_roots(10)
+        run_dir, _, manifest, _, _ = self._build_run()
+        luna_dir = run_dir / "results" / "luna"
+        luna_dir.mkdir()
+        for entry in manifest["packets"]:
+            source = run_dir / "results" / f"{entry['packet_id']}.json"
+            shutil.move(source, luna_dir / source.name)
+        terra_dir = run_dir / "results" / "terra"
+        terra_dir.mkdir()
+        (terra_dir / "unrelated.json").write_text(json.dumps({
+            "packet_id": "spkt_unrelated",
+            "result_id": "terra-placeholder",
+        }))
+
+        verified = verify_coach_run(self.conn, run_dir)
+
+        result_hashes = verified.replay_provenance["preprocess_result_hashes"]
+        self.assertEqual(len(result_hashes), len(manifest["packets"]))
+        self.assertTrue(all(path.startswith("results/luna/") for path in result_hashes))
+        self.assertNotIn("results/terra/unrelated.json", result_hashes)
+
+    def test_conflicting_config_target_refs_remain_rejected(self):
+        self._seed_roots(10)
+        run_dir = self.base / "conflicting-target-kind"
+        run_dir.mkdir()
+        target = run_dir / "AGENTS.md"
+        target.write_text("# Existing rules\n")
+        entry = {
+            "path": str(target),
+            "content": target.read_text(),
+            "fingerprint": hashlib.sha256(target.read_bytes()).hexdigest(),
+            "target_kind": "instruction_file",
+        }
+        manifest = emit_coach_packets(self.conn, run_dir)
+        self._write_luna_results(run_dir, manifest, "instruction_miss")
+        self._finalize_run(
+            run_dir,
+            [entry, {**entry, "target_kind": "harness_rule"}],
+            include_proposal=False,
+        )
+
+        with self.assertRaisesRegex(
+            MaterializationError, "private config target entry is not self-consistent"
+        ):
+            verify_coach_run(self.conn, run_dir)
+
     def test_observed_instance_keeps_physical_navigation_and_source_time(self):
         self._seed_roots(1)
         self.conn.execute(

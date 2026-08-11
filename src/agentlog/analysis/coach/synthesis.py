@@ -984,6 +984,21 @@ def _packet_map(run_dir: Path, manifest: Mapping[str, Any]) -> dict[str, dict[st
     return packets
 
 
+def luna_result_paths(run_dir: Path | str) -> list[Path]:
+    """Return only legacy-root or explicitly Luna-scoped preprocess results."""
+    root = Path(run_dir) / "results"
+    if not root.is_dir():
+        return []
+    legacy = [path for path in root.glob("*.json") if path.is_file()]
+    staged = root / "luna"
+    nested = (
+        [path for path in staged.glob("**/*.json") if path.is_file()]
+        if staged.is_dir()
+        else []
+    )
+    return sorted({*legacy, *nested})
+
+
 def load_validated_observation_records(
     run_dir: Path | str,
     *,
@@ -992,14 +1007,15 @@ def load_validated_observation_records(
 ) -> tuple[list[dict[str, Any]], list[SynthesisValidationFailure]]:
     """Load only results that pass the preprocessing validator again.
 
-    Result files are read from ``results/**/*.json`` when paths are omitted.
+    Result files are read from legacy ``results/*.json`` and scoped
+    ``results/luna/**/*.json`` locations when paths are omitted.
     Re-validating at this boundary prevents synthesis from trusting a stale or
     hand-edited record merely because it has a familiar JSON shape.
     """
     root = Path(run_dir)
     source_manifest = _manifest_from(manifest) if manifest is not None else _manifest_from(root / "manifest.json")
     packets = _packet_map(root, source_manifest)
-    paths = [Path(path) for path in result_paths] if result_paths is not None else sorted((root / "results").glob("**/*.json")) if (root / "results").exists() else []
+    paths = [Path(path) for path in result_paths] if result_paths is not None else luna_result_paths(root)
     records: list[dict[str, Any]] = []
     failures: list[SynthesisValidationFailure] = []
     authoritative_results: set[str] = set()
@@ -1073,7 +1089,7 @@ def summarize_result_processing_coverage(
     root = Path(run_dir)
     source_manifest = _manifest_from(manifest) if manifest is not None else _manifest_from(root / "manifest.json")
     packets = _packet_map(root, source_manifest)
-    paths = [Path(path) for path in result_paths] if result_paths is not None else sorted((root / "results").glob("**/*.json")) if (root / "results").exists() else []
+    paths = [Path(path) for path in result_paths] if result_paths is not None else luna_result_paths(root)
     failures: list[SynthesisValidationFailure] = []
     authoritative: set[str] = set()
     valid_packets: set[str] = set()
@@ -1451,20 +1467,45 @@ def _config_target_ref(path: str, fingerprint: str) -> str:
     ).hexdigest()[:24]
 
 
-def build_config_target_map(config_inventory: Any) -> dict[str, Any]:
-    """Keep raw target paths in a local map that is never included in Terra packets."""
-    targets = []
+def _deduplicated_config_entries(config_inventory: Any) -> list[dict[str, str]]:
+    entries: dict[tuple[str, str, str], dict[str, str]] = {}
     for item in _config_entries(config_inventory):
         target_path = str(Path(item["path"]).expanduser().resolve())
-        targets.append(
-            {
-                "target_ref": _config_target_ref(target_path, item["fingerprint"]),
-                "target_path": target_path,
-                "fingerprint": item["fingerprint"],
-                "target_kind": item["target_kind"],
-            }
-        )
-    return {"schema_version": SYNTHESIS_SCHEMA_VERSION, "targets": sorted(targets, key=lambda item: item["target_ref"])}
+        identity = (target_path, item["fingerprint"], item["target_kind"])
+        normalized = {**item, "path": target_path}
+        existing = entries.get(identity)
+        if existing is not None:
+            if existing["content"] != normalized["content"]:
+                raise ValueError("conflicting config target content for identical target metadata")
+            continue
+        entries[identity] = normalized
+    return [entries[key] for key in sorted(entries)]
+
+
+def build_config_target_map(config_inventory: Any) -> dict[str, Any]:
+    """Keep raw target paths in a local map that is never included in Terra packets."""
+    targets: list[dict[str, str]] = []
+    for item in _deduplicated_config_entries(config_inventory):
+        target_path = item["path"]
+        target = {
+            "target_ref": _config_target_ref(target_path, item["fingerprint"]),
+            "target_path": target_path,
+            "fingerprint": item["fingerprint"],
+            "target_kind": item["target_kind"],
+        }
+        targets.append(target)
+    return {
+        "schema_version": SYNTHESIS_SCHEMA_VERSION,
+        "targets": sorted(
+            targets,
+            key=lambda item: (
+                item["target_ref"],
+                item["target_path"],
+                item["fingerprint"],
+                item["target_kind"],
+            ),
+        ),
+    }
 
 
 def _config_target_index(config_targets: Any) -> dict[str, dict[str, str]]:
@@ -1499,7 +1540,7 @@ def _config_overlap(
         token for token in _normalized_part(assertion_key).split("_")
         if len(token) >= 3 and token not in _STOP_CONFIG_TOKENS
     ]
-    entries = _config_entries(config_inventory)
+    entries = _deduplicated_config_entries(config_inventory)
     searched = [
         {
             "target_ref": _config_target_ref(item["path"], item["fingerprint"]),
@@ -1877,14 +1918,20 @@ def emit_synthesis_packets(
     coverage_manifest: Mapping[str, Any] | Path | str | None = None,
     config_inventory: Any = None,
     config: SynthesisConfig | None = None,
+    luna_results: Iterable[Path | str] | None = None,
 ) -> dict[str, Any]:
     """Write redacted synthesis packets under a coach run directory."""
     target = assert_writable(Path(run_dir), purpose="coach synthesis run")
     target.mkdir(parents=True, exist_ok=True)
     manifest = _manifest_from(coverage_manifest) if coverage_manifest is not None else _manifest_from(target / "manifest.json")
     if records is None:
-        source_records, failures = load_validated_observation_records(target, manifest=manifest)
-        processing_coverage, processing_failures = summarize_result_processing_coverage(target, manifest=manifest)
+        result_paths = tuple(luna_results) if luna_results is not None else None
+        source_records, failures = load_validated_observation_records(
+            target, manifest=manifest, result_paths=result_paths
+        )
+        processing_coverage, processing_failures = summarize_result_processing_coverage(
+            target, manifest=manifest, result_paths=result_paths
+        )
         failures = [*failures, *processing_failures]
     else:
         source_records, failures, processing_coverage = list(records), [], None
@@ -3426,6 +3473,7 @@ def run_synthesis_pipeline(
     records: Iterable[Mapping[str, Any]] | None = None,
     coverage_manifest: Mapping[str, Any] | Path | str | None = None,
     config_inventory: Any = None,
+    luna_results: Iterable[Path | str] | None = None,
     terra_results: Iterable[Mapping[str, Any]] | Mapping[str, Any] | None = None,
     second_review: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -3442,6 +3490,7 @@ def run_synthesis_pipeline(
         records,
         coverage_manifest=coverage_manifest,
         config_inventory=config_inventory,
+        luna_results=luna_results,
     )
     summary: dict[str, Any] = {
         "synthesis_manifest": synthesis_manifest,
