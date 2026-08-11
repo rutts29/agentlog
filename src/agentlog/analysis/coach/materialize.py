@@ -1762,7 +1762,8 @@ def _scope(
 
 def _observation_theme(observation: Mapping[str, Any]) -> set[str]:
     return _theme_terms(
-        observation.get("assertion_theme")
+        observation.get("server_theme")
+        or observation.get("assertion_theme")
         or observation.get("assertion_key")
         or observation.get("evidence_family")
     )

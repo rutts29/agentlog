@@ -60,9 +60,27 @@ _THEME_NOISE = frozenset({
     "gap", "instruction", "miss", "missing", "request", "required", "result", "run", "the",
 })
 _THEME_ALIASES = {
-    "test": "verification", "tests": "verification", "testing": "verification",
+    "pytest": "verification", "test": "verification", "tests": "verification", "testing": "verification",
     "verify": "verification", "verified": "verification",
 }
+_EXPLICIT_VERIFICATION_THEME_WORDS = frozenset({
+    "pytest", "test", "tests", "testing", "verify", "verified", "verification",
+})
+_AMBIGUOUS_VERIFICATION_THEME_WORDS = frozenset({
+    "check", "checks", "checking", "validate", "validated", "validation",
+})
+_VERIFICATION_THEME_WORDS = (
+    _EXPLICIT_VERIFICATION_THEME_WORDS | _AMBIGUOUS_VERIFICATION_THEME_WORDS
+)
+_VERIFICATION_THEME_MODIFIERS = _VERIFICATION_THEME_WORDS | frozenset({"finish"})
+_NON_VERIFICATION_TARGET_WORDS = frozenset({
+    "config", "configuration", "deploy", "deployment", "environment", "infrastructure",
+    "release", "rollout",
+})
+_THEME_TARGET_STOP_WORDS = _THEME_NOISE | frozenset({
+    "a", "an", "and", "for", "if", "must", "only", "please", "requested", "root",
+    "task", "tasks", "then", "to", "with", "work",
+}) | _VERIFICATION_THEME_MODIFIERS
 _COMPLETION_TERMS = re.compile(
     r"\b(?:complete(?:d|ion)?|deliver(?:ed|y)?|followed|verified|passed)\b",
     re.IGNORECASE,
@@ -88,7 +106,7 @@ _PIPELINE_NARRATION = re.compile(
     re.IGNORECASE,
 )
 _CANONICAL_TERM_ALIASES = {
-    "test": "verification", "tests": "verification", "testing": "verification",
+    "pytest": "verification", "test": "verification", "tests": "verification", "testing": "verification",
     "verified": "verification", "verify": "verification", "verification": "verification",
     "miss": "instruction_miss", "missed": "instruction_miss", "missing": "instruction_miss",
 }
@@ -389,9 +407,9 @@ def _evidence_family(observation: Mapping[str, Any]) -> str:
 
 
 def _assertion_theme(observation: Mapping[str, Any]) -> str:
-    explicit = _normalized_part(observation.get("assertion_theme"))
-    if explicit:
-        return explicit
+    server_theme = _normalized_part(observation.get("server_theme"))
+    if server_theme:
+        return server_theme
     tokens = [
         _THEME_ALIASES.get(token, token)
         for token in _assertion_from_observation(observation).split("_")
@@ -400,6 +418,108 @@ def _assertion_theme(observation: Mapping[str, Any]) -> str:
     if "verification" in tokens:
         tokens = [token for token in tokens if token not in {"check", "checks", "checking"}]
     return "_".join(dict.fromkeys(tokens)) or _evidence_family(observation)
+
+
+def _theme_fact(entry: Mapping[str, Any]) -> Mapping[str, Any]:
+    fact = entry.get("fact")
+    if isinstance(fact, Mapping):
+        return fact
+    if isinstance(fact, str):
+        try:
+            parsed = json.loads(fact)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, Mapping) else {}
+    return {}
+
+
+def _arc_refs(observation: Mapping[str, Any], labels: frozenset[str]) -> set[str]:
+    return {
+        str(ref)
+        for arc in observation.get("proof_arcs", [])
+        if isinstance(arc, Mapping)
+        and _normalized_part(arc.get("arc")) in labels
+        and isinstance(arc.get("evidence_refs"), list)
+        for ref in arc["evidence_refs"]
+    }
+
+
+def _server_assertion_theme(
+    observation: Mapping[str, Any],
+    windows: Mapping[str, Mapping[str, Any]],
+) -> str:
+    kind = str(observation.get("kind") or "")
+    evidence_by_ref = {
+        str(entry.get("ref") or ""): entry
+        for entry in observation.get("evidence", [])
+        if isinstance(entry, Mapping) and str(entry.get("ref") or "")
+    }
+    if kind == "process_fact":
+        artifact_refs = _arc_refs(observation, frozenset({"action", "artifact"}))
+        operation_kinds = {
+            _normalized_part(_theme_fact(evidence_by_ref[ref]).get("operation_kind"))
+            for ref in artifact_refs
+            if ref in evidence_by_ref
+        } - {""}
+        return f"process_{next(iter(operation_kinds))}" if len(operation_kinds) == 1 else "process"
+    if kind == "skill_use":
+        return "skill_execution"
+    if kind not in {"instruction_follow", "instruction_miss", "repeated_ask", "delivery_gap", "verification"}:
+        return ""
+    request_refs = _arc_refs(
+        observation,
+        frozenset({"request", "expectation", "verification_request", "request_1", "request_2"}),
+    )
+    request_texts: list[str] = []
+    for ref in sorted(request_refs):
+        evidence = evidence_by_ref.get(ref)
+        if not isinstance(evidence, Mapping) or str(evidence.get("evidence_type") or "") != "message":
+            continue
+        window = windows.get(str(evidence.get("window_id") or ""))
+        if not isinstance(window, Mapping):
+            continue
+        message_id = str(evidence.get("message_id") or "")
+        message = next(
+            (
+                entry for entry in window.get("messages", [])
+                if isinstance(entry, Mapping)
+                and str(entry.get("message_id") or "") == message_id
+                and str(entry.get("role") or "") == "user"
+            ),
+            None,
+        )
+        source_text = str((message or {}).get("source_text") or "")
+        if source_text:
+            request_texts.append(source_text)
+    if not request_texts:
+        return ""
+    request_tokens = [
+        token
+        for text in request_texts
+        for token in _normalized_part(text).split("_")
+        if token and not token.isdigit()
+    ]
+    request_set = set(request_tokens)
+    terminal_refs = _arc_refs(
+        observation,
+        frozenset({"outcome", "gap", "delivery", "verification_result"}),
+    )
+    typed_verification = any(
+        str(_theme_fact(evidence_by_ref[ref]).get("operation_kind") or "").lower()
+        == "verification"
+        for ref in terminal_refs
+        if ref in evidence_by_ref
+    )
+    explicit_verification = bool(request_set & _EXPLICIT_VERIFICATION_THEME_WORDS)
+    ambiguous_verification = bool(request_set & _AMBIGUOUS_VERIFICATION_THEME_WORDS)
+    configuration_target = bool(request_set & _NON_VERIFICATION_TARGET_WORDS)
+    if explicit_verification or (
+        typed_verification and ambiguous_verification and not configuration_target
+    ):
+        target = [token for token in request_tokens if token not in _THEME_TARGET_STOP_WORDS]
+        return "_".join(["verification", *dict.fromkeys(target)])
+    target = [token for token in request_tokens if token not in _THEME_TARGET_STOP_WORDS]
+    return "_".join(dict.fromkeys(target)) or f"unclassified_{_short_hash(request_texts)}"
 
 
 def _packet_evidence_windows(packet: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
@@ -437,7 +557,12 @@ def _packet_evidence_windows(packet: Mapping[str, Any]) -> dict[str, Mapping[str
     return windows
 
 
-def _observation_hash(observation: Mapping[str, Any], packet: Mapping[str, Any]) -> str:
+def _observation_hash(
+    observation: Mapping[str, Any],
+    packet: Mapping[str, Any],
+    *,
+    server_theme: str = "",
+) -> str:
     windows = _packet_evidence_windows(packet)
     evidence: list[dict[str, Any]] = []
     for item in observation.get("evidence", []):
@@ -469,6 +594,7 @@ def _observation_hash(observation: Mapping[str, Any], packet: Mapping[str, Any])
         {
             "kind": str(observation.get("kind") or ""),
             "assertion_key": _assertion_from_observation(observation),
+            "server_theme": server_theme,
             "scope": _scope_from_observation(observation),
             "polarity": _polarity_from_observation(observation),
             "does_not_prove": _normalized_text(observation.get("does_not_prove")),
@@ -738,7 +864,8 @@ def _record_from_observation(
     assertion = _assertion_from_observation(observation)
     if not assertion:
         return None, SynthesisValidationFailure("validated_observation_missing_assertion_key")
-    record_hash = _observation_hash(observation, packet)
+    server_theme = _server_assertion_theme(observation, windows) or _evidence_family(observation)
+    record_hash = _observation_hash(observation, packet, server_theme=server_theme)
     packet_hash = str(packet.get("packet_hash") or _short_hash(packet))
     artifact_hashes = sorted(
         {
@@ -785,6 +912,7 @@ def _record_from_observation(
         "exact_hash": record_hash,
         "kind": str(observation.get("kind") or ""),
         "assertion_key": assertion,
+        "server_theme": server_theme,
         "evidence_family": _evidence_family(observation),
         "scope": _scope_from_observation(observation),
         "polarity": _polarity_from_observation(observation),
@@ -1112,6 +1240,7 @@ def _brief_observation(record: Mapping[str, Any], report: RedactionReport) -> di
         "observation_id": str(record.get("observation_id") or ""),
         "kind": str(record.get("kind") or ""),
         "assertion_key": str(record.get("assertion_key") or ""),
+        "server_theme": str(record.get("server_theme") or ""),
         "evidence_family": str(record.get("evidence_family") or _evidence_family(record)),
         "assertion_theme": str(record.get("assertion_theme") or _assertion_theme(record)),
         "scope": str(record.get("scope") or ""),

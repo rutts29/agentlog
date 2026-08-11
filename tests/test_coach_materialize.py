@@ -84,9 +84,9 @@ class CoachMaterializeTests(unittest.TestCase):
             window_id = f"window-{number}"
             tool_id = f"tool-{number}"
             request = (
-                f"Please use the verification skill for root {number}."
+                "Please use the verification skill."
                 if skill
-                else f"Please verify the requested work for root {number}."
+                else "Please verify the requested work."
             )
             response = f"I attempted the requested work for root {number}."
             self.conn.execute(
