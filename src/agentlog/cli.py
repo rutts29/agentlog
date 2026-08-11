@@ -51,7 +51,15 @@ def _coach_json(value: Any) -> None:
 
 
 def _coach_result_paths(run_dir: Path, supplied: Optional[Path]) -> list[Path]:
-    root = (supplied or (run_dir / "results")).expanduser()
+    if supplied is None:
+        from agentlog.analysis.coach import luna_result_paths
+
+        return luna_result_paths(run_dir)
+    root = supplied.expanduser()
+    if root.resolve() == (run_dir / "results").resolve():
+        from agentlog.analysis.coach import luna_result_paths
+
+        return luna_result_paths(run_dir)
     if root.is_dir():
         return sorted(path for path in root.glob("**/*.json") if path.is_file())
     return [root] if root.is_file() else []
@@ -967,6 +975,7 @@ def coach_synthesize_cmd(
         summary = run_synthesis_pipeline(
             root,
             config_inventory=inventory,
+            luna_results=paths,
             terra_results=terra_value,
             second_review=review_value,
         )

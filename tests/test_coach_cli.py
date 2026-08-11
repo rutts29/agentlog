@@ -1,3 +1,4 @@
+import hashlib
 import json
 import sqlite3
 import tempfile
@@ -200,6 +201,139 @@ class CoachCliTests(unittest.TestCase):
         self.assertFalse(body["complete"])
         self.assertEqual(body["failures"][0]["reason"], "missing_luna_result_packets")
         self.assertNotIn("processed", result.output)
+
+    def test_synthesize_reads_luna_subdirectory_without_ingesting_terra_results(self):
+        conn = sqlite3.connect(self.db)
+        init_db(conn)
+        conn.execute(
+            "INSERT INTO sessions(id,harness,external_id,repo) VALUES(?,?,?,?)",
+            ("root", "codex", "root", "demo"),
+        )
+        conn.execute(
+            "INSERT INTO messages(id,session_id,seq,role,text,content_hash) VALUES(?,?,?,?,?,?)",
+            ("request", "root", 1, "user", "Please verify the tests", "request-hash"),
+        )
+        conn.execute(
+            "INSERT INTO messages(id,session_id,seq,role,text,content_hash) VALUES(?,?,?,?,?,?)",
+            ("response", "root", 2, "assistant", "I will verify the tests", "response-hash"),
+        )
+        conn.execute(
+            "INSERT INTO exchange_windows(id,session_id,request_message_id,response_message_id,input_hash,content_hash) VALUES(?,?,?,?,?,?)",
+            ("window", "root", "request", "response", "input-hash", "window-hash"),
+        )
+        conn.commit()
+        conn.close()
+
+        prepared = self.invoke("coach", "prepare", "--run-dir", str(self.run_dir))
+        self.assertEqual(prepared.exit_code, 0, prepared.output)
+        manifest = json.loads((self.run_dir / "manifest.json").read_text())
+        packet_entry = manifest["packets"][0]
+        packet = json.loads((self.run_dir / packet_entry["path"]).read_text())
+        luna_dir = self.run_dir / "results" / "luna"
+        luna_dir.mkdir(parents=True)
+        (luna_dir / f"{packet_entry['packet_id']}.json").write_text(json.dumps({
+            "packet_id": packet_entry["packet_id"],
+            "result_id": "luna-abstain",
+            "producer": packet["producer_contract"]["expected"],
+            "abstain": True,
+            "abstain_reason": "No bounded observation.",
+            "window_dispositions": [
+                {
+                    "window_id": window["window_id"],
+                    "observation_ids": [],
+                    "no_supported_observation": True,
+                }
+                for window in packet["windows"]
+            ],
+        }))
+        terra_dir = self.run_dir / "results" / "terra"
+        terra_dir.mkdir()
+        (terra_dir / "spkt_unrelated.json").write_text(json.dumps({
+            "packet_id": "spkt_unrelated",
+            "result_id": "terra-placeholder",
+        }))
+
+        result = self.invoke(
+            "coach",
+            "synthesize",
+            "--run-dir",
+            str(self.run_dir),
+            "--luna-results",
+            str(self.run_dir / "results"),
+        )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        body = json.loads(result.output)
+        self.assertEqual(body["luna_results"], {"expected": 1, "validated": 1, "complete": True})
+        self.assertEqual(body["stage"], "awaiting_terra")
+
+    def test_synthesize_deduplicates_identical_cli_config_inventory_entries(self):
+        conn = sqlite3.connect(self.db)
+        init_db(conn)
+        conn.execute(
+            "INSERT INTO sessions(id,harness,external_id,repo) VALUES(?,?,?,?)",
+            ("root", "codex", "root", "demo"),
+        )
+        conn.execute(
+            "INSERT INTO messages(id,session_id,seq,role,text,content_hash) VALUES(?,?,?,?,?,?)",
+            ("request", "root", 1, "user", "Please verify the tests", "request-hash"),
+        )
+        conn.execute(
+            "INSERT INTO messages(id,session_id,seq,role,text,content_hash) VALUES(?,?,?,?,?,?)",
+            ("response", "root", 2, "assistant", "I will verify the tests", "response-hash"),
+        )
+        conn.execute(
+            "INSERT INTO exchange_windows(id,session_id,request_message_id,response_message_id,input_hash,content_hash) VALUES(?,?,?,?,?,?)",
+            ("window", "root", "request", "response", "input-hash", "window-hash"),
+        )
+        conn.commit()
+        conn.close()
+
+        prepared = self.invoke("coach", "prepare", "--run-dir", str(self.run_dir))
+        self.assertEqual(prepared.exit_code, 0, prepared.output)
+        manifest = json.loads((self.run_dir / "manifest.json").read_text())
+        entry = manifest["packets"][0]
+        packet = json.loads((self.run_dir / entry["path"]).read_text())
+        luna_dir = self.run_dir / "results" / "luna"
+        luna_dir.mkdir(parents=True)
+        (luna_dir / f"{entry['packet_id']}.json").write_text(json.dumps({
+            "packet_id": entry["packet_id"],
+            "result_id": "luna-abstain",
+            "producer": packet["producer_contract"]["expected"],
+            "abstain": True,
+            "abstain_reason": "No bounded observation.",
+            "window_dispositions": [
+                {
+                    "window_id": window["window_id"],
+                    "observation_ids": [],
+                    "no_supported_observation": True,
+                }
+                for window in packet["windows"]
+            ],
+        }))
+        target = self.tmp / "AGENTS.md"
+        target.write_text("# Rules\n")
+        config = {
+            "path": str(target),
+            "content": target.read_text(),
+            "fingerprint": hashlib.sha256(target.read_bytes()).hexdigest(),
+            "target_kind": "instruction_file",
+        }
+        inventory_path = self.tmp / "duplicate-inventory.json"
+        inventory_path.write_text(json.dumps([config, dict(config)]))
+
+        result = self.invoke(
+            "coach",
+            "synthesize",
+            "--run-dir",
+            str(self.run_dir),
+            "--config-inventory",
+            str(inventory_path),
+        )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        target_map = json.loads((self.run_dir / "synthesis_config_targets.json").read_text())
+        self.assertEqual(len(target_map["targets"]), 1)
 
     def test_quarantine_defaults_to_dry_run_and_apply_is_explicit(self):
         dry_run = self.invoke("coach", "quarantine")

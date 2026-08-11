@@ -305,6 +305,29 @@ def _refresh_scope_population(packet):
 
 
 class CoachSynthesisTests(unittest.TestCase):
+    def test_config_target_map_deduplicates_only_identical_entries(self):
+        with tempfile.TemporaryDirectory() as temp:
+            target = Path(temp) / "AGENTS.md"
+            target.write_text("# Rules\n")
+            fingerprint = hashlib.sha256(target.read_bytes()).hexdigest()
+            entry = {
+                "path": str(target),
+                "content": target.read_text(),
+                "fingerprint": fingerprint,
+                "target_kind": "instruction_file",
+            }
+            exact = build_config_target_map([entry, dict(entry)])
+            conflicting = build_config_target_map(
+                [entry, {**entry, "target_kind": "harness_rule"}]
+            )
+
+        self.assertEqual(len(exact["targets"]), 1)
+        self.assertEqual(len(conflicting["targets"]), 2)
+        self.assertEqual(
+            {item["target_ref"] for item in conflicting["targets"]},
+            {exact["targets"][0]["target_ref"]},
+        )
+
     def test_exact_dedup_and_redacted_packet_contract(self):
         first = _record(1)
         duplicate = dict(first)
@@ -1547,6 +1570,56 @@ class CoachSynthesisTests(unittest.TestCase):
         self.assertIn("missing_synthesis_packet_results", {item["reason"] for item in partial["validation_failures"]})
         self.assertTrue(bundle_written)
         self.assertIn("synthesis_producer_assignment_mismatch", {failure.reason for failure in failures})
+
+    def test_synthesis_reuses_one_shot_luna_result_paths_for_processing_coverage(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        init_db(conn)
+        conn.execute(
+            "INSERT INTO sessions(id,harness,external_id,repo) VALUES(?,?,?,?)",
+            ("root", "codex", "root", "demo"),
+        )
+        conn.execute(
+            "INSERT INTO messages(id,session_id,seq,role,text,content_hash) VALUES(?,?,?,?,?,?)",
+            ("request", "root", 1, "user", "Please verify the tests", "request-hash"),
+        )
+        conn.execute(
+            "INSERT INTO messages(id,session_id,seq,role,text,content_hash) VALUES(?,?,?,?,?,?)",
+            ("response", "root", 2, "assistant", "I will verify the tests", "response-hash"),
+        )
+        conn.execute(
+            "INSERT INTO exchange_windows(id,session_id,request_message_id,response_message_id,input_hash,content_hash) VALUES(?,?,?,?,?,?)",
+            ("window", "root", "request", "response", "input-hash", "window-hash"),
+        )
+        conn.commit()
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            manifest = emit_coach_packets(conn, root)
+            entry = manifest["packets"][0]
+            packet = json.loads((root / entry["path"]).read_text())
+            result_path = root / "luna.json"
+            result_path.write_text(json.dumps({
+                "packet_id": entry["packet_id"],
+                "result_id": "luna-abstain",
+                "producer": packet["producer_contract"]["expected"],
+                "abstain": True,
+                "abstain_reason": "No bounded observation.",
+                "window_dispositions": [
+                    {
+                        "window_id": window["window_id"],
+                        "observation_ids": [],
+                        "no_supported_observation": True,
+                    }
+                    for window in packet["windows"]
+                ],
+            }))
+            summary = run_synthesis_pipeline(
+                root, luna_results=(path for path in [result_path])
+            )
+        self.assertEqual(summary["validation_failures"], [])
+        self.assertEqual(summary["synthesis_manifest"]["coverage"]["processed_packets"], 1)
+        self.assertEqual(summary["synthesis_manifest"]["coverage"]["abstained_packets"], 1)
+        conn.close()
 
     def test_orchestrator_emits_packets_without_model_or_catalog_until_results(self):
         records = [_record(i) for i in range(5)]
