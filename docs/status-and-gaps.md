@@ -11,6 +11,48 @@
 
 agentlog is a **harness assistant and observatory layer**, not a harness. It sits beside whatever coding agent the owner is running — Claude Code, Codex, Cursor, Warp, Hermes — reads their durable on-disk transcripts, databases, and configs locally, normalizes them into one evidence ledger, measures behavior over time, and *proposes* changes for the owner to approve. It never drives an agent, never spawns or supervises a process, and never applies a change on its own: writes are limited to `~/.agentlog/`, and any write outside it must pass through an explicitly approved, dry-run-by-default proposal (`src/agentlog/analysis/claims/apply.py`, `src/agentlog/cli.py:349-459`). Everything works offline against `~/.agentlog/agentlog.db`; there is no cloud dependency in the codebase.
 
+## 1.1 Forward-only source-backed transcript architecture
+
+Transcript retention is an explicit, forward-only choice. Existing sessions
+remain `legacy_materialized`: their message text stays in SQLite and remains
+available to SQLite FTS. Every newly created session identity is
+`source_backed`, including a new identity discovered inside an artifact that
+also contains older materialized sessions. The storage mode is immutable on
+artifacts and sessions, preventing later ingest from silently changing the
+retention contract.
+
+For source-backed sessions, SQLite retains session and artifact metadata,
+message identity fields and content hashes, tool events, token usage, and
+derived exchange windows. Message `text` is blank and source-backed messages
+are not inserted into FTS. Detail endpoints, search, read-only MCP tools, and
+coach preprocessing hydrate text transiently from the canonical artifact
+through the deterministic harness adapter. No LLM is needed to parse or
+retrieve transcript text.
+
+The source reader validates the artifact path and harness, checks that the
+persisted checkpoint prefix still matches, reads a stable source snapshot, and
+requires the parsed session to match the persisted identity and message
+metadata prefix. A missing source, changed prefix, unstable read, identity
+disappearance, or metadata divergence fails closed with no transcript text;
+callers receive an unavailable/changed result rather than stale or guessed
+content. Complete lines appended after the checkpoint become visible on the
+next read, subject to the same stability and prefix checks.
+
+This is deliberately a bounded first cut. Source search scans only a bounded
+number of candidate sessions, and each selected JSONL source read currently
+parses the full artifact to reconstruct the requested session; SQLite sources
+likewise use their adapter's current full read. Large multi-session artifacts
+therefore pay a scan/parse cost on detail, search, MCP, and coach paths. The
+durable metadata and hashes make that cost safe and observable, but do not yet
+provide random-access transcript offsets.
+
+Cutover is additive: migration defaults existing rows to `legacy_materialized`,
+installs blank-text-aware FTS triggers, and adds storage guards. Rollback means
+restoring the database backup and compatible code version; there is no in-place
+conversion that repopulates source-backed text or silently downgrades a
+session. Future improvements can add indexed source offsets or a deliberate
+backfill, but must preserve the immutable mode and fail-closed behavior.
+
 ## 2. Council backlog matrix
 
 Legend: **Integrated** = built and reachable from the UI or CLI · **Built, not surfaced** = code and API exist but no UI/CLI consumer · **Scaffold** = partial or unvalidated · **Missing**.

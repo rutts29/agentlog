@@ -922,7 +922,7 @@ class T3CodeAdapterTests(unittest.TestCase):
                 )
             ]
             self.assertEqual(stats.parsed, 1)
-            self.assertEqual(values, ["old", "fast-new"])
+            self.assertEqual(values, ["", ""])
         finally:
             writer.close()
             ledger.close()
@@ -1005,7 +1005,7 @@ class T3CodeAdapterTests(unittest.TestCase):
                 )
             ]
             self.assertEqual(stats.parsed, 1)
-            self.assertEqual(values, ["old", "parse-new", "parse-race"])
+            self.assertEqual(values, ["", "", ""])
         finally:
             writer.close()
             ledger.close()

@@ -63,6 +63,21 @@ export type SessionIdentityLike = {
   runtime_harness?: string | null;
 };
 
+export type TranscriptSourceStatus =
+  | "ready"
+  | "legacy"
+  | "source_changed"
+  | "source_unavailable";
+
+export type TranscriptSource = {
+  status: TranscriptSourceStatus;
+  identity?: string | null;
+  hash?: string | null;
+  warning?: string | null;
+};
+
+export type TranscriptStorage = "source_backed" | "legacy_materialized" | "materialized" | string;
+
 export function logicalHarness(item: SessionIdentityLike): string {
   return item.logical_harness || item.harness || "other";
 }
@@ -86,6 +101,7 @@ export type SessionRow = SessionIdentityFields & {
   tool_count: number;
   window_count?: number;
   parent_session_id?: string | null;
+  transcript_storage?: TranscriptStorage | null;
   status: string;
 };
 
@@ -426,12 +442,15 @@ export function fetchSessionDetail(sessionId: string) {
       artifact_id: number | null;
       artifact_path: string | null;
       external_id: string;
+      source?: TranscriptSource | null;
+      transcript_storage?: TranscriptStorage | null;
     };
     transcript?: {
       id: string;
       harness: string;
       artifact_id: number | null;
       artifact_path: string | null;
+      source?: TranscriptSource | null;
     } | null;
     timeline: TimelineItem[];
     skills: Array<{ skill_name: string; exposure_type: string; c: number }>;
@@ -479,6 +498,15 @@ export function fetchSearch(
       effort: string | null;
       project: string;
       started_at: string | null;
+      transcript_storage?: TranscriptStorage | null;
+      provenance?: {
+        mode?: string;
+        session_storage?: TranscriptStorage | null;
+        source_status?: TranscriptSourceStatus | null;
+        source_identity?: string | null;
+        source_hash?: string | null;
+        message_locator?: string | null;
+      };
     }>;
     note: string;
     truncated?: boolean;

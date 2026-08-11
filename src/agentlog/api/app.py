@@ -34,6 +34,7 @@ from agentlog.api.ranges import TimeRange, parse_range, range_params
 from agentlog.api.security import SecurityConfig, install_security
 from agentlog.config import DEFAULT_DB_PATH
 from agentlog.normalize.model_identity import repair_null_model_identity
+from agentlog.source_reader import read_source_transcript
 
 log = logging.getLogger("agentlog.api")
 
@@ -341,6 +342,7 @@ def create_app(
             project=project,
             cursor=cursor,
             limit=limit,
+            source_reader=read_source_transcript,
         )
         return {**range_params(tr), **data}
 

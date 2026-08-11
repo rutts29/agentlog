@@ -24,6 +24,7 @@ from agentlog.session_identity import (
     provider_canonical_root_backing_ids,
     provider_root_shadow_ids,
 )
+from agentlog.source_reader import read_source_transcript
 from agentlog.analysis.coach.proof import (
     EVIDENCE_MESSAGE,
     EVIDENCE_SKILL,
@@ -180,6 +181,7 @@ class CoachPreprocessConfig:
     producer_model: str = "gpt-5.6-luna"
     producer_worker_id: str = "luna-extraction"
     producer_assignment_id: str = "luna-extraction"
+    source_transcript_reader: Callable[[sqlite3.Connection, str], Any] | None = None
 
 
 _SAMPLED_WINDOWS_PER_ROOT = 8
@@ -301,6 +303,113 @@ def _session_roots(rows: list[sqlite3.Row]) -> tuple[dict[str, str], dict[str, s
                 break
         roots[sid] = cur if cur in by_id else sid
     return roots, by_id
+
+
+def _source_backed_session_ids(sessions: Iterable[sqlite3.Row]) -> set[str]:
+    source_backed: set[str] = set()
+    for session in sessions:
+        columns = set(session.keys())
+        if "transcript_storage" not in columns:
+            continue
+        mode = session["transcript_storage"]
+        if mode not in {"legacy_materialized", "source_backed"}:
+            raise ValueError(
+                "coach_source_transcript_storage_invalid: "
+                f"session_id={session['id']}"
+            )
+        if mode == "source_backed":
+            source_backed.add(str(session["id"]))
+    return source_backed
+
+
+def _source_messages(
+    conn: sqlite3.Connection,
+    session_ids: Iterable[str],
+    *,
+    reader: Callable[[sqlite3.Connection, str], Any],
+) -> tuple[dict[str, list[dict[str, Any]]], dict[str, dict[str, str]]]:
+    messages_by_session: dict[str, list[dict[str, Any]]] = {}
+    provenance: dict[str, dict[str, str]] = {}
+    required = {
+        "id", "seq", "role", "timestamp", "model", "model_canonical", "effort",
+        "text", "content_hash", "is_tool_plumbing", "authored_by_agent",
+    }
+    for session_id in sorted(set(session_ids)):
+        result = reader(conn, session_id)
+        status = str(getattr(result, "status", "unreadable"))
+        if status != "ready":
+            raise ValueError(
+                "coach_source_transcript_unavailable: "
+                f"session_id={session_id} status={status}"
+            )
+        source_identity = str(getattr(result, "source_identity", "") or "")
+        source_hash = str(getattr(result, "source_hash", "") or "")
+        if not source_identity or not source_hash:
+            raise ValueError(
+                "coach_source_transcript_provenance_missing: "
+                f"session_id={session_id}"
+            )
+        raw_messages = getattr(result, "messages", None)
+        if not isinstance(raw_messages, list):
+            raise ValueError(
+                "coach_source_transcript_messages_invalid: "
+                f"session_id={session_id}"
+            )
+        parsed: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        for raw in raw_messages:
+            if not isinstance(raw, Mapping) or not required.issubset(raw):
+                raise ValueError(
+                    "coach_source_transcript_message_invalid: "
+                    f"session_id={session_id}"
+                )
+            message_id = str(raw["id"] or "")
+            text = raw["text"]
+            if not message_id or message_id in seen_ids or not isinstance(text, str):
+                raise ValueError(
+                    "coach_source_transcript_message_invalid: "
+                    f"session_id={session_id}"
+                )
+            seen_ids.add(message_id)
+            parsed.append(dict(raw, id=message_id, session_id=session_id, text=text))
+        parsed.sort(key=lambda message: (int(message["seq"]), str(message["id"])))
+        messages_by_session[session_id] = parsed
+        provenance[session_id] = {
+            "source_identity": source_identity,
+            "source_hash": source_hash,
+        }
+    return messages_by_session, provenance
+
+
+def _validate_source_message_ledger(
+    conn: sqlite3.Connection,
+    messages_by_session: Mapping[str, list[dict[str, Any]]],
+) -> None:
+    for session_id, messages in messages_by_session.items():
+        persisted = conn.execute(
+            "SELECT id, seq, role, timestamp, content_hash, is_tool_plumbing, authored_by_agent "
+            "FROM messages WHERE session_id = ? ORDER BY seq, id",
+            (session_id,),
+        ).fetchall()
+        if len(persisted) != len(messages):
+            raise ValueError(
+                "coach_source_transcript_ledger_mismatch: "
+                f"session_id={session_id}"
+            )
+        for stored, source in zip(persisted, messages):
+            if (
+                str(stored["id"]) != str(source["id"])
+                or int(stored["seq"]) != int(source["seq"])
+                or str(stored["role"] or "") != str(source["role"] or "")
+                or str(stored["timestamp"] or "") != str(source["timestamp"] or "")
+                or str(stored["content_hash"] or "") != str(source["content_hash"] or "")
+                or bool(stored["is_tool_plumbing"]) != bool(source["is_tool_plumbing"])
+                or bool(stored["authored_by_agent"]) != bool(source["authored_by_agent"])
+            ):
+                raise ValueError(
+                    "coach_source_transcript_ledger_mismatch: "
+                    f"session_id={session_id}"
+                )
 
 
 def _linked_t3_sessions(conn: sqlite3.Connection) -> set[str]:
@@ -544,9 +653,15 @@ def _select_per_root(items: list[dict[str, Any]], limit: int | None) -> list[dic
     return sorted(chosen[:limit], key=lambda x: (str(x["timestamp"] or ""), str(x["window_id"])))
 
 
-def _window_rows(conn: sqlite3.Connection, report: RedactionReport) -> tuple[list[dict[str, Any]], dict[str, int], dict[str, Any]]:
+def _window_rows(
+    conn: sqlite3.Connection,
+    report: RedactionReport,
+    *,
+    source_transcript_reader: Callable[[sqlite3.Connection, str], Any] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, int], dict[str, Any]]:
     sessions = list(conn.execute("SELECT * FROM sessions ORDER BY id"))
     roots, by_id = _session_roots(sessions)
+    source_backed = _source_backed_session_ids(sessions)
     tool_context, skill_context = _session_context(conn)
     linked = _linked_t3_sessions(conn)
     identity = build_identity_context(conn)
@@ -576,18 +691,33 @@ def _window_rows(conn: sqlite3.Connection, report: RedactionReport) -> tuple[lis
             if sid == root:
                 excluded_roots.add(root)
 
-    total = int(conn.execute("SELECT COUNT(*) AS n FROM exchange_windows").fetchone()["n"])
+    source_sessions = {
+        session_id
+        for session_id in source_backed
+        if session_id not in excluded_sessions
+        and session_id not in projection_sources
+        and session_id not in historical_root_backings
+        and roots.get(session_id, session_id) not in excluded_roots
+    }
+    source_messages, source_provenance = _source_messages(
+        conn,
+        source_sessions,
+        reader=source_transcript_reader or read_source_transcript,
+    )
+    _validate_source_message_ledger(conn, source_messages)
+    legacy_sessions = sorted(set(by_id) - source_backed)
+    legacy_placeholders = ", ".join("?" for _ in legacy_sessions)
     rows = conn.execute(
         """
         SELECT w.id AS window_id, w.session_id, w.input_hash, w.*,
                s.harness, s.external_id, s.repo, s.cwd, s.started_at, s.artifact_id,
                s.parent_session_id, s.model, s.model_canonical, s.provider, s.agent_profile,
                req.id AS req_id, req.role AS req_role, req.seq AS req_seq,
-               req.timestamp AS req_timestamp, req.text AS req_text, req.content_hash AS req_hash,
+               req.timestamp AS req_timestamp, req.content_hash AS req_hash,
                req.model_canonical AS req_model_canonical, req.effort AS req_effort,
                req.is_tool_plumbing AS req_tool, req.authored_by_agent AS req_agent,
                resp.id AS resp_id, resp.role AS resp_role, resp.seq AS resp_seq,
-               resp.timestamp AS resp_timestamp, resp.text AS resp_text, resp.content_hash AS resp_hash,
+               resp.timestamp AS resp_timestamp, resp.content_hash AS resp_hash,
                resp.model_canonical AS resp_model_canonical, resp.effort AS resp_effort,
                resp.is_tool_plumbing AS resp_tool, resp.authored_by_agent AS resp_agent
         FROM exchange_windows w
@@ -597,29 +727,62 @@ def _window_rows(conn: sqlite3.Connection, report: RedactionReport) -> tuple[lis
         ORDER BY w.session_id, req.seq, w.id
         """
     ).fetchall()
+    text_by_id: dict[str, str] = {}
+    if legacy_sessions:
+        text_rows = conn.execute(
+            "SELECT id, text FROM messages WHERE session_id IN (" + legacy_placeholders + ")",
+            legacy_sessions,
+        ).fetchall()
+        text_by_id = {str(message["id"]): str(message["text"] or "") for message in text_rows}
+    source_text_by_id = {
+        str(message["id"]): str(message["text"])
+        for messages in source_messages.values()
+        for message in messages
+    }
+    rows = [
+        dict(
+            row,
+            req_text=(source_text_by_id if str(row["session_id"]) in source_backed else text_by_id).get(str(row["req_id"]), ""),
+            resp_text=(source_text_by_id if str(row["session_id"]) in source_backed else text_by_id).get(str(row["resp_id"]), ""),
+        )
+        for row in rows
+    ]
+    total = len(rows)
     copied_duplicate_windows = _copied_history_duplicate_windows(
         rows, logical_roots=logical_roots, sessions=by_id
     )
     out: list[dict[str, Any]] = []
     counts: dict[str, int] = {}
     inspected = 0
-    session_models: dict[str, list[str]] = {}
-    for message in conn.execute(
-        "SELECT session_id, model_canonical, model FROM messages WHERE role = 'assistant' ORDER BY session_id, seq, id"
-    ):
-        model = str(message["model_canonical"] or message["model"] or "")
-        if model and model not in session_models.setdefault(str(message["session_id"]), []):
-            session_models[str(message["session_id"])].append(model)
-    session_messages: dict[str, list[sqlite3.Row]] = {}
+    session_messages: dict[str, list[dict[str, Any]]] = {}
     message_seq_by_id: dict[str, int] = {}
-    message_by_id: dict[str, sqlite3.Row] = {}
+    message_by_id: dict[str, dict[str, Any]] = {}
     for message in conn.execute(
-        "SELECT id, session_id, seq, role, timestamp, text, content_hash, model_canonical, effort, "
+        "SELECT id, session_id, seq, role, timestamp, content_hash, model_canonical, effort, "
         "is_tool_plumbing, authored_by_agent FROM messages ORDER BY session_id, seq, id"
     ):
-        session_messages.setdefault(str(message["session_id"]), []).append(message)
+        session_id = str(message["session_id"])
+        if session_id in source_backed:
+            continue
+        copied = dict(message)
+        copied["text"] = str(text_by_id.get(str(message["id"]), "")) if legacy_sessions else ""
+        session_messages.setdefault(session_id, []).append(copied)
         message_seq_by_id[str(message["id"])] = int(message["seq"])
-        message_by_id[str(message["id"])] = message
+        message_by_id[str(message["id"])] = copied
+    for session_id, messages in source_messages.items():
+        session_messages[session_id] = messages
+        for message in messages:
+            message_id = str(message["id"])
+            message_seq_by_id[message_id] = int(message["seq"])
+            message_by_id[message_id] = message
+    session_models: dict[str, list[str]] = {}
+    for session_id, messages in session_messages.items():
+        for message in messages:
+            if str(message["role"] or "") != "assistant":
+                continue
+            model = str(message.get("model_canonical") or message.get("model") or "")
+            if model and model not in session_models.setdefault(session_id, []):
+                session_models[session_id].append(model)
     for row in rows:
         sid = str(row["session_id"])
         if str(row["window_id"]) in copied_duplicate_windows:
@@ -778,6 +941,7 @@ def _window_rows(conn: sqlite3.Connection, report: RedactionReport) -> tuple[lis
             "artifact": artifact, "signal_score": _signal_score(user_raw, asst_raw),
             "tool_timeline": tool_events, "skill_exposures": skill_exposures,
             "skills_loaded": sorted({str(exposure["skill_name"]) for exposure in skill_exposures}),
+            "source_provenance": dict(source_provenance.get(sid, {})),
             "session": {
                 "session_id": sid, "external_id": _external_label(str(row["external_id"] or "")),
                 "harness": runtime_harness, "logical_harness": logical_harness, "runtime_harness": runtime_harness,
@@ -788,6 +952,7 @@ def _window_rows(conn: sqlite3.Connection, report: RedactionReport) -> tuple[lis
                 "model_canonical": row["model_canonical"], "provider": row["provider"],
                 "agent_profile": row["agent_profile"],
                 "models_seen": session_models.get(sid, []),
+                "source_provenance": dict(source_provenance.get(sid, {})),
             },
             "messages": [
                 {"message_id": str(row["req_id"]), "role": "user", "seq": int(row["req_seq"]), "timestamp": row["req_timestamp"], "source_text": user, "source_hash": _sha256(user_raw), "content_hash": str(row["req_hash"] or _sha256(user_raw)), "model_canonical": None, "effort": None},
@@ -804,6 +969,8 @@ def _window_rows(conn: sqlite3.Connection, report: RedactionReport) -> tuple[lis
         "excluded_roots": sorted(excluded_roots), "excluded_sessions": sorted(excluded_sessions),
         "backing_shadows": sorted(backing_shadows), "projection_sources": sorted(projection_sources),
         "historical_root_backings": sorted(historical_root_backings),
+        "source_backed_sessions": sorted(source_backed),
+        "source_provenance": dict(sorted(source_provenance.items())),
         "excluded_synthetic_window_ids": sorted(excluded_synthetic_windows),
         "excluded_synthetic_by_kind": dict(sorted(excluded_synthetic_by_kind.items())),
         "excluded_duplicate_window_ids": sorted(copied_duplicate_windows),
@@ -1210,7 +1377,9 @@ def build_eligibility_commitment(
     cfg = config or CoachPreprocessConfig()
     _, quote_limit = _publication_limits(cfg)
     report = RedactionReport()
-    eligible, _, meta = _window_rows(conn, report)
+    eligible, _, meta = _window_rows(
+        conn, report, source_transcript_reader=cfg.source_transcript_reader
+    )
     report.version = COACH_REDACTION_VERSION
     selected, groups, ordered_roots, selected_by_root, emitted_by_root = _selection_state(
         eligible,
@@ -1233,7 +1402,9 @@ def build_packetized_window_index(
     cfg = config or CoachPreprocessConfig()
     _, quote_limit = _publication_limits(cfg)
     report = RedactionReport()
-    eligible, _, _ = _window_rows(conn, report)
+    eligible, _, _ = _window_rows(
+        conn, report, source_transcript_reader=cfg.source_transcript_reader
+    )
     report.version = COACH_REDACTION_VERSION
     _, groups, _, _, _ = _selection_state(
         eligible,
@@ -1254,7 +1425,9 @@ def build_root_request_index(
 ) -> dict[str, list[dict[str, Any]]]:
     cfg = config or CoachPreprocessConfig()
     _, quote_limit = _publication_limits(cfg)
-    eligible, _, _ = _window_rows(conn, RedactionReport())
+    eligible, _, _ = _window_rows(
+        conn, RedactionReport(), source_transcript_reader=cfg.source_transcript_reader
+    )
     return _root_request_index(eligible, quote_limit)
 
 
@@ -1266,7 +1439,9 @@ def build_preprocess_coverage(
     cfg = config or CoachPreprocessConfig()
     _, quote_limit = _publication_limits(cfg)
     report = RedactionReport()
-    eligible, _, meta = _window_rows(conn, report)
+    eligible, _, meta = _window_rows(
+        conn, report, source_transcript_reader=cfg.source_transcript_reader
+    )
     report.version = COACH_REDACTION_VERSION
     selected, groups, _, selected_by_root, emitted_by_root = _selection_state(
         eligible,
@@ -1390,7 +1565,9 @@ def emit_coach_packets(
     producer_contract = _producer_contract(cfg)
     report = RedactionReport()
     corpus_snapshot = _corpus_snapshot(conn)
-    eligible, pair_counts, meta = _window_rows(conn, report)
+    eligible, pair_counts, meta = _window_rows(
+        conn, report, source_transcript_reader=cfg.source_transcript_reader
+    )
     report.version = COACH_REDACTION_VERSION
     root_request_index = _root_request_index(eligible, quote_limit)
     selected, groups, ordered_roots, selected_by_root, emitted_by_root = _selection_state(

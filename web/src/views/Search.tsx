@@ -5,7 +5,7 @@ import { fetchFacets, fetchSearch } from "@/lib/api";
 import { Snippet } from "@/components/Snippet";
 import { EmptyState } from "@/components/EmptyState";
 import { PanelCard } from "@/components/ui/card";
-import { HarnessTag, ModelBadge } from "@/components/ui/badges";
+import { HarnessTag, ModelBadge, TranscriptStorageBadge } from "@/components/ui/badges";
 import { formatDayTime } from "@/lib/utils";
 
 type Ctx = { range: string };
@@ -60,7 +60,7 @@ export function Search() {
       <div className="flex items-baseline justify-between">
         <h1 className="text-[18px] font-semibold tracking-tight">Search</h1>
         <span className="text-[12px] text-faint-foreground">
-          full-text over every ingested message
+          legacy index + canonical transcript sources
         </span>
       </div>
 
@@ -106,15 +106,15 @@ export function Search() {
       {!qParam.trim() ? (
         <EmptyState
           title="Enter a query"
-          body="Search runs against the FTS index over 32k+ messages. Hits open the session transcript scrolled to the matching turn. Try: refactor, parent_session_id, auto-review."
-          missing={["messages_fts"]}
+          body="Legacy sessions use the local search index; new sessions are read from their canonical harness transcripts. Hits open the matching turn. Try: refactor, parent_session_id, auto-review."
+          missing={["legacy FTS + source scan"]}
         />
       ) : results.isLoading ? (
         <div className="text-[13px] text-muted-foreground">Searching…</div>
       ) : results.isError ? (
         <EmptyState
           title="Search failed"
-          body="The search endpoint returned an error. Check the FTS index and query syntax."
+          body="The search endpoint returned an error. Check the canonical source status, legacy index, and query syntax."
         />
       ) : results.data!.items.length === 0 ? (
         <EmptyState
@@ -140,6 +140,10 @@ export function Search() {
                 <div className="mb-1 flex flex-wrap items-center gap-x-2.5 gap-y-1">
                   <HarnessTag harness={hit.harness} />
                   <ModelBadge model={hit.model} harness={hit.harness} />
+                  <TranscriptStorageBadge
+                    storage={hit.transcript_storage ?? hit.provenance?.session_storage}
+                    sourceStatus={hit.provenance?.source_status}
+                  />
                   <span className="text-[11px] text-muted-foreground">{hit.project}</span>
                   <span
                     className="microlabel text-[9px]"

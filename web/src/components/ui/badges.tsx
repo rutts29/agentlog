@@ -1,4 +1,5 @@
 import { harnessColor, shortModel, cn } from "@/lib/utils";
+import type { TranscriptSourceStatus, TranscriptStorage } from "@/lib/api";
 
 export function harnessDisplayName(harness: string): string {
   switch (harness.toLowerCase()) {
@@ -121,6 +122,38 @@ export function StatusDot({
         className="inline-block h-[6px] w-[6px] rounded-full"
         style={{ background: color }}
       />
+      {label}
+    </span>
+  );
+}
+
+export function TranscriptStorageBadge({
+  storage,
+  sourceStatus,
+  className,
+}: {
+  storage?: TranscriptStorage | null;
+  sourceStatus?: TranscriptSourceStatus | null;
+  className?: string;
+}) {
+  const sourceBacked =
+    storage === "source_backed" ||
+    (sourceStatus != null && sourceStatus !== "legacy");
+  const label = sourceBacked ? "Source-backed" : "Legacy transcript";
+  const tint = sourceBacked ? "var(--status-info)" : "var(--faint-foreground)";
+  return (
+    <span
+      className={cn(
+        "inline-flex items-center gap-1.5 rounded-[4px] border px-1.5 py-[2px] text-[10px] leading-none",
+        className,
+      )}
+      style={{
+        borderColor: `color-mix(in srgb, ${tint} 35%, var(--border))`,
+        color: tint,
+      }}
+      title={sourceStatus && sourceStatus !== "ready" ? `Source status: ${sourceStatus}` : undefined}
+    >
+      <span aria-hidden className="inline-block h-[5px] w-[5px] rounded-full" style={{ background: tint }} />
       {label}
     </span>
   );

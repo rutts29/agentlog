@@ -18,6 +18,23 @@ T = TypeVar("T")
 _BUSY_RETRIES = 8
 _BUSY_RETRY_BASE_S = 0.05
 
+LEGACY_MATERIALIZED = "legacy_materialized"
+SOURCE_BACKED = "source_backed"
+_TRANSCRIPT_STORAGES = {LEGACY_MATERIALIZED, SOURCE_BACKED}
+
+
+class TranscriptStorageError(RuntimeError):
+    pass
+
+
+def _transcript_storage(value: object, *, scope: str) -> str:
+    storage = str(value or "")
+    if storage not in _TRANSCRIPT_STORAGES:
+        raise TranscriptStorageError(
+            f"ambiguous transcript storage for {scope}: {value!r}"
+        )
+    return storage
+
 
 def _is_busy(exc: BaseException) -> bool:
     if not isinstance(exc, sqlite3.OperationalError):
@@ -154,6 +171,7 @@ class ArtifactRow:
     content_hash: str
     parsed_offset: int
     parser_version: str
+    transcript_storage: str
 
 
 class Repository:
@@ -166,7 +184,41 @@ class Repository:
         ).fetchone()
         if not row:
             return None
-        return ArtifactRow(**dict(row))
+        artifact = ArtifactRow(**dict(row))
+        _transcript_storage(
+            artifact.transcript_storage, scope=f"artifact {artifact.path}"
+        )
+        return artifact
+
+    def _artifact_storage(self, artifact_id: int) -> str:
+        row = self.conn.execute(
+            "SELECT transcript_storage FROM artifacts WHERE id = ?",
+            (artifact_id,),
+        ).fetchone()
+        if row is None:
+            raise TranscriptStorageError(f"missing artifact {artifact_id}")
+        return _transcript_storage(
+            row["transcript_storage"], scope=f"artifact {artifact_id}"
+        )
+
+    def session_transcript_storage(self, session_id: str) -> str | None:
+        row = self.conn.execute(
+            "SELECT transcript_storage FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return _transcript_storage(
+            row["transcript_storage"], scope=f"session {session_id}"
+        )
+
+    def session_artifact_id(self, session_id: str) -> int | None:
+        row = self.conn.execute(
+            "SELECT artifact_id FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        if row is None or row["artifact_id"] is None:
+            return None
+        return int(row["artifact_id"])
 
     def upsert_artifact(
         self,
@@ -178,11 +230,26 @@ class Repository:
         content_hash: str,
         parsed_offset: int,
         parser_version: str,
+        transcript_storage: str = LEGACY_MATERIALIZED,
     ) -> int:
+        transcript_storage = _transcript_storage(
+            transcript_storage, scope=f"artifact {path}"
+        )
+        existing = self.get_artifact_by_path(path)
+        if (
+            existing is not None
+            and existing.transcript_storage != transcript_storage
+        ):
+            raise TranscriptStorageError(
+                f"artifact {path} cannot change transcript storage from "
+                f"{existing.transcript_storage} to {transcript_storage}"
+            )
         self.conn.execute(
             """
-            INSERT INTO artifacts (harness, path, size, mtime_ns, content_hash, parsed_offset, parser_version)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO artifacts (
+                harness, path, size, mtime_ns, content_hash, parsed_offset,
+                parser_version, transcript_storage
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(path) DO UPDATE SET
                 harness=excluded.harness,
                 size=excluded.size,
@@ -191,7 +258,16 @@ class Repository:
                 parsed_offset=excluded.parsed_offset,
                 parser_version=excluded.parser_version
             """,
-            (harness, path, size, mtime_ns, content_hash, parsed_offset, parser_version),
+            (
+                harness,
+                path,
+                size,
+                mtime_ns,
+                content_hash,
+                parsed_offset,
+                parser_version,
+                transcript_storage,
+            ),
         )
         row = self.conn.execute(
             "SELECT id FROM artifacts WHERE path = ?", (path,)
@@ -446,6 +522,28 @@ class Repository:
             return False
         return any(stored[k] > incoming[k] for k in stored)
 
+    def _assert_source_prefix(
+        self, session_id: str, result: ParseResult
+    ) -> None:
+        stored = self.conn.execute(
+            "SELECT seq, role, content_hash FROM messages "
+            "WHERE session_id = ? ORDER BY seq",
+            (session_id,),
+        ).fetchall()
+        if len(stored) > len(result.messages):
+            raise TranscriptStorageError(
+                f"source-backed session {session_id} shrank during reparse"
+            )
+        for row, message in zip(stored, result.messages):
+            if (
+                int(row["seq"]) != message.seq
+                or row["role"] != message.role
+                or row["content_hash"] != message.content_hash
+            ):
+                raise TranscriptStorageError(
+                    f"source-backed session {session_id} diverged during reparse"
+                )
+
     def save_parse_result(
         self,
         *,
@@ -455,9 +553,25 @@ class Repository:
         base_seq: int = 0,
         base_tool_seq: int = 0,
         base_token_seq: int = 0,
+        transcript_storage: str | None = None,
+        preserve_existing_legacy: bool = False,
     ) -> str:
         session = result.session
         session_id = _sid(session.harness.value, session.external_id)
+        artifact_storage = self._artifact_storage(artifact_id)
+        transcript_storage = _transcript_storage(
+            transcript_storage or artifact_storage,
+            scope=f"session {session_id}",
+        )
+        existing_storage = self.session_transcript_storage(session_id)
+        if (
+            existing_storage is not None
+            and existing_storage != transcript_storage
+        ):
+            raise TranscriptStorageError(
+                f"session {session_id} cannot change transcript storage from "
+                f"{existing_storage} to {transcript_storage}"
+            )
         session_ident = _identity_for(
             session.model,
             provider_hint=session.provider,
@@ -469,57 +583,76 @@ class Repository:
         incoming_links = list(result.extras.get("session_links", []))
         links = previous_links + incoming_links
 
+        if (
+            preserve_existing_legacy
+            and existing_storage == LEGACY_MATERIALIZED
+        ):
+            return session_id
+
+        if (
+            existing_storage == SOURCE_BACKED
+            and self.session_artifact_id(session_id) != artifact_id
+        ):
+            return session_id
+
         if not append:
-            existing_n = self.max_message_seq(session_id)
-            # Multiple transcript paths can resolve to one session id. Never
-            # replace a richer copy with a poorer or stale variant, including
-            # one that carries the same messages but less surrounding evidence.
-            if existing_n > len(result.messages) or self._equal_length_copy_is_poorer(
-                session_id, result, existing_n=existing_n
-            ):
+            if existing_storage == SOURCE_BACKED:
+                self._assert_source_prefix(session_id, result)
                 self._merge_session_metadata(
-                    session_id,
-                    result,
-                    artifact_id=None,
+                    session_id, result, artifact_id=None
                 )
-                self.replace_session_links(
-                    session_id,
-                    links,
+            else:
+                existing_n = self.max_message_seq(session_id)
+                # Multiple transcript paths can resolve to one session id. Never
+                # replace a richer copy with a poorer or stale variant, including
+                # one that carries the same messages but less surrounding evidence.
+                if existing_n > len(result.messages) or self._equal_length_copy_is_poorer(
+                    session_id, result, existing_n=existing_n
+                ):
+                    self._merge_session_metadata(
+                        session_id,
+                        result,
+                        artifact_id=None,
+                    )
+                    self.replace_session_links(
+                        session_id,
+                        links,
+                    )
+                    self.resolve_session_links(
+                        session.harness.value, session.external_id
+                    )
+                    return session_id
+                self.conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+                self.conn.execute(
+                    """
+                    INSERT INTO sessions (
+                        id, harness, external_id, parent_session_id, artifact_id,
+                        started_at, ended_at, repo, cwd, branch, commit_sha,
+                        model, model_canonical, provider, agent_profile,
+                        effort, effort_source, transcript_storage
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        session_id,
+                        session.harness.value,
+                        session.external_id,
+                        session.parent_session_id,
+                        artifact_id,
+                        _iso(session.started_at),
+                        _iso(session.ended_at),
+                        session.repo,
+                        session.cwd,
+                        session.branch,
+                        session.commit_sha,
+                        session.model,
+                        session_ident.canonical,
+                        session_ident.provider,
+                        session_ident.agent_profile,
+                        session.effort,
+                        session.effort_source,
+                        transcript_storage,
+                    ),
                 )
-                self.resolve_session_links(
-                    session.harness.value, session.external_id
-                )
-                return session_id
-            self.conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
-            self.conn.execute(
-                """
-                INSERT INTO sessions (
-                    id, harness, external_id, parent_session_id, artifact_id,
-                    started_at, ended_at, repo, cwd, branch, commit_sha,
-                    model, model_canonical, provider, agent_profile,
-                    effort, effort_source
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    session_id,
-                    session.harness.value,
-                    session.external_id,
-                    session.parent_session_id,
-                    artifact_id,
-                    _iso(session.started_at),
-                    _iso(session.ended_at),
-                    session.repo,
-                    session.cwd,
-                    session.branch,
-                    session.commit_sha,
-                    session.model,
-                    session_ident.canonical,
-                    session_ident.provider,
-                    session_ident.agent_profile,
-                    session.effort,
-                    session.effort_source,
-                ),
-            )
         else:
             self._merge_session_metadata(
                 session_id,
@@ -556,12 +689,27 @@ class Repository:
                 )
             self.conn.execute(
                 """
-                INSERT OR REPLACE INTO messages (
+                INSERT INTO messages (
                     id, session_id, seq, role, timestamp, model,
                     model_canonical, provider, agent_profile,
                     effort, effort_source, text, content_hash,
                     is_tool_plumbing, authored_by_agent
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    session_id = excluded.session_id,
+                    seq = excluded.seq,
+                    role = excluded.role,
+                    timestamp = excluded.timestamp,
+                    model = excluded.model,
+                    model_canonical = excluded.model_canonical,
+                    provider = excluded.provider,
+                    agent_profile = excluded.agent_profile,
+                    effort = excluded.effort,
+                    effort_source = excluded.effort_source,
+                    text = excluded.text,
+                    content_hash = excluded.content_hash,
+                    is_tool_plumbing = excluded.is_tool_plumbing,
+                    authored_by_agent = excluded.authored_by_agent
                 """,
                 (
                     mid,
@@ -575,7 +723,7 @@ class Repository:
                     msg_ident.agent_profile,
                     msg.effort,
                     msg.effort_source,
-                    msg.text,
+                    "" if transcript_storage == SOURCE_BACKED else msg.text,
                     msg.content_hash,
                     1 if msg.is_tool_plumbing else 0,
                     1 if msg.authored_by_agent else 0,
@@ -591,10 +739,19 @@ class Repository:
                 mid = _mid(session_id, base_seq + te.message_seq)
             self.conn.execute(
                 """
-                INSERT OR REPLACE INTO tool_events (
+                INSERT INTO tool_events (
                     id, session_id, message_id, seq, tool_name, action, success,
                     duration_ms, operation_kind
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    session_id = excluded.session_id,
+                    message_id = excluded.message_id,
+                    seq = excluded.seq,
+                    tool_name = excluded.tool_name,
+                    action = excluded.action,
+                    success = excluded.success,
+                    duration_ms = excluded.duration_ms,
+                    operation_kind = excluded.operation_kind
                 """,
                 (
                     _tid(session_id, seq),
@@ -617,9 +774,14 @@ class Repository:
                 )
             self.conn.execute(
                 """
-                INSERT OR REPLACE INTO skill_exposures (
+                INSERT INTO skill_exposures (
                     id, session_id, message_id, skill_name, exposure_type
                 ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    session_id = excluded.session_id,
+                    message_id = excluded.message_id,
+                    skill_name = excluded.skill_name,
+                    exposure_type = excluded.exposure_type
                 """,
                 (
                     _kid(session_id, base_seq * 1000 + idx, sk.skill_name),
@@ -644,13 +806,31 @@ class Repository:
             )
             self.conn.execute(
                 """
-                INSERT OR REPLACE INTO token_usage (
+                INSERT INTO token_usage (
                     id, session_id, message_id, seq, granularity, usage_source,
                     model, model_canonical, input_tokens, output_tokens,
                     cache_creation_input_tokens, cache_read_input_tokens,
                     cached_input_tokens, cache_write_input_tokens,
                     reasoning_output_tokens, total_tokens, timestamp, extras_json
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    session_id = excluded.session_id,
+                    message_id = excluded.message_id,
+                    seq = excluded.seq,
+                    granularity = excluded.granularity,
+                    usage_source = excluded.usage_source,
+                    model = excluded.model,
+                    model_canonical = excluded.model_canonical,
+                    input_tokens = excluded.input_tokens,
+                    output_tokens = excluded.output_tokens,
+                    cache_creation_input_tokens = excluded.cache_creation_input_tokens,
+                    cache_read_input_tokens = excluded.cache_read_input_tokens,
+                    cached_input_tokens = excluded.cached_input_tokens,
+                    cache_write_input_tokens = excluded.cache_write_input_tokens,
+                    reasoning_output_tokens = excluded.reasoning_output_tokens,
+                    total_tokens = excluded.total_tokens,
+                    timestamp = excluded.timestamp,
+                    extras_json = excluded.extras_json
                 """,
                 (
                     _uid(session_id, tu.usage_source, seq),
@@ -935,19 +1115,46 @@ class Repository:
         ).fetchone()
 
     def search_messages(self, query: str, limit: int = 30) -> list[sqlite3.Row]:
-        return list(
-            self.conn.execute(
-                """
-                SELECT m.id, m.session_id, m.seq, m.role, m.timestamp, m.model,
-                       snippet(messages_fts, 0, '[', ']', '…', 16) AS snippet,
-                       s.harness, s.cwd
-                FROM messages_fts
-                JOIN messages m ON m.rowid = messages_fts.rowid
-                JOIN sessions s ON s.id = m.session_id
-                WHERE messages_fts MATCH ?
-                ORDER BY rank
-                LIMIT ?
-                """,
-                (query, limit),
-            )
+        from datetime import datetime, timezone
+
+        from agentlog.api.ranges import TimeRange
+        from agentlog.api.search import search_messages as dual_search_messages
+        from agentlog.source_reader import read_source_transcript
+
+        now = datetime.now(timezone.utc)
+        result = dual_search_messages(
+            self.conn,
+            TimeRange("all", None, now, None, now),
+            q=query,
+            limit=limit,
+            source_reader=read_source_transcript,
         )
+        rows: list[sqlite3.Row] = []
+        for item in result["items"]:
+            physical_id = str(item.get("physical_session_id") or item["session_id"])
+            session = self.conn.execute(
+                "SELECT cwd FROM sessions WHERE id = ?", (physical_id,)
+            ).fetchone()
+            snippet = str(item.get("snippet") or "").replace("«", "[").replace("»", "]")
+            rows.append(
+                self.conn.execute(
+                    """
+                    SELECT :message_id AS id, :session_id AS session_id,
+                           :seq AS seq, :role AS role, :timestamp AS timestamp,
+                           :model AS model, :snippet AS snippet,
+                           :harness AS harness, :cwd AS cwd
+                    """,
+                    {
+                        "message_id": item.get("message_id"),
+                        "session_id": item["session_id"],
+                        "seq": item.get("seq"),
+                        "role": item.get("role"),
+                        "timestamp": item.get("timestamp"),
+                        "model": item.get("model"),
+                        "snippet": snippet,
+                        "harness": item.get("harness"),
+                        "cwd": session["cwd"] if session else None,
+                    },
+                ).fetchone()
+            )
+        return rows
