@@ -27,6 +27,15 @@ CREATE TABLE IF NOT EXISTS sessions (
     harness TEXT NOT NULL,
     external_id TEXT NOT NULL,
     parent_session_id TEXT,
+    originator TEXT,
+    thread_source TEXT,
+    inherited_message_count INTEGER NOT NULL DEFAULT 0,
+    inherited_record_count INTEGER NOT NULL DEFAULT 0,
+    fork_context_status TEXT,
+    fork_context_boundary TEXT,
+    source_sync_status TEXT,
+    source_sync_warning TEXT,
+    source_sync_checked_at TEXT,
     artifact_id INTEGER REFERENCES artifacts(id) ON DELETE CASCADE,
     started_at TEXT,
     ended_at TEXT,
@@ -172,9 +181,23 @@ def migrate_db(conn: sqlite3.Connection) -> None:
                 conn.execute(f"ALTER TABLE messages ADD COLUMN {col} TEXT")
     if "sessions" in tables:
         cols = _column_names(conn, "sessions")
-        for col in ("model_canonical", "provider", "agent_profile"):
+        for col in (
+            "model_canonical",
+            "provider",
+            "agent_profile",
+            "originator",
+            "thread_source",
+            "fork_context_status",
+            "fork_context_boundary",
+        ):
             if col not in cols:
                 conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} TEXT")
+        for col in ("inherited_message_count", "inherited_record_count"):
+            if col not in cols:
+                conn.execute(
+                    f"ALTER TABLE sessions ADD COLUMN {col} "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
     if "token_usage" in tables:
         cols = _column_names(conn, "token_usage")
         if "model_canonical" not in cols:

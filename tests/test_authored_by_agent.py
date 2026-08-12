@@ -13,6 +13,7 @@ from agentlog.db.schema import init_db
 from agentlog.ingest.claude import ClaudeAdapter
 from agentlog.ingest.codex import CodexAdapter
 from agentlog.ingest.cursor import CursorAdapter
+from agentlog.session_identity import INTERNAL_APPROVAL_GUARDIAN_THREAD_SOURCE
 
 
 def _line(obj: dict) -> bytes:
@@ -176,7 +177,9 @@ class CursorSubagentAuthoredTests(unittest.TestCase):
                                 {
                                     "type": "text",
                                     "text": (
-                                        "<side_chat_boundary>\nSide chat boundary."
+                                        "<side_chat_boundary>\n"
+                                        "Side chat boundary.\n"
+                                        "</side_chat_boundary>"
                                     ),
                                 }
                             ],
@@ -197,11 +200,37 @@ class CursorSubagentAuthoredTests(unittest.TestCase):
                 child_path, child_data, start_offset=0
             )
             self.assertIsNotNone(result.session.parent_session_id)
-            self.assertFalse(result.messages[0].authored_by_agent)
-            self.assertFalse(result.messages[1].authored_by_agent)
+            self.assertEqual(result.messages, [])
+            self.assertEqual(result.extras["inherited_message_count"], 1)
+            self.assertEqual(result.extras["inherited_record_count"], 1)
+            self.assertEqual(result.extras["fork_context_status"], "trimmed")
 
 
 class ClaudeSidechainAuthoredTests(unittest.TestCase):
+    def test_interruption_marker_is_tool_plumbing(self) -> None:
+        data = _line(
+            {
+                "type": "user",
+                "timestamp": "2026-08-01T12:00:00Z",
+                "sessionId": "parent-sess",
+                "agentId": "abc123",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "[Request interrupted by user]"}
+                    ],
+                },
+            }
+        )
+        result = ClaudeAdapter().parse_chunk(
+            Path("/tmp/proj/parent-sess/subagents/agent-abc123.jsonl"),
+            data,
+            start_offset=0,
+        )
+
+        self.assertEqual(len(result.messages), 1)
+        self.assertTrue(result.messages[0].is_tool_plumbing)
+
     def test_subagent_first_non_plumbing_user_flagged(self) -> None:
         data = b"".join(
             [
@@ -350,7 +379,7 @@ class CodexSubagentAuthoredTests(unittest.TestCase):
         self.assertEqual(result.session.parent_session_id, "parent-1")
         self.assertFalse(result.messages[0].authored_by_agent)
 
-    def test_guardian_other_spawn_flagged(self) -> None:
+    def test_internal_approval_guardian_suppresses_activity(self) -> None:
         data = b"".join(
             [
                 _line(
@@ -376,11 +405,68 @@ class CodexSubagentAuthoredTests(unittest.TestCase):
                         },
                     }
                 ),
+                _line(
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "function_call",
+                            "name": "search_history",
+                            "call_id": "guardian-call",
+                        },
+                    }
+                ),
             ]
         )
         result = CodexAdapter().parse_chunk(
             Path("/tmp/rollout-child-3.jsonl"), data, start_offset=0
         )
+        self.assertEqual(result.session.parent_session_id, "parent-1")
+        self.assertEqual(result.session.agent_profile, "guardian")
+        self.assertEqual(
+            result.session.thread_source,
+            INTERNAL_APPROVAL_GUARDIAN_THREAD_SOURCE,
+        )
+        self.assertEqual(result.messages, [])
+        self.assertEqual(result.tool_events, [])
+        self.assertEqual(result.token_usages, [])
+        self.assertEqual(result.skill_exposures, [])
+        self.assertEqual(
+            result.extras["activity_suppressed"],
+            "internal_approval_guardian",
+        )
+
+    def test_native_guardian_child_is_not_suppressed(self) -> None:
+        data = b"".join(
+            [
+                _line(
+                    {
+                        "type": "session_meta",
+                        "payload": {
+                            "id": "child-4",
+                            "parent_thread_id": "parent-1",
+                            "thread_source": "subagent",
+                            "agent_role": "guardian",
+                            "source": {"subagent": {"thread_spawn": {}}},
+                        },
+                    }
+                ),
+                _line(
+                    {
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "user_message",
+                            "message": "Review this delegated change.",
+                        },
+                    }
+                ),
+            ]
+        )
+        result = CodexAdapter().parse_chunk(
+            Path("/tmp/rollout-child-4.jsonl"), data, start_offset=0
+        )
+        self.assertEqual(result.session.thread_source, "subagent")
+        self.assertEqual(result.session.agent_profile, "guardian")
+        self.assertEqual(len(result.messages), 1)
         self.assertTrue(result.messages[0].authored_by_agent)
 
 

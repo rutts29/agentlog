@@ -8,7 +8,10 @@ type RenderItem =
   | { type: "turn"; msg: TimelineMessage; spec: SpeakerSpec }
   | { type: "toolgroup"; id: string; tools: ToolEvent[] };
 
-function buildRenderItems(timeline: TimelineItem[]): RenderItem[] {
+function buildRenderItems(
+  timeline: TimelineItem[],
+  isChildSession: boolean,
+): RenderItem[] {
   const out: RenderItem[] = [];
   for (const item of timeline) {
     if (item.kind === "tool") {
@@ -25,7 +28,11 @@ function buildRenderItems(timeline: TimelineItem[]): RenderItem[] {
       if (last && last.type === "toolgroup") last.tools.push(ev);
       else out.push({ type: "toolgroup", id: item.id, tools: [ev] });
     } else {
-      out.push({ type: "turn", msg: item, spec: classifySpeaker(item) });
+      out.push({
+        type: "turn",
+        msg: item,
+        spec: classifySpeaker(item, { isChildSession }),
+      });
     }
   }
   return out;
@@ -34,11 +41,16 @@ function buildRenderItems(timeline: TimelineItem[]): RenderItem[] {
 export function Transcript({
   timeline,
   focusId,
+  isChildSession = false,
 }: {
   timeline: TimelineItem[];
   focusId: string | null;
+  isChildSession?: boolean;
 }) {
-  const items = useMemo(() => buildRenderItems(timeline), [timeline]);
+  const items = useMemo(
+    () => buildRenderItems(timeline, isChildSession),
+    [timeline, isChildSession],
+  );
   const containerRef = useRef<HTMLDivElement | null>(null);
 
   const humanIds = useMemo(

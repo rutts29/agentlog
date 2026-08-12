@@ -210,6 +210,190 @@ class ClaimDerivationTests(unittest.TestCase):
         props = generate_proposals(self.conn, claims=claims, home=self.root)
         self.assertFalse(any(p.action == "archive_skill" for p in props))
 
+    def test_skill_rates_dedupe_children_and_provider_backings(self) -> None:
+        _seed_session(self.conn, sid="t3code:root", harness="t3code")
+        _seed_session(self.conn, sid="codex:backing")
+        _seed_session(self.conn, sid="codex:child", parent="backing")
+        self.conn.execute(
+            """
+            INSERT INTO session_links
+              (source_session_id, target_session_id, link_type,
+               target_harness, target_external_id, link_role)
+            VALUES ('t3code:root', 'codex:backing', 'provider_backing',
+                    'codex', 'backing', 'root')
+            """
+        )
+        skill_path = self.root / "skills" / "bounded" / "SKILL.md"
+        skill_path.parent.mkdir(parents=True)
+        skill_path.write_text("# bounded\n", encoding="utf-8")
+        self.conn.execute(
+            """
+            INSERT INTO skills
+              (id, name, source, source_path, description, current_content_hash,
+               first_seen_at, last_seen_at, last_indexed_at)
+            VALUES ('bounded', 'bounded', 'agents', ?, 'x', 'h', 't', 't', 't')
+            """,
+            (str(skill_path),),
+        )
+        self.conn.executemany(
+            """
+            INSERT INTO skill_exposures
+              (id, session_id, message_id, skill_name, exposure_type)
+            VALUES (?, ?, NULL, 'bounded', 'invoked')
+            """,
+            [("e1", "codex:backing"), ("e2", "codex:child")],
+        )
+        self.conn.commit()
+
+        claim = next(
+            claim
+            for claim in derive_claims(self.conn, include_llm_derived=False)
+            if claim.kind == "skill_exposure" and claim.subject == "bounded"
+        )
+        self.assertEqual(claim.sample_size, 1)
+        self.assertEqual(claim.denominator, 1)
+        self.assertEqual(claim.rate, 1.0)
+
+    def test_skill_rates_exclude_internal_skill_sessions_from_numerator(self) -> None:
+        _seed_session(self.conn, sid="codex:root")
+        _seed_session(self.conn, sid="codex:skill-internal")
+        self.conn.execute(
+            "UPDATE sessions SET external_id = 'skills:internal' "
+            "WHERE id = 'codex:skill-internal'"
+        )
+        skill_path = self.root / "skills" / "bounded" / "SKILL.md"
+        skill_path.parent.mkdir(parents=True)
+        skill_path.write_text("# bounded\n", encoding="utf-8")
+        self.conn.execute(
+            """
+            INSERT INTO skills
+              (id, name, source, source_path, description, current_content_hash,
+               first_seen_at, last_seen_at, last_indexed_at)
+            VALUES ('bounded', 'bounded', 'agents', ?, 'x', 'h', 't', 't', 't')
+            """,
+            (str(skill_path),),
+        )
+        self.conn.executemany(
+            """
+            INSERT INTO skill_exposures
+              (id, session_id, message_id, skill_name, exposure_type)
+            VALUES (?, ?, NULL, 'bounded', 'invoked')
+            """,
+            [("e1", "codex:root"), ("e2", "codex:skill-internal")],
+        )
+        self.conn.commit()
+
+        claim = next(
+            claim
+            for claim in derive_claims(self.conn, include_llm_derived=False)
+            if claim.kind == "skill_exposure" and claim.subject == "bounded"
+        )
+        self.assertEqual(claim.sample_size, 1)
+        self.assertEqual(claim.denominator, 1)
+        self.assertLessEqual(claim.sample_size, claim.denominator)
+
+    def test_harness_model_usage_dedupes_provider_root_backings(self) -> None:
+        for index in range(5):
+            t3 = f"t3code:r{index}"
+            backing = f"codex:b{index}"
+            _seed_session(
+                self.conn,
+                sid=t3,
+                harness="t3code",
+                model="orchestrator-model",
+            )
+            _seed_session(self.conn, sid=backing, model="gpt-5.6-sol")
+            t3_artifact = self.conn.execute(
+                """
+                INSERT INTO artifacts
+                  (harness, path, size, mtime_ns, content_hash, parsed_offset,
+                   parser_version, transcript_storage)
+                VALUES ('t3code', ?, 1, 1, ?, 1, 'test', 'source_backed')
+                """,
+                (f"/tmp/t3-{index}.jsonl", f"t3-{index}"),
+            ).lastrowid
+            backing_artifact = self.conn.execute(
+                """
+                INSERT INTO artifacts
+                  (harness, path, size, mtime_ns, content_hash, parsed_offset,
+                   parser_version, transcript_storage)
+                VALUES ('codex', ?, 1, 1, ?, 1, 'test', 'source_backed')
+                """,
+                (f"/tmp/codex-{index}.jsonl", f"codex-{index}"),
+            ).lastrowid
+            self.conn.execute(
+                """
+                UPDATE sessions
+                SET artifact_id = ?, transcript_storage = 'source_backed', provider = 'openai'
+                WHERE id = ?
+                """,
+                (t3_artifact, t3),
+            )
+            self.conn.execute(
+                """
+                UPDATE sessions
+                SET artifact_id = ?, transcript_storage = 'source_backed', provider = 'openai'
+                WHERE id = ?
+                """,
+                (backing_artifact, backing),
+            )
+            self.conn.execute(
+                """
+                INSERT INTO session_links
+                  (source_session_id, target_session_id, link_type,
+                   target_harness, target_external_id, link_role)
+                VALUES (?, ?, 'provider_backing', 'codex', ?, 'root')
+                """,
+                (t3, backing, f"b{index}"),
+            )
+        self.conn.commit()
+
+        claim = next(
+            claim
+            for claim in derive_claims(self.conn, include_llm_derived=False)
+            if claim.kind == "harness_model_usage"
+        )
+        self.assertEqual(claim.value["sessions_total"], 5)
+        self.assertEqual(
+            claim.value["harnesses"],
+            [{"harness": "t3code", "sessions": 5, "share": 1.0}],
+        )
+        self.assertEqual(
+            claim.value["models"],
+            [{"model": "gpt-5.6-sol", "sessions": 5, "share": 1.0}],
+        )
+        self.assertEqual(claim.sample_size, claim.denominator)
+
+    def test_harness_model_usage_keeps_foreign_parent_root(self) -> None:
+        for index in range(5):
+            _seed_session(self.conn, sid=f"codex:root-{index}")
+        _seed_session(
+            self.conn,
+            sid="claude:foreign-root",
+            harness="claude",
+            model="claude-4",
+            parent="root-0",
+        )
+        self.conn.commit()
+
+        claim = next(
+            claim
+            for claim in derive_claims(self.conn, include_llm_derived=False)
+            if claim.kind == "harness_model_usage"
+        )
+        self.assertEqual(claim.value["sessions_total"], 6)
+        self.assertEqual(
+            claim.value["harnesses"],
+            [
+                {"harness": "codex", "sessions": 5, "share": 5 / 6},
+                {"harness": "claude", "sessions": 1, "share": 1 / 6},
+            ],
+        )
+        self.assertLessEqual(
+            sum(item["sessions"] for item in claim.value["harnesses"]),
+            claim.denominator,
+        )
+
     def test_sample_size_gating(self) -> None:
         for i in range(3):
             _seed_session(self.conn, sid=f"codex:s{i}")

@@ -56,13 +56,14 @@ from agentlog.analysis.coach.preprocess import (
     build_preprocess_coverage,
     build_root_request_index,
 )
-from agentlog.source_reader import read_source_transcript
+from agentlog.source_reader import CachedSourceTranscriptReader
 from agentlog.safety.redaction import REDACTION_VERSION
 from agentlog.registry import supports as harness_supports
 from agentlog.session_identity import (
     build_identity_context,
     logical_root_session_id,
     provider_backing_shadow_ids,
+    resolve_implicit_parent_ids,
 )
 
 
@@ -1265,23 +1266,7 @@ def _session_roots(
         "started_at, repo FROM sessions ORDER BY id"
     ).fetchall()
     sessions = {str(row["id"]): row for row in rows}
-    by_external: dict[tuple[str, str], list[str]] = {}
-    for row in rows:
-        by_external.setdefault(
-            (str(row["harness"] or ""), str(row["external_id"] or "")), []
-        ).append(str(row["id"]))
-    unresolved: dict[tuple[str, str], list[str]] = {}
-    for session_id, row in sessions.items():
-        raw_parent = str(row["parent_session_id"] or "")
-        if not raw_parent or raw_parent in sessions:
-            continue
-        matches = by_external.get((str(row["harness"] or ""), raw_parent), [])
-        if len(matches) != 1:
-            unresolved.setdefault(
-                (str(row["harness"] or ""), raw_parent), []
-            ).append(session_id)
-    if any(len(session_ids) > 1 for session_ids in unresolved.values()):
-        raise MaterializationError("coach session lineage has a shared unresolved parent")
+    parents = resolve_implicit_parent_ids(rows)
     physical_roots: dict[str, str] = {}
     for session_id, row in sessions.items():
         current = session_id
@@ -1290,19 +1275,10 @@ def _session_roots(
             if current in seen:
                 raise MaterializationError("coach session lineage contains a cycle")
             seen.add(current)
-            parent = sessions[current]["parent_session_id"]
-            if not parent:
+            parent = parents.get(current)
+            if parent is None:
                 break
-            raw_parent = str(parent)
-            if raw_parent in sessions:
-                current = raw_parent
-                continue
-            matches = by_external.get(
-                (str(sessions[current]["harness"] or ""), raw_parent), []
-            )
-            if len(matches) != 1:
-                break
-            current = matches[0]
+            current = parent
         physical_roots[session_id] = current
     identity = build_identity_context(conn)
     logical_roots = {
@@ -1356,7 +1332,7 @@ def _artifact_matches(
 def _source_replay_messages(
     conn: sqlite3.Connection,
     session_id: str,
-    cache: dict[str, dict[str, Mapping[str, Any]]],
+    cache: dict[str, Any],
 ) -> dict[str, Mapping[str, Any]] | None:
     row = conn.execute(
         "SELECT transcript_storage FROM sessions WHERE id = ?", (session_id,)
@@ -1366,7 +1342,11 @@ def _source_replay_messages(
     if str(row["transcript_storage"] or "legacy_materialized") != "source_backed":
         return None
     if session_id not in cache:
-        result = read_source_transcript(conn, session_id)
+        reader = cache.get("__artifact_reader__")
+        if not isinstance(reader, CachedSourceTranscriptReader):
+            reader = CachedSourceTranscriptReader()
+            cache["__artifact_reader__"] = reader
+        result = reader(conn, session_id)
         if str(getattr(result, "status", "source_unavailable")) != "ready":
             raise MaterializationError("source-backed evidence source is unavailable")
         messages = getattr(result, "messages", None)
@@ -1409,7 +1389,7 @@ def _replay_message(
     conn: sqlite3.Connection,
     session_id: str,
     message_id: str,
-    cache: dict[str, dict[str, Mapping[str, Any]]],
+    cache: dict[str, Any],
 ) -> Mapping[str, Any] | None:
     source_messages = _source_replay_messages(conn, session_id, cache)
     if source_messages is not None:
@@ -1425,7 +1405,7 @@ def _window_message_bounds(
     conn: sqlite3.Connection,
     session_id: str,
     window: sqlite3.Row,
-    source_cache: dict[str, dict[str, Mapping[str, Any]]] | None = None,
+    source_cache: dict[str, Any] | None = None,
 ) -> tuple[int, int, int]:
     source_cache = source_cache if source_cache is not None else {}
     source_messages = _source_replay_messages(conn, session_id, source_cache)
@@ -1482,7 +1462,7 @@ def _verify_message_evidence(
     evidence: Mapping[str, Any],
     session_id: str,
     window: sqlite3.Row,
-    source_cache: dict[str, dict[str, Mapping[str, Any]]] | None = None,
+    source_cache: dict[str, Any] | None = None,
 ) -> str:
     source_cache = source_cache if source_cache is not None else {}
     message_id = str(evidence.get("message_id") or "")
@@ -1534,7 +1514,7 @@ def _verify_tool_evidence(
     session_id: str,
     window: sqlite3.Row,
     window_timestamp: str,
-    source_cache: dict[str, dict[str, Mapping[str, Any]]] | None = None,
+    source_cache: dict[str, Any] | None = None,
 ) -> str:
     source_cache = source_cache if source_cache is not None else {}
     tool_event_id = str(evidence.get("tool_event_id") or "")
@@ -1613,7 +1593,7 @@ def _verify_skill_evidence(
     session_id: str,
     window: sqlite3.Row,
     window_timestamp: str,
-    source_cache: dict[str, dict[str, Mapping[str, Any]]] | None = None,
+    source_cache: dict[str, Any] | None = None,
 ) -> str:
     source_cache = source_cache if source_cache is not None else {}
     exposure_id = str(evidence.get("skill_exposure_id") or "")
@@ -1699,7 +1679,7 @@ def _verify_catalog_evidence(
     if not isinstance(coverage, Mapping) or not isinstance(packet_provenance, Mapping):
         raise MaterializationError("candidate catalog packet provenance is missing")
     sessions, logical_roots, backing_shadows = _session_roots(conn)
-    source_cache: dict[str, dict[str, Mapping[str, Any]]] = {}
+    source_cache: dict[str, Any] = {}
     for observation_id, raw_observation in observation_index.items():
         if not isinstance(raw_observation, Mapping):
             raise MaterializationError("catalog observation is not an object")

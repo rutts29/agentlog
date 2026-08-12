@@ -19,6 +19,7 @@ from agentlog.api.identity_aggregates import visible_logical_sessions
 from agentlog.api.ranges import TimeRange
 from agentlog.db.migrations.v025_session_link_roles import apply as apply_v025
 from agentlog.session_identity import (
+    lineage_parent_ids,
     logical_projection,
     provider_backing_exclusion_sql,
     provider_backing_shadow_ids,
@@ -100,29 +101,23 @@ class SessionIdentityProjectionTests(unittest.TestCase):
         self.conn.close()
         self._tmp.cleanup()
 
-    def test_default_list_collapses_only_root_backing(self) -> None:
+    def test_default_list_returns_presentation_roots(self) -> None:
         result = list_sessions_v2(self.conn, _tr())
         rows = {item["id"]: item for item in result["items"]}
-        self.assertIn("t3code:root", rows)
-        self.assertIn("t3code:child", rows)
-        self.assertIn("codex:worker", rows)
-        self.assertIn("codex:grandchild", rows)
-        self.assertIn("codex:unlinked", rows)
-        self.assertNotIn("codex:backing", rows)
-        self.assertEqual(result["total"], 5)
+        self.assertEqual(set(rows), {"t3code:root", "codex:unlinked"})
+        self.assertEqual(result["view"], "roots")
+        self.assertEqual(result["total"], 2)
         root = rows["t3code:root"]
         self.assertEqual(root["logical_harness"], "t3code")
         self.assertEqual(root["runtime_harness"], "codex")
         self.assertEqual(root["orchestrator_session_id"], "t3code:root")
         self.assertEqual(root["transcript_session_id"], "codex:backing")
-        self.assertEqual(root["message_count"], 2)
+        self.assertEqual(root["message_count"], 4)
         self.assertEqual(root["tool_count"], 1)
-        for session_id in ("codex:worker", "codex:grandchild"):
-            self.assertEqual(rows[session_id]["logical_harness"], "t3code")
-            self.assertEqual(rows[session_id]["runtime_harness"], "codex")
-            self.assertEqual(
-                rows[session_id]["orchestrator_session_id"], "t3code:root"
-            )
+        self.assertEqual(root["navigation_id"], "t3code:root")
+        self.assertEqual(root["child_count"], 2)
+        self.assertEqual(root["descendant_count"], 3)
+        self.assertFalse(root["is_orphan"])
 
     def test_harness_sort_uses_logical_harness_with_stable_id_ties(self) -> None:
         result = list_sessions_v2(
@@ -134,17 +129,11 @@ class SessionIdentityProjectionTests(unittest.TestCase):
         rows = result["items"]
         self.assertEqual(
             [row["logical_harness"] for row in rows],
-            ["codex", "t3code", "t3code", "t3code", "t3code"],
+            ["codex", "t3code"],
         )
         self.assertEqual(
             [row["id"] for row in rows],
-            [
-                "codex:unlinked",
-                "codex:grandchild",
-                "codex:worker",
-                "t3code:child",
-                "t3code:root",
-            ],
+            ["codex:unlinked", "t3code:root"],
         )
 
     def test_t3_detail_uses_provider_transcript_and_codex_stays_direct(self) -> None:
@@ -154,25 +143,97 @@ class SessionIdentityProjectionTests(unittest.TestCase):
         self.assertEqual(detail["session"]["logical_harness"], "t3code")
         self.assertEqual(detail["transcript"]["id"], "codex:backing")
         self.assertEqual(detail["messages"][1]["text"], "rich provider reply")
-        logical_child = detail["children"][0]
-        self.assertEqual(logical_child["id"], "codex:worker")
+        detail_children = {child["id"]: child for child in detail["children"]}
+        self.assertEqual(set(detail_children), {"t3code:child", "codex:worker"})
+        logical_child = detail_children["codex:worker"]
         self.assertEqual(logical_child["logical_harness"], "t3code")
         self.assertEqual(logical_child["runtime_harness"], "codex")
         self.assertEqual(
             logical_child["orchestrator_session_id"], "t3code:root"
         )
+        self.assertEqual(logical_child["parent_navigation_id"], "t3code:root")
+        self.assertEqual(detail["session"]["child_count"], 2)
         direct = session_detail_v2(self.conn, "codex:backing")
         assert direct is not None
         self.assertEqual(direct["session"]["id"], "codex:backing")
         self.assertEqual(direct["session"]["harness"], "codex")
         self.assertEqual(direct["session"]["logical_harness"], "t3code")
         self.assertEqual(direct["session"]["runtime_harness"], "codex")
-        child = direct["children"][0]
-        self.assertEqual(child["id"], "codex:worker")
+        self.assertEqual(direct["session"]["navigation_id"], "t3code:root")
+        direct_children = {child["id"]: child for child in direct["children"]}
+        child = direct_children["codex:worker"]
         self.assertEqual(child["harness"], "codex")
         self.assertEqual(child["logical_harness"], "t3code")
         self.assertEqual(child["runtime_harness"], "codex")
         self.assertEqual(child["orchestrator_session_id"], "t3code:root")
+
+    def test_source_backed_t3_keeps_runtime_backing_provenance(self) -> None:
+        self.conn.executescript(
+            """
+            INSERT INTO artifacts
+              (harness,path,size,mtime_ns,content_hash,parsed_offset,
+               parser_version,transcript_storage)
+            VALUES ('t3code','/tmp/t3.jsonl',1,1,'t3',1,'test','source_backed'),
+                   ('codex','/tmp/backing.jsonl',1,1,'backing',1,'test','source_backed');
+            INSERT INTO sessions
+              (id,harness,external_id,artifact_id,transcript_storage)
+            VALUES ('t3code:source-root','t3code','source-root',1,'source_backed'),
+                   ('codex:source-backing','codex','source-backing',2,'source_backed');
+            INSERT INTO session_links
+              (source_session_id,target_session_id,link_type,target_harness,
+               target_external_id,link_role)
+            VALUES ('t3code:source-root','codex:source-backing','provider_backing',
+                    'codex','source-backing','root');
+            """
+        )
+        self.conn.commit()
+
+        projection = logical_projection(
+            self.conn, "t3code:source-root", "t3code"
+        )
+        self.assertIsNone(projection["transcript_session_id"])
+        self.assertEqual(projection["runtime_harness"], "codex")
+        backing = projection["provider_backings"][0]
+        self.assertEqual(backing["target_session_id"], "codex:source-backing")
+        self.assertEqual(backing["artifact_path"], "/tmp/backing.jsonl")
+        self.assertEqual(
+            projection["runtime_backing_provenance"],
+            {
+                "status": "validated",
+                "harness": "codex",
+                "session_id": "codex:source-backing",
+                "external_id": "source-backing",
+                "artifact_id": 2,
+                "artifact_path": "/tmp/backing.jsonl",
+            },
+        )
+        detail = session_detail_v2(self.conn, "t3code:source-root")
+        assert detail is not None
+        self.assertEqual(
+            detail["session"]["runtime_backing_provenance"],
+            projection["runtime_backing_provenance"],
+        )
+        listed = {
+            item["id"] for item in list_sessions_v2(self.conn, _tr())["items"]
+        }
+        self.assertIn("t3code:source-root", listed)
+        self.assertNotIn("codex:source-backing", listed)
+
+    def test_typed_worker_parent_wins_over_native_runtime_parent(self) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO session_links
+              (source_session_id, target_session_id, link_type, target_harness,
+               target_external_id, link_role)
+            VALUES ('t3code:root', 'codex:worker', 'provider_backing', 'codex',
+                    'worker', 'worker')
+            """
+        )
+        self.conn.commit()
+
+        self.assertEqual(
+            lineage_parent_ids(self.conn)["codex:worker"], "t3code:root"
+        )
 
     def test_tree_keeps_backing_as_provenance_and_flattens_its_children(self) -> None:
         self.conn.executescript(
@@ -256,20 +317,9 @@ class SessionIdentityProjectionTests(unittest.TestCase):
         }
         self.assertEqual(
             set(t3_rows),
-            {
-                "t3code:root",
-                "t3code:child",
-                "codex:worker",
-                "codex:grandchild",
-            },
+            {"t3code:root"},
         )
-        for session_id in ("codex:worker", "codex:grandchild"):
-            self.assertEqual(t3_rows[session_id]["harness"], "codex")
-            self.assertEqual(t3_rows[session_id]["runtime_harness"], "codex")
-            self.assertEqual(t3_rows[session_id]["logical_harness"], "t3code")
-            self.assertEqual(
-                t3_rows[session_id]["orchestrator_session_id"], "t3code:root"
-            )
+        self.assertEqual(t3_rows["t3code:root"]["runtime_harness"], "codex")
 
         codex_rows = list_sessions_v2(self.conn, _tr(), harness=["codex"])[
             "items"
@@ -349,7 +399,7 @@ class SessionIdentityProjectionTests(unittest.TestCase):
         listed = {item["id"]: item for item in list_sessions_v2(self.conn, _tr())["items"]}
         self.assertNotIn("codex:backing", listed)
         self.assertEqual(listed["t3code:root"]["model"], "grok-4.5")
-        self.assertEqual(listed["t3code:root"]["message_count"], 4)
+        self.assertEqual(listed["t3code:root"]["message_count"], 6)
         self.assertEqual(listed["t3code:root"]["runtime_harness"], "t3code")
 
         detail = session_detail_v2(self.conn, "t3code:root")
@@ -517,10 +567,9 @@ class SessionIdentityProjectionTests(unittest.TestCase):
             item["id"]: item for item in list_sessions_v2(self.conn, _tr())["items"]
         }
         self.assertIn("t3code:worker-only", rows)
-        self.assertIn("codex:single-worker", rows)
-        self.assertEqual(rows["t3code:worker-only"]["message_count"], 0)
-        self.assertEqual(rows["codex:single-worker"]["logical_harness"], "t3code")
-        self.assertEqual(rows["codex:single-worker"]["runtime_harness"], "codex")
+        self.assertNotIn("codex:single-worker", rows)
+        self.assertEqual(rows["t3code:worker-only"]["message_count"], 1)
+        self.assertEqual(rows["t3code:worker-only"]["child_count"], 1)
 
     def test_unknown_singleton_link_uses_legacy_root_fallback(self) -> None:
         self.conn.executescript(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,19 @@ from agentlog.normalize.synthetic import (
     synthetic_skill_exposures,
 )
 from agentlog.normalize.tool_ops import classify_operation
+from agentlog.session_identity import INTERNAL_APPROVAL_GUARDIAN_THREAD_SOURCE
+
+
+_INTERNAL_APPROVAL_GUARDIAN_PREFIXES = (
+    "the following is the codex agent history whose request action you are assessing",
+    "the following is the codex agent history added since your last approval assessment",
+)
+
+
+def _is_internal_approval_guardian_prompt(text: str) -> bool:
+    return text.lstrip().casefold().startswith(
+        _INTERNAL_APPROVAL_GUARDIAN_PREFIXES
+    )
 
 
 def _external_id_from_path(path: Path) -> str:
@@ -311,6 +325,233 @@ def _operation_for_event(
     )
 
 
+@dataclass(frozen=True)
+class _ForkBoundary:
+    record_index: int | None
+    turn_id: str | None
+    status: str | None
+    inherited_record_count: int = 0
+    inherited_message_count: int = 0
+    local_prefix: tuple[dict[str, Any], ...] = ()
+
+
+def _response_item_id(obj: dict[str, Any]) -> str | None:
+    if obj.get("type") != "response_item":
+        return None
+    payload = obj.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    value = payload.get("id")
+    return str(value) if value else None
+
+
+def _worker_agent_path(records: list[dict[str, Any]]) -> str | None:
+    if not records:
+        return None
+    payload = records[0].get("payload")
+    if not isinstance(payload, dict):
+        return None
+    source = payload.get("source")
+    subagent = source.get("subagent") if isinstance(source, dict) else None
+    spawn = subagent.get("thread_spawn") if isinstance(subagent, dict) else None
+    path = spawn.get("agent_path") if isinstance(spawn, dict) else None
+    return path.strip() if isinstance(path, str) and path.strip() else None
+
+
+def _is_agent_coordination_envelope(text: str) -> bool:
+    first_line = text.lstrip().splitlines()[0] if text.strip() else ""
+    return first_line in {"Message Type: NEW_TASK", "Message Type: MESSAGE"}
+
+
+def _incoming_agent_message_indices(records: list[dict[str, Any]]) -> set[int]:
+    worker_path = _worker_agent_path(records)
+    if worker_path is None:
+        return set()
+    incoming: set[int] = set()
+    for index, obj in enumerate(records):
+        payload = obj.get("payload")
+        if (
+            obj.get("type") != "inter_agent_communication_metadata"
+            or not isinstance(payload, dict)
+            or payload.get("trigger_turn") is not True
+        ):
+            continue
+        for later_index, later in enumerate(
+            records[index + 1 : index + 5], start=index + 1
+        ):
+            later_payload = later.get("payload")
+            if (
+                later.get("type") == "response_item"
+                and isinstance(later_payload, dict)
+                and later_payload.get("type") == "agent_message"
+                and later_payload.get("recipient") == worker_path
+                and _is_agent_coordination_envelope(
+                    extract_text(later_payload.get("content"))
+                )
+            ):
+                incoming.add(later_index)
+                break
+    return incoming
+
+
+def _parent_response_ids(parent_id: str) -> set[str] | None:
+    matches = list(CODEX_SESSIONS_DIR.rglob(f"*{parent_id}.jsonl"))
+    if len(matches) != 1:
+        return None
+    ids: set[str] = set()
+    try:
+        data = matches[0].read_bytes()
+    except OSError:
+        return None
+    for _start, _end, obj, err in iter_jsonl_bytes(data, source=str(matches[0])):
+        if err or obj is None:
+            continue
+        response_id = _response_item_id(obj)
+        if response_id:
+            ids.add(response_id)
+    return ids
+
+
+def _fork_boundary(records: list[dict[str, Any]]) -> _ForkBoundary:
+    if not records:
+        return _ForkBoundary(None, None, None)
+    meta = records[0]
+    payload = meta.get("payload")
+    if meta.get("type") != "session_meta" or not isinstance(payload, dict):
+        return _ForkBoundary(None, None, None)
+    parent_id = payload.get("forked_from_id")
+    if payload.get("thread_source") != "subagent" or not parent_id:
+        return _ForkBoundary(None, None, None)
+
+    meta_ts = parse_ts(payload.get("timestamp") or meta.get("timestamp"))
+    first_after_meta = records[1] if len(records) > 1 else None
+    first_payload = (
+        first_after_meta.get("payload")
+        if isinstance(first_after_meta, dict)
+        else None
+    )
+    if (
+        isinstance(first_payload, dict)
+        and first_after_meta.get("type") == "event_msg"
+        and first_payload.get("type") == "task_started"
+        and first_payload.get("turn_id")
+    ):
+        raw_started_at = first_payload.get("started_at")
+        starts_at_spawn = meta_ts is None or raw_started_at is None
+        if meta_ts is not None and raw_started_at is not None:
+            try:
+                starts_at_spawn = abs(
+                    float(raw_started_at) - meta_ts.timestamp()
+                ) <= 1
+            except (TypeError, ValueError):
+                starts_at_spawn = False
+        turn_id = str(first_payload["turn_id"])
+        has_context = any(
+            obj.get("type") == "turn_context"
+            and isinstance(obj.get("payload"), dict)
+            and str(obj["payload"].get("turn_id") or "") == turn_id
+            for obj in records[2:]
+        )
+        if starts_at_spawn and has_context:
+            return _ForkBoundary(None, None, None)
+
+    candidates: list[tuple[int, str]] = []
+    for index, obj in enumerate(records[1:], start=1):
+        event = obj.get("payload")
+        if (
+            obj.get("type") != "event_msg"
+            or not isinstance(event, dict)
+            or event.get("type") != "task_started"
+            or not event.get("turn_id")
+        ):
+            continue
+        turn_id = str(event["turn_id"])
+        next_task = next(
+            (
+                offset
+                for offset, later in enumerate(records[index + 1 :], start=index + 1)
+                if later.get("type") == "event_msg"
+                and isinstance(later.get("payload"), dict)
+                and later["payload"].get("type") == "task_started"
+            ),
+            len(records),
+        )
+        turn_records = records[index + 1 : next_task]
+        has_context = any(
+            later.get("type") == "turn_context"
+            and isinstance(later.get("payload"), dict)
+            and str(later["payload"].get("turn_id") or "") == turn_id
+            for later in turn_records
+        )
+        has_trigger = any(
+            later.get("type") == "inter_agent_communication_metadata"
+            and isinstance(later.get("payload"), dict)
+            and later["payload"].get("trigger_turn") is True
+            for later in turn_records
+        )
+        raw_started_at = event.get("started_at")
+        starts_after_spawn = True
+        if meta_ts is not None and raw_started_at is not None:
+            try:
+                starts_after_spawn = float(raw_started_at) >= meta_ts.timestamp() - 1
+            except (TypeError, ValueError):
+                starts_after_spawn = False
+        if has_context and has_trigger and starts_after_spawn:
+            candidates.append((index, turn_id))
+
+    if not candidates:
+        return _ForkBoundary(None, None, "ambiguous")
+    boundary_index, turn_id = candidates[0]
+    inherited = records[1:boundary_index]
+    response_ids = {
+        response_id
+        for obj in inherited
+        if (response_id := _response_item_id(obj)) is not None
+    }
+    parent_ids = _parent_response_ids(str(parent_id))
+    status = "structural_only"
+    local_prefix: tuple[dict[str, Any], ...] = ()
+    if parent_ids is not None:
+        non_parent_ids = response_ids - parent_ids
+        if non_parent_ids:
+            local_prefix = tuple(
+                obj
+                for obj in inherited
+                if _response_item_id(obj) in non_parent_ids
+                and isinstance(obj.get("payload"), dict)
+                and obj["payload"].get("type") == "message"
+                and obj["payload"].get("role") in ("developer", "system")
+            )
+            if {
+                response_id
+                for obj in local_prefix
+                if (response_id := _response_item_id(obj)) is not None
+            } != non_parent_ids:
+                return _ForkBoundary(None, turn_id, "ambiguous")
+        status = "verified_parent"
+    local_prefix_ids = {
+        response_id
+        for obj in local_prefix
+        if (response_id := _response_item_id(obj)) is not None
+    }
+    inherited_messages = sum(
+        1
+        for obj in inherited
+        if obj.get("type") == "response_item"
+        and isinstance(obj.get("payload"), dict)
+        and obj["payload"].get("type") == "message"
+        and _response_item_id(obj) not in local_prefix_ids
+    )
+    return _ForkBoundary(
+        boundary_index,
+        turn_id,
+        status,
+        inherited_record_count=len(inherited) - len(local_prefix),
+        inherited_message_count=inherited_messages,
+        local_prefix=local_prefix,
+    )
+
+
 def _append_message(
     bucket: list[NormalizedMessage],
     *,
@@ -368,6 +609,31 @@ class CodexAdapter(TranscriptAdapter):
         self, path: Path, data: bytes, *, start_offset: int
     ) -> ParseResult:
         warnings: list[str] = []
+        parsed_records: list[dict[str, Any]] = []
+        bytes_consumed = 0
+        for _start, end, obj, err in iter_jsonl_bytes(data, source=str(path)):
+            bytes_consumed = end
+            if err:
+                warnings.append(err)
+            elif obj is not None:
+                parsed_records.append(obj)
+        fork_boundary = (
+            _fork_boundary(parsed_records)
+            if start_offset == 0
+            else _ForkBoundary(None, None, None)
+        )
+        if fork_boundary.status == "ambiguous":
+            warnings.append(
+                f"{path}: ambiguous full-history fork boundary; activity omitted"
+            )
+            parsed_records = parsed_records[:1]
+        elif fork_boundary.record_index is not None:
+            parsed_records = (
+                parsed_records[:1]
+                + list(fork_boundary.local_prefix)
+                + parsed_records[fork_boundary.record_index :]
+            )
+        incoming_agent_messages = _incoming_agent_message_indices(parsed_records)
         # response_item stream is canonical when present (tools interleave there).
         response_messages: list[NormalizedMessage] = []
         event_messages: list[NormalizedMessage] = []
@@ -382,7 +648,9 @@ class CodexAdapter(TranscriptAdapter):
         model: str | None = None
         provider: str | None = None
         agent_profile: str | None = None
+        guardian_other_subagent = False
         originator: str | None = None
+        thread_source: str | None = None
         effort: str | None = None
         effort_source: str | None = None
         started_at = None
@@ -399,14 +667,7 @@ class CodexAdapter(TranscriptAdapter):
         terminal_indices: dict[str, int] = {}
         conflicted_call_ids: set[str] = set()
         session_id_locked = False
-        bytes_consumed = 0
-
-        for _start, end, obj, err in iter_jsonl_bytes(data, source=str(path)):
-            bytes_consumed = end
-            if err:
-                warnings.append(err)
-                continue
-            assert obj is not None
+        for record_index, obj in enumerate(parsed_records):
             ts = parse_ts(obj.get("timestamp"))
             if started_at is None and ts:
                 started_at = ts
@@ -427,6 +688,7 @@ class CodexAdapter(TranscriptAdapter):
                     or payload.get("parent_session_id")
                 )
                 root_id = payload.get("session_id")
+                forked_from_id = payload.get("forked_from_id")
                 if parent_raw and str(parent_raw) != external_id:
                     parent_id = str(parent_raw)
                 elif (
@@ -435,10 +697,19 @@ class CodexAdapter(TranscriptAdapter):
                     and parent_id is None
                 ):
                     parent_id = str(root_id)
+                elif (
+                    forked_from_id
+                    and str(forked_from_id) != external_id
+                    and parent_id is None
+                ):
+                    parent_id = str(forked_from_id)
                 agent_role = payload.get("agent_role")
                 raw_originator = payload.get("originator")
                 if isinstance(raw_originator, str) and raw_originator.strip():
                     originator = raw_originator.strip()
+                raw_thread_source = payload.get("thread_source")
+                if isinstance(raw_thread_source, str) and raw_thread_source.strip():
+                    thread_source = raw_thread_source.strip()
                 source = payload.get("source")
                 sub = (
                     source.get("subagent")
@@ -457,6 +728,11 @@ class CodexAdapter(TranscriptAdapter):
                         agent_brief_session = isinstance(spawn, dict) and bool(
                             spawn.get("agent_nickname") or spawn.get("agent_path")
                         )
+                guardian_other_subagent = (
+                    payload.get("thread_source") == "subagent"
+                    and isinstance(sub, dict)
+                    and sub.get("other") == "guardian"
+                )
                 cwd = payload.get("cwd") or cwd
                 r, b, c = _git_fields(payload.get("git"))
                 repo = r or repo
@@ -576,6 +852,24 @@ class CodexAdapter(TranscriptAdapter):
                 )
                 if raw_role == "assistant" and seq is not None:
                     last_response_assistant_seq = seq
+                continue
+
+            if (
+                kind == "response_item"
+                and payload_type == "agent_message"
+                and record_index in incoming_agent_messages
+            ):
+                text = extract_text(payload.get("content"))
+                _append_message(
+                    response_messages,
+                    role="user",
+                    text=text,
+                    ts=ts,
+                    model=None,
+                    effort=None,
+                    effort_source=None,
+                    authored_by_agent=True,
+                )
                 continue
 
             if kind == "response_item" and payload_type in (
@@ -765,6 +1059,11 @@ class CodexAdapter(TranscriptAdapter):
         # Prefer response_item transcript: it carries developer/user preambles and
         # is the structural home for interleaved tool calls.
         messages = response_messages or event_messages
+        internal_approval_guardian = guardian_other_subagent and any(
+            message.role == "user"
+            and _is_internal_approval_guardian_prompt(message.text)
+            for message in messages
+        )
         # Tools sometimes fire before the first assistant narration (reasoning →
         # function_call → assistant text). Attach those to the first assistant.
         first_assistant_seq = next(
@@ -778,11 +1077,19 @@ class CodexAdapter(TranscriptAdapter):
             flag_parent_authored_prompt(messages, leading_users=True)
         flag_synthetic_user_messages(messages)
         skills = synthetic_skill_exposures(messages)
+        if internal_approval_guardian:
+            messages = []
+            tools = []
+            skills = []
+            token_usages = []
+            thread_source = INTERNAL_APPROVAL_GUARDIAN_THREAD_SOURCE
 
         session = NormalizedSession(
             harness=Harness.CODEX,
             external_id=external_id,
             parent_session_id=parent_id,
+            originator=originator,
+            thread_source=thread_source,
             started_at=started_at,
             ended_at=ended_at,
             repo=repo,
@@ -803,5 +1110,26 @@ class CodexAdapter(TranscriptAdapter):
             token_usages=token_usages,
             warnings=warnings,
             bytes_consumed=start_offset + bytes_consumed,
-            extras={"originator": originator} if originator else {},
+            extras={
+                **({"originator": originator} if originator else {}),
+                "inherited_message_count": fork_boundary.inherited_message_count,
+                "inherited_record_count": fork_boundary.inherited_record_count,
+                "fork_context_status": fork_boundary.status,
+                "fork_context_boundary": fork_boundary.turn_id,
+                "checkpoint_blocked": fork_boundary.status == "ambiguous",
+                **(
+                    {"activity_suppressed": "internal_approval_guardian"}
+                    if internal_approval_guardian
+                    else {}
+                ),
+                **(
+                    {
+                        "checkpoint_blocked_reason": (
+                            "ambiguous full-history fork boundary"
+                        )
+                    }
+                    if fork_boundary.status == "ambiguous"
+                    else {}
+                ),
+            },
         )

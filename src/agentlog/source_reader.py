@@ -52,6 +52,43 @@ class SourceReadResult:
         return self.status == "ready"
 
 
+@dataclass(frozen=True)
+class _CachedSourceParse:
+    revision: tuple[int, int]
+    source_hash: str
+    results: list[ParseResult]
+
+
+class CachedSourceTranscriptReader:
+    def __init__(self) -> None:
+        self._artifacts: dict[tuple[str, str], _CachedSourceParse] = {}
+
+    def verify_current(self) -> bool:
+        """Confirm every source used by this operation is still unchanged."""
+        try:
+            for (harness, artifact_path), cached in self._artifacts.items():
+                path = Path(artifact_path)
+                if not path.is_file() or file_stat(path) != cached.revision:
+                    return False
+                if _current_hash(path) != cached.source_hash:
+                    return False
+        except (OSError, sqlite3.Error, ValueError):
+            return False
+        return True
+
+    def __call__(
+        self, conn: sqlite3.Connection, session_id: str
+    ) -> SourceReadResult:
+        return _read_source_transcript(
+            conn, session_id, artifact_cache=self._artifacts
+        )
+
+    def read_source_transcript(
+        self, conn: sqlite3.Connection, session_id: str
+    ) -> SourceReadResult:
+        return self(conn, session_id)
+
+
 _ADAPTERS: dict[str, type[TranscriptAdapter]] = {
     Harness.CODEX.value: CodexAdapter,
     Harness.CLAUDE.value: ClaudeAdapter,
@@ -181,6 +218,15 @@ def _metadata_is_prefix(
 def read_source_transcript(
     conn: sqlite3.Connection, session_id: str
 ) -> SourceReadResult:
+    return _read_source_transcript(conn, session_id, artifact_cache=None)
+
+
+def _read_source_transcript(
+    conn: sqlite3.Connection,
+    session_id: str,
+    *,
+    artifact_cache: dict[tuple[str, str], _CachedSourceParse] | None,
+) -> SourceReadResult:
     """Return current normalized messages for a source-backed session.
 
     The artifact checkpoint verifies that a JSONL source's ingested prefix was
@@ -215,13 +261,32 @@ def read_source_transcript(
     adapter_type = _ADAPTERS.get(str(row["harness"]))
     if adapter_type is None:
         return SourceReadResult("source_unavailable", [], locator, locator.unit_id, warning="unsupported source harness")
+    cache_key = (locator.harness, locator.artifact_path)
+    cached = artifact_cache.get(cache_key) if artifact_cache is not None else None
     try:
-        parsed = _parse_current(adapter_type(), path)
+        if cached is not None:
+            if file_stat(path) != cached.revision:
+                return SourceReadResult(
+                    "source_changed",
+                    [],
+                    locator,
+                    locator.unit_id,
+                    warning="canonical source changed during this operation",
+                )
+            parsed = (cached.results, cached.source_hash)
+        else:
+            parsed = _parse_current(adapter_type(), path)
     except (OSError, sqlite3.Error, ValueError) as exc:
         return SourceReadResult("source_unavailable", [], locator, locator.unit_id, warning=f"could not read canonical source: {exc}")
     if parsed is None:
         return SourceReadResult("source_changed", [], locator, locator.unit_id, warning="canonical source changed while being read")
     results, source_hash = parsed
+    if artifact_cache is not None and cached is None:
+        artifact_cache[cache_key] = _CachedSourceParse(
+            revision=file_stat(path),
+            source_hash=source_hash,
+            results=results,
+        )
     external_id = str(row["external_id"])
     matches = [item for item in results if item.session.external_id == external_id]
     if len(matches) != 1:
@@ -231,6 +296,18 @@ def read_source_transcript(
             locator,
             locator.unit_id,
             warning="canonical source no longer contains this session identity",
+        )
+    if matches[0].extras.get("checkpoint_blocked") is True:
+        reason = str(
+            matches[0].extras.get("checkpoint_blocked_reason")
+            or "canonical source is unsafe to checkpoint"
+        )
+        return SourceReadResult(
+            "source_changed",
+            [],
+            locator,
+            locator.unit_id,
+            warning=reason,
         )
     if not _metadata_is_prefix(conn, session_id, matches[0]):
         return SourceReadResult(

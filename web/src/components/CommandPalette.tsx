@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import {
+  displaySessionIdentity,
   fetchFacets,
   fetchRecent,
   fetchSkills,
@@ -96,7 +97,7 @@ export function CommandPalette({
       out.push({
         id: `session:${s.id}`,
         group: "Recent sessions",
-        label: s.id,
+        label: displaySessionIdentity(s),
         meta: `${s.project} · ${formatDayTime(s.started_at)}`,
         harness: logicalHarness(s),
         runtimeHarness: runtimeHarness(s),

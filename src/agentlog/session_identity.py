@@ -7,6 +7,17 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
+INTERNAL_APPROVAL_GUARDIAN_THREAD_SOURCE = "internal_approval_guardian"
+
+
+def is_internal_approval_guardian(row: sqlite3.Row | Any) -> bool:
+    try:
+        thread_source = row["thread_source"]
+    except (IndexError, KeyError, TypeError):
+        return False
+    return str(thread_source or "") == INTERNAL_APPROVAL_GUARDIAN_THREAD_SOURCE
+
+
 def _has_links_table(conn: sqlite3.Connection) -> bool:
     return (
         conn.execute(
@@ -27,6 +38,7 @@ class IdentityContext:
     canonical_root_backing_by_source: dict[str, str] = field(
         default_factory=dict
     )
+    t3_origin_session_ids: set[str] = field(default_factory=set)
 
 
 _PROVIDER_FAMILIES = {
@@ -130,19 +142,23 @@ def _root_backings(backings: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def build_identity_context(conn: sqlite3.Connection) -> IdentityContext:
     context = IdentityContext()
-    if not _has_links_table(conn):
-        return context
-    rows = conn.execute(
-        """
-        SELECT l.source_session_id, l.target_session_id, l.target_harness,
-               l.target_external_id, l.link_role, l.confidence, l.evidence_json,
-               source.harness AS source_harness
-        FROM session_links l
-        JOIN sessions source ON source.id = l.source_session_id
-        WHERE l.link_type = 'provider_backing'
-        ORDER BY l.target_harness, l.target_external_id
-        """
-    ).fetchall()
+    rows = []
+    if _has_links_table(conn):
+        rows = conn.execute(
+            """
+            SELECT l.source_session_id, l.target_session_id, l.target_harness,
+                   l.target_external_id, l.link_role, l.confidence, l.evidence_json,
+                   source.harness AS source_harness,
+                   target.artifact_id AS target_artifact_id,
+                   artifact.path AS target_artifact_path
+            FROM session_links l
+            JOIN sessions source ON source.id = l.source_session_id
+            LEFT JOIN sessions target ON target.id = l.target_session_id
+            LEFT JOIN artifacts artifact ON artifact.id = target.artifact_id
+            WHERE l.link_type = 'provider_backing'
+            ORDER BY l.target_harness, l.target_external_id
+            """
+        ).fetchall()
     for row in rows:
         link = {
             "target_session_id": row["target_session_id"],
@@ -151,6 +167,8 @@ def build_identity_context(conn: sqlite3.Connection) -> IdentityContext:
             "link_role": row["link_role"],
             "confidence": row["confidence"],
             "evidence_json": row["evidence_json"],
+            "artifact_id": row["target_artifact_id"],
+            "artifact_path": row["target_artifact_path"],
         }
         source_id = str(row["source_session_id"])
         context.backings_by_source.setdefault(source_id, []).append(link)
@@ -158,20 +176,28 @@ def build_identity_context(conn: sqlite3.Connection) -> IdentityContext:
             context.owners_by_session.setdefault(
                 str(row["target_session_id"]), set()
             ).add(source_id)
-    if not context.owners_by_session:
-        return context
-    parents = _physical_parent_ids(conn)
-    changed = True
-    while changed:
-        changed = False
-        for child_id, parent_id in parents.items():
-            parent_owners = context.owners_by_session.get(parent_id)
-            if not parent_owners:
-                continue
-            child_owners = context.owners_by_session.setdefault(child_id, set())
-            before = len(child_owners)
-            child_owners.update(parent_owners)
-            changed = changed or len(child_owners) != before
+    if _has_session_column(conn, "originator"):
+        context.t3_origin_session_ids = {
+            str(row["id"])
+            for row in conn.execute(
+                """
+                SELECT id FROM sessions
+                WHERE harness = 'codex' AND originator = 't3code_desktop'
+                """
+            )
+        }
+    if context.owners_by_session or context.t3_origin_session_ids:
+        parents = _physical_parent_ids(conn)
+        harness_by_id = {
+            str(row["id"]): str(row["harness"])
+            for row in conn.execute("SELECT id, harness FROM sessions")
+        }
+        _propagate_owners(
+            context.owners_by_session, parents, harness_by_id
+        )
+        _propagate_membership(
+            context.t3_origin_session_ids, parents, harness_by_id
+        )
     context.owned_session_ids = {
         session_id
         for session_id, owners in context.owners_by_session.items()
@@ -252,11 +278,16 @@ def logical_projection(
     if harness != "t3code":
         owner = logical_orchestrator_id(conn, session_id, context=identity)
         return {
-            "logical_harness": "t3code" if owner else harness,
+            "logical_harness": (
+                "t3code"
+                if owner or session_id in identity.t3_origin_session_ids
+                else harness
+            ),
             "runtime_harness": harness,
             "orchestrator_session_id": owner,
             "transcript_session_id": session_id,
             "provider_backings": [],
+            "runtime_backing_provenance": None,
         }
     backings = provider_backings(conn, session_id, context=identity)
     roots = _root_backings(backings)
@@ -265,7 +296,34 @@ def logical_projection(
         target_id = str(roots[0]["target_session_id"])
         if identity.canonical_root_backing_by_source.get(session_id) == target_id:
             transcript = roots[0]
-    transcript_id = str(transcript["target_session_id"]) if transcript else None
+    source_backed = False
+    if _has_session_column(conn, "transcript_storage"):
+        source = conn.execute(
+            "SELECT transcript_storage, artifact_id FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        source_backed = bool(
+            source is not None
+            and source["transcript_storage"] == "source_backed"
+            and source["artifact_id"] is not None
+        )
+    transcript_id = (
+        str(transcript["target_session_id"])
+        if transcript and not source_backed
+        else None
+    )
+    runtime_backing_provenance = None
+    if transcript and identity.canonical_root_backing_by_source.get(session_id) == str(
+        transcript["target_session_id"]
+    ) and str(transcript.get("target_harness") or "").lower() == "codex":
+        runtime_backing_provenance = {
+            "status": "validated",
+            "harness": "codex",
+            "session_id": transcript["target_session_id"],
+            "external_id": transcript["target_external_id"],
+            "artifact_id": transcript["artifact_id"],
+            "artifact_path": transcript["artifact_path"],
+        }
     runtime_harness = str(transcript["target_harness"]) if transcript else "t3code"
     return {
         "logical_harness": "t3code",
@@ -273,6 +331,7 @@ def logical_projection(
         "orchestrator_session_id": session_id,
         "transcript_session_id": transcript_id,
         "provider_backings": backings,
+        "runtime_backing_provenance": runtime_backing_provenance,
     }
 
 
@@ -300,24 +359,166 @@ def _physical_parent_ids(conn: sqlite3.Connection) -> dict[str, str]:
     rows = conn.execute(
         "SELECT id, harness, external_id, parent_session_id FROM sessions"
     ).fetchall()
-    by_id = {str(row["id"]) for row in rows}
+    return resolve_implicit_parent_ids(rows)
+
+
+def resolve_implicit_parent_ids(rows: Any) -> dict[str, str]:
+    """Resolve recorded parents without crossing a child's harness boundary."""
+    materialized = list(rows)
+    harness_by_id = {
+        str(row["id"]): str(row["harness"])
+        for row in materialized
+    }
     by_external: dict[tuple[str, str], list[str]] = {}
-    for row in rows:
+    for row in materialized:
         key = (str(row["harness"]), str(row["external_id"]))
         by_external.setdefault(key, []).append(str(row["id"]))
     out: dict[str, str] = {}
-    for row in rows:
+    for row in materialized:
         parent = row["parent_session_id"]
         if not parent:
             continue
+        child_id = str(row["id"])
+        child_harness = str(row["harness"])
         raw = str(parent)
-        if raw in by_id:
-            out[str(row["id"])] = raw
+        if raw in harness_by_id:
+            if raw != child_id and harness_by_id[raw] == child_harness:
+                out[child_id] = raw
             continue
-        candidates = by_external.get((str(row["harness"]), raw), [])
+        candidates = [
+            candidate
+            for candidate in by_external.get((child_harness, raw), [])
+            if candidate != child_id
+        ]
         if len(candidates) == 1:
-            out[str(row["id"])] = candidates[0]
+            out[child_id] = candidates[0]
     return out
+
+
+def implicit_parent_ids(conn: sqlite3.Connection) -> dict[str, str]:
+    rows = conn.execute(
+        "SELECT id, harness, external_id, parent_session_id FROM sessions"
+    ).fetchall()
+    return resolve_implicit_parent_ids(rows)
+
+
+def explicit_worker_parent_ids(conn: sqlite3.Connection) -> dict[str, str]:
+    if not _has_links_table(conn):
+        return {}
+    candidates: dict[str, set[str]] = {}
+    for row in conn.execute(
+        """
+        SELECT link.source_session_id, link.target_session_id
+        FROM session_links link
+        JOIN sessions source ON source.id = link.source_session_id
+        JOIN sessions target ON target.id = link.target_session_id
+        WHERE link.link_type = 'provider_backing'
+          AND link.link_role = 'worker'
+          AND link.target_session_id IS NOT NULL
+        """
+    ):
+        child_id = str(row["target_session_id"])
+        candidates.setdefault(child_id, set()).add(str(row["source_session_id"]))
+    return {
+        child_id: next(iter(parent_ids))
+        for child_id, parent_ids in candidates.items()
+        if len(parent_ids) == 1 and child_id not in parent_ids
+    }
+
+
+def lineage_parent_ids(conn: sqlite3.Connection) -> dict[str, str]:
+    parents = implicit_parent_ids(conn)
+    parents.update(explicit_worker_parent_ids(conn))
+    return parents
+
+
+def physical_root_session_ids(
+    conn: sqlite3.Connection,
+    *,
+    parents: dict[str, str] | None = None,
+) -> dict[str, str]:
+    session_ids = {
+        str(row["id"])
+        for row in conn.execute("SELECT id FROM sessions")
+    }
+    parent_by_id = parents if parents is not None else lineage_parent_ids(conn)
+    roots: dict[str, str] = {}
+    for session_id in sorted(session_ids):
+        path: list[str] = []
+        seen: set[str] = set()
+        current = session_id
+        while current in parent_by_id and current not in seen:
+            path.append(current)
+            seen.add(current)
+            current = parent_by_id[current]
+        root = min(seen) if current in seen else current
+        if root not in session_ids:
+            root = session_id
+        roots[session_id] = root
+        for member in path:
+            roots[member] = root
+    return roots
+
+
+def logical_session_root_ids(
+    conn: sqlite3.Connection,
+    *,
+    context: IdentityContext | None = None,
+) -> dict[str, str]:
+    identity = context or build_identity_context(conn)
+    return {
+        session_id: logical_root_session_id(conn, root_id, context=identity)
+        for session_id, root_id in physical_root_session_ids(conn).items()
+    }
+
+
+def _has_session_column(conn: sqlite3.Connection, column: str) -> bool:
+    return any(
+        str(row[1]) == column
+        for row in conn.execute("PRAGMA table_info(sessions)")
+    )
+
+
+def _propagate_owners(
+    owners_by_session: dict[str, set[str]],
+    parents: dict[str, str],
+    harness_by_id: dict[str, str],
+) -> None:
+    changed = True
+    while changed:
+        changed = False
+        for child_id, parent_id in parents.items():
+            if (
+                harness_by_id.get(parent_id) != "codex"
+                or harness_by_id.get(child_id) != "codex"
+            ):
+                continue
+            parent_owners = owners_by_session.get(parent_id)
+            if not parent_owners:
+                continue
+            child_owners = owners_by_session.setdefault(child_id, set())
+            before = len(child_owners)
+            child_owners.update(parent_owners)
+            changed = changed or len(child_owners) != before
+
+
+def _propagate_membership(
+    members: set[str],
+    parents: dict[str, str],
+    harness_by_id: dict[str, str],
+) -> None:
+    changed = True
+    while changed:
+        changed = False
+        for child_id, parent_id in parents.items():
+            if (
+                parent_id in members
+                and harness_by_id.get(parent_id) == "codex"
+                and harness_by_id.get(child_id) == "codex"
+                and child_id not in members
+            ):
+                members.add(child_id)
+                changed = True
 
 
 def provider_backing_owners(

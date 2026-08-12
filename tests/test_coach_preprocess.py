@@ -7,6 +7,7 @@ from pathlib import Path
 from agentlog.analysis.coach import CoachPreprocessConfig, emit_coach_packets, validate_coach_result as _validate_coach_result
 from agentlog.db.schema import init_db
 from agentlog.source_reader import SourceReadResult
+from agentlog.session_identity import INTERNAL_APPROVAL_GUARDIAN_THREAD_SOURCE
 
 
 def _legacy_result_with_dispositions(raw, packet):
@@ -57,10 +58,10 @@ class CoachPreprocessTests(unittest.TestCase):
     def tearDown(self):
         self.conn.close()
 
-    def add_session(self, sid, parent=None, *, profile="codex", transcript_storage="legacy_materialized"):
+    def add_session(self, sid, parent=None, *, profile="codex", thread_source=None, transcript_storage="legacy_materialized"):
         self.conn.execute(
-            "INSERT INTO sessions(id,harness,external_id,parent_session_id,repo,agent_profile,transcript_storage) VALUES(?,?,?,?,?,?,?)",
-            (sid, "codex", sid, parent, "demo", profile, transcript_storage),
+            "INSERT INTO sessions(id,harness,external_id,parent_session_id,repo,agent_profile,thread_source,transcript_storage) VALUES(?,?,?,?,?,?,?,?)",
+            (sid, "codex", sid, parent, "demo", profile, thread_source, transcript_storage),
         )
 
     def add_window(self, sid, number, *, authored=False):
@@ -101,6 +102,23 @@ class CoachPreprocessTests(unittest.TestCase):
         self.assertEqual(manifest["coverage"]["joined_windows"], 4)
         self.assertEqual(manifest["coverage"]["selected"], 2)
         self.assertEqual(packet["root_session_ids"], ["root"])
+
+    def test_internal_approval_guardian_is_excluded_from_coach(self):
+        self.add_session(
+            "guardian",
+            profile="guardian",
+            thread_source=INTERNAL_APPROVAL_GUARDIAN_THREAD_SOURCE,
+        )
+        self.add_window("guardian", 1)
+        self.conn.commit()
+        root = Path(tempfile.mkdtemp())
+
+        manifest = emit_coach_packets(self.conn, root)
+
+        self.assertEqual(manifest["coverage"]["total"], 1)
+        self.assertEqual(manifest["coverage"]["eligible"], 0)
+        self.assertEqual(manifest["coverage"]["selected"], 0)
+        self.assertEqual(manifest["packets"], [])
 
     def test_synthetic_owner_looking_requests_do_not_reach_coach_coverage(self):
         self.add_session("root")
@@ -823,6 +841,68 @@ class CoachPreprocessTests(unittest.TestCase):
         self.assertEqual(
             {window["physical_root_session_id"] for window in packet["windows"]},
             {"codex-backing"},
+        )
+
+    def test_post_promotion_t3_root_is_authority_over_source_backed_backing(self):
+        self.conn.executescript(
+            """
+            INSERT INTO artifacts
+              (harness,path,size,mtime_ns,content_hash,parsed_offset,parser_version,
+               transcript_storage)
+            VALUES ('t3code','/tmp/t3',1,1,'t3',1,'test','source_backed'),
+                   ('codex','/tmp/backing',1,1,'backing',1,'test','source_backed');
+            INSERT INTO sessions
+              (id,harness,external_id,repo,artifact_id,transcript_storage)
+            VALUES ('t3-root','t3code','root','demo',1,'source_backed'),
+                   ('codex-backing','codex','backing','demo',2,'source_backed');
+            INSERT INTO session_links
+              (source_session_id,target_session_id,link_type,target_harness,
+               target_external_id,link_role)
+            VALUES ('t3-root','codex-backing','provider_backing','codex','backing','root');
+            """
+        )
+        self.add_window("t3-root", 1)
+        self.add_window("codex-backing", 1)
+        self.conn.commit()
+
+        def reader(conn, session_id):
+            rows = conn.execute(
+                "SELECT id,seq,role,content_hash FROM messages WHERE session_id=? ORDER BY seq",
+                (session_id,),
+            ).fetchall()
+            return SourceReadResult(
+                "ready",
+                [
+                    {
+                        "id": row["id"],
+                        "seq": row["seq"],
+                        "role": row["role"],
+                        "timestamp": None,
+                        "model": None,
+                        "model_canonical": None,
+                        "effort": None,
+                        "text": "Please verify the tests" if row["role"] == "user" else "Verified the tests",
+                        "content_hash": row["content_hash"],
+                        "is_tool_plumbing": False,
+                        "authored_by_agent": False,
+                    }
+                    for row in rows
+                ],
+                source_identity=session_id,
+                source_hash=f"hash:{session_id}",
+            )
+
+        root = Path(tempfile.mkdtemp())
+        manifest = emit_coach_packets(
+            self.conn,
+            root,
+            config=CoachPreprocessConfig(source_transcript_reader=reader),
+        )
+        packet = json.loads((root / manifest["packets"][0]["path"]).read_text())
+        self.assertEqual(packet["root_session_ids"], ["t3-root"])
+        self.assertEqual(
+            [window["session_id"] for window in packet["windows"]],
+            ["t3-root"],
         )
 
     def test_fallback_uses_current_t3_episode_once(self):

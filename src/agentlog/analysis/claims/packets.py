@@ -42,6 +42,15 @@ from agentlog.analysis.claims.store import (
 )
 from agentlog.safety.redaction import REDACTION_VERSION, RedactionReport, redact_text
 from agentlog.safety.write_guard import assert_writable
+from agentlog.source_reader import CachedSourceTranscriptReader
+from agentlog.session_identity import (
+    build_identity_context,
+    explicit_worker_parent_ids,
+    logical_projection,
+    logical_root_session_id,
+    provider_root_shadow_ids,
+    resolve_implicit_parent_ids,
+)
 
 DEFAULT_MODEL = "cursor-grok-4.5-high-fast"
 PROMPT_PATH = (
@@ -455,22 +464,7 @@ def _session_logical_roots(conn: sqlite3.Connection) -> dict[str, dict[str, str 
         "SELECT id, harness, external_id, parent_session_id, repo, cwd FROM sessions"
     ).fetchall()
     by_id = {str(row["id"]): row for row in rows}
-    by_external: dict[tuple[str, str], list[str]] = {}
-    for row in rows:
-        key = (str(row["harness"] or ""), str(row["external_id"] or ""))
-        by_external.setdefault(key, []).append(str(row["id"]))
-
-    parents: dict[str, str] = {}
-    for sid, row in by_id.items():
-        raw_parent = str(row["parent_session_id"] or "")
-        if not raw_parent:
-            continue
-        if raw_parent in by_id:
-            parents[sid] = raw_parent
-            continue
-        candidates = by_external.get((str(row["harness"] or ""), raw_parent), [])
-        if len(candidates) == 1:
-            parents[sid] = candidates[0]
+    parents = resolve_implicit_parent_ids(rows)
 
     roots: dict[str, str] = {}
     for sid in sorted(by_id):
@@ -481,41 +475,12 @@ def _session_logical_roots(conn: sqlite3.Connection) -> dict[str, dict[str, str 
             cursor = parents[cursor]
         roots[sid] = cursor if cursor in by_id else sid
 
-    owners: dict[str, set[str]] = {}
-    if _table_exists(conn, "session_links"):
-        for row in conn.execute(
-            """
-            SELECT link.target_session_id, link.source_session_id
-            FROM session_links link
-            JOIN sessions source ON source.id = link.source_session_id
-            WHERE link.link_type = 'provider_backing'
-              AND link.target_session_id IS NOT NULL
-              AND source.harness = 't3code'
-            """
-        ):
-            owners.setdefault(str(row["target_session_id"]), set()).add(
-                str(row["source_session_id"])
-            )
-    changed = True
-    while changed:
-        changed = False
-        for child, parent in parents.items():
-            parent_owners = owners.get(parent)
-            if not parent_owners:
-                continue
-            child_owners = owners.setdefault(child, set())
-            before = len(child_owners)
-            child_owners.update(parent_owners)
-            changed = changed or len(child_owners) != before
-
+    identity = build_identity_context(conn)
     out: dict[str, dict[str, str | None]] = {}
     for sid, row in by_id.items():
         physical_root = roots[sid]
-        owner_ids = owners.get(sid, set())
-        logical_root = (
-            roots[next(iter(owner_ids))]
-            if len(owner_ids) == 1
-            else physical_root
+        logical_root = logical_root_session_id(
+            conn, physical_root, context=identity
         )
         logical_row = by_id[logical_root]
         project_key = _opaque_project_key(
@@ -530,6 +495,30 @@ def _session_logical_roots(conn: sqlite3.Connection) -> dict[str, dict[str, str 
     return out
 
 
+def _eligible_root_session_ids(conn: sqlite3.Connection) -> set[str]:
+    rows = conn.execute(
+        "SELECT id, harness, external_id, parent_session_id FROM sessions"
+    ).fetchall()
+    parents = resolve_implicit_parent_ids(rows)
+    explicit_workers = explicit_worker_parent_ids(conn)
+    identity = build_identity_context(conn)
+    root_shadows = provider_root_shadow_ids(conn, context=identity)
+    eligible: set[str] = set()
+    for row in rows:
+        session_id = str(row["id"])
+        if (
+            session_id in parents
+            or session_id in explicit_workers
+            or session_id in root_shadows
+        ):
+            continue
+        projection = logical_projection(
+            conn, session_id, str(row["harness"]), context=identity
+        )
+        eligible.add(str(projection["transcript_session_id"] or session_id))
+    return eligible
+
+
 def _fetch_theme_windows(
     conn: sqlite3.Connection,
     *,
@@ -537,6 +526,7 @@ def _fetch_theme_windows(
     limit: int,
     report: RedactionReport,
     logical_roots: dict[str, dict[str, str | None]],
+    source_reader: CachedSourceTranscriptReader | None = None,
 ) -> list[dict[str, Any]]:
     sql = f"""
         SELECT
@@ -546,6 +536,7 @@ def _fetch_theme_windows(
             w.response_message_id,
             d.request_kind,
             s.harness,
+            s.transcript_storage,
             s.started_at,
             m_user.text AS user_text,
             m_asst.text AS assistant_text,
@@ -562,7 +553,6 @@ def _fetch_theme_windows(
         LEFT JOIN messages m_asst ON m_asst.id = w.response_message_id
         JOIN ux_observations u ON u.window_id = w.id
         WHERE d.request_kind = 'substantive'
-          AND s.parent_session_id IS NULL
           AND COALESCE(s.external_id, '') NOT LIKE 'skills:%'
           AND COALESCE(u.link_status, 'linked') = 'linked'
           AND COALESCE(m_user.authored_by_agent, 0) = 0
@@ -570,11 +560,24 @@ def _fetch_theme_windows(
         ORDER BY COALESCE(m_user.timestamp, s.started_at) DESC
     """
     rows = conn.execute(sql).fetchall()
+    source_reader = source_reader or CachedSourceTranscriptReader()
+    source_text: dict[str, str] = {}
+    for session_id in sorted({str(row["session_id"]) for row in rows if row["transcript_storage"] == "source_backed"}):
+        source = source_reader(conn, session_id)
+        if not source.ready:
+            raise RuntimeError(
+                f"canonical source unavailable for {session_id}: "
+                f"{source.warning or source.status}"
+            )
+        source_text.update({str(message["id"]): str(message["text"]) for message in source.messages})
+    eligible_session_ids = _eligible_root_session_ids(conn)
     out: list[dict[str, Any]] = []
     seen_sessions: set[str] = set()
     seen_roots: set[str] = set()
     for r in rows:
         sid = str(r["session_id"])
+        if sid not in eligible_session_ids:
+            continue
         if sid in seen_sessions:
             continue
         logical = logical_roots.get(sid)
@@ -585,8 +588,8 @@ def _fetch_theme_windows(
             continue
         seen_sessions.add(sid)
         seen_roots.add(logical_root_id)
-        user = _redact(str(r["user_text"] or ""), report)[:MAX_QUOTE_IN_PACKET]
-        asst = _redact(str(r["assistant_text"] or ""), report)[:MAX_QUOTE_IN_PACKET]
+        user = _redact(source_text.get(str(r["request_message_id"]), str(r["user_text"] or "")), report)[:MAX_QUOTE_IN_PACKET]
+        asst = _redact(source_text.get(str(r["response_message_id"]), str(r["assistant_text"] or "")), report)[:MAX_QUOTE_IN_PACKET]
         spans = []
         try:
             raw_spans = json.loads(r["spans_json"] or "[]")
@@ -640,16 +643,17 @@ def _eligible_root_population(
         JOIN window_det_classifications d ON d.window_id = w.id
         JOIN ux_observations u ON u.window_id = w.id
         JOIN messages m_user ON m_user.id = w.request_message_id
-        WHERE s.parent_session_id IS NULL
-          AND COALESCE(s.external_id, '') NOT LIKE 'skills:%'
+        WHERE COALESCE(s.external_id, '') NOT LIKE 'skills:%'
           AND d.request_kind = 'substantive'
           AND COALESCE(u.link_status, 'linked') = 'linked'
           AND COALESCE(m_user.authored_by_agent, 0) = 0
         """
     ).fetchall()
+    eligible_session_ids = _eligible_root_session_ids(conn)
     unique_roots = {
         str(logical["logical_root_id"])
         for row in rows
+        if str(row["id"]) in eligible_session_ids
         if (logical := logical_roots.get(str(row["id"]))) is not None
         and logical.get("logical_root_id")
     }
@@ -929,6 +933,7 @@ def emit_proposal_packet_run(
     run_id = f"proposals_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
     packet_meta: dict[str, Any] = {}
     window_count = 0
+    source_reader = CachedSourceTranscriptReader()
     for i, (theme, where_sql) in enumerate(THEME_SPECS, start=1):
         report = RedactionReport()
         snippets = _config_snippets(inventory, target_paths, report)
@@ -939,6 +944,7 @@ def emit_proposal_packet_run(
             limit=windows_per_theme,
             report=report,
             logical_roots=logical_roots,
+            source_reader=source_reader,
         )
         miss_pairs = _adjudicated_miss_pairs(conn, windows, theme)
         window_count += len(windows)
@@ -984,6 +990,8 @@ def emit_proposal_packet_run(
             "validated_miss_pairs": miss_pairs,
             "redaction": report.to_dict(),
         }
+        if not source_reader.verify_current():
+            raise RuntimeError("canonical source changed before proposal packet write")
         body["evidence_pack_hash"] = _packet_hash(body)
         packet_path = paths["packets"] / f"{packet_id}.json"
         packet_path.write_text(

@@ -12,6 +12,7 @@ from agentlog.db.schema import connect, init_db
 from agentlog.db.repository import Repository
 from agentlog.ingest.base import content_hash_text, hash_prefix
 from agentlog.mcp_server import tools as mcp_tools
+from agentlog.session_identity import INTERNAL_APPROVAL_GUARDIAN_THREAD_SOURCE
 
 
 class DualSearchTests(unittest.TestCase):
@@ -44,6 +45,57 @@ class DualSearchTests(unittest.TestCase):
     def test_source_sessions_are_never_read_from_message_fts(self) -> None:
         result = search_messages(self.conn, self.tr, q="leak")
         self.assertEqual(result["total"], 0)
+
+    def test_internal_approval_guardian_is_hidden_from_search(self) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO sessions
+              (id, harness, external_id, started_at, thread_source,
+               transcript_storage)
+            VALUES (?, 'codex', 'guardian', '2026-08-10T00:02:00+00:00',
+                    ?, 'legacy_materialized')
+            """,
+            ("codex:guardian", INTERNAL_APPROVAL_GUARDIAN_THREAD_SOURCE),
+        )
+        self.conn.execute(
+            """
+            INSERT INTO messages (id, session_id, seq, role, text, content_hash)
+            VALUES ('guardian-m1', 'codex:guardian', 1, 'user',
+                    'approval assessment transcript', 'guardian-hash')
+            """
+        )
+        self.conn.execute("INSERT INTO messages_fts(messages_fts) VALUES ('rebuild')")
+        self.conn.commit()
+
+        result = search_messages(self.conn, self.tr, q="assessment")
+
+        self.assertEqual(result["total"], 0)
+
+    def test_source_scan_rejects_stale_payload_when_status_is_not_ready(self) -> None:
+        def reader(conn: sqlite3.Connection, session_id: str) -> dict:
+            return {
+                "status": "source_changed",
+                "warning": "checkpoint mismatch",
+                "messages": [
+                    {
+                        "id": "stale-locator",
+                        "seq": 1,
+                        "role": "user",
+                        "text": "stale source payload",
+                    }
+                ],
+            }
+
+        result = search_messages(
+            self.conn,
+            self.tr,
+            q="payload",
+            source_reader=reader,
+        )
+
+        self.assertEqual(result["total"], 0)
+        self.assertEqual(result["items"], [])
+        self.assertEqual(result["source_warnings"], ["checkpoint mismatch"])
 
     def test_source_scan_has_provenance_and_deduplicates_locator(self) -> None:
         calls: list[str] = []

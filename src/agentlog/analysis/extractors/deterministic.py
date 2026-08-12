@@ -4,6 +4,7 @@ import hashlib
 import json
 import sqlite3
 from datetime import datetime, timezone
+from typing import Any
 
 from agentlog.analysis.extractors.models import DetClassification, ExtractorMeta
 from agentlog.analysis.extractors.taxonomy import (
@@ -15,8 +16,13 @@ from agentlog.analysis.extractors.window_context import (
     load_window_contexts,
     structural_features,
 )
+from agentlog.source_reader import CachedSourceTranscriptReader
 
 KIND_DETERMINISTIC = "deterministic"
+
+
+class DeterministicInputChanged(RuntimeError):
+    pass
 
 
 def _run_id(kind: str, started_at: str) -> str:
@@ -43,31 +49,130 @@ def window_input_fingerprint(
     return hashlib.sha1(raw.encode()).hexdigest()[:16]
 
 
+def _hash_record(
+    digest: Any,
+    kind: str,
+    values: tuple[object, ...],
+) -> None:
+    encoded = json.dumps(
+        [kind, *values],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode()
+    digest.update(len(encoded).to_bytes(8, "big"))
+    digest.update(encoded)
+
+
 def iter_window_input_rows(
     conn: sqlite3.Connection,
 ) -> list[tuple[str, str]]:
     """Return (window_id, input_fp) for every exchange window."""
-    rows = conn.execute(
+    windows = conn.execute(
         """
-        SELECT w.id AS window_id,
-               COALESCE(w.content_hash, '') AS wch,
-               COALESCE(m.content_hash, '') AS mch,
-               COALESCE(m.authored_by_agent, 0) AS aba,
-               COALESCE(m.is_tool_plumbing, 0) AS plumb
+        SELECT w.id, w.session_id, w.request_message_id,
+               w.response_message_id, w.input_hash, w.content_hash,
+               s.harness, s.model
         FROM exchange_windows w
-        LEFT JOIN messages m ON m.id = w.request_message_id
+        JOIN sessions s ON s.id = w.session_id
         ORDER BY w.id
         """
     ).fetchall()
+    session_digests: dict[str, Any] = {}
+    for row in windows:
+        session_id = str(row["session_id"])
+        if session_id not in session_digests:
+            digest = hashlib.sha1()
+            _hash_record(
+                digest,
+                "session",
+                (session_id, row["harness"], row["model"]),
+            )
+            session_digests[session_id] = digest
+
+    if session_digests:
+        for row in conn.execute(
+            """
+            SELECT m.id, m.session_id, m.seq, m.role,
+                   m.content_hash, m.model, m.is_tool_plumbing,
+                   m.authored_by_agent
+            FROM messages m
+            JOIN (SELECT DISTINCT session_id FROM exchange_windows) w
+              ON w.session_id = m.session_id
+            ORDER BY m.session_id, m.seq, m.id
+            """
+        ):
+            _hash_record(
+                session_digests[str(row["session_id"])],
+                "message",
+                (
+                    row["id"],
+                    row["seq"],
+                    row["role"],
+                    row["content_hash"],
+                    row["model"],
+                    row["is_tool_plumbing"],
+                    row["authored_by_agent"],
+                ),
+            )
+        for row in conn.execute(
+            """
+            SELECT t.id, t.session_id, t.message_id, t.seq, t.tool_name,
+                   t.action, t.success
+            FROM tool_events t
+            JOIN (SELECT DISTINCT session_id FROM exchange_windows) w
+              ON w.session_id = t.session_id
+            ORDER BY t.session_id, t.seq, t.id
+            """
+        ):
+            _hash_record(
+                session_digests[str(row["session_id"])],
+                "tool",
+                (
+                    row["id"],
+                    row["message_id"],
+                    row["seq"],
+                    row["tool_name"],
+                    row["action"],
+                    row["success"],
+                ),
+            )
+        for row in conn.execute(
+            """
+            SELECT e.id, e.session_id, e.message_id, e.skill_name,
+                   e.exposure_type
+            FROM skill_exposures e
+            JOIN (SELECT DISTINCT session_id FROM exchange_windows) w
+              ON w.session_id = e.session_id
+            ORDER BY e.session_id, e.skill_name, e.exposure_type, e.id
+            """
+        ):
+            _hash_record(
+                session_digests[str(row["session_id"])],
+                "skill",
+                (
+                    row["id"],
+                    row["message_id"],
+                    row["skill_name"],
+                    row["exposure_type"],
+                ),
+            )
+
     out: list[tuple[str, str]] = []
-    for row in rows:
-        fp = window_input_fingerprint(
-            window_content_hash=str(row["wch"] or ""),
-            request_content_hash=str(row["mch"] or ""),
-            authored_by_agent=bool(row["aba"]),
-            is_tool_plumbing=bool(row["plumb"]),
+    for row in windows:
+        digest = session_digests[str(row["session_id"])].copy()
+        _hash_record(
+            digest,
+            "window",
+            (
+                row["id"],
+                row["request_message_id"],
+                row["response_message_id"],
+                row["input_hash"],
+                row["content_hash"],
+                EXTRACTOR_VERSION,
+            ),
         )
-        out.append((str(row["window_id"]), fp))
+        out.append((str(row["id"]), digest.hexdigest()[:16]))
     return out
 
 
@@ -123,37 +228,40 @@ def run_deterministic(
     conn: sqlite3.Connection,
     *,
     window_ids: list[str] | None = None,
+    expected_window_fps: list[tuple[str, str]] | None = None,
 ) -> tuple[TriageReport, str]:
     """Classify all (or selected) windows; write det rows; return triage + run_id."""
     started = datetime.now(timezone.utc).isoformat()
     run_id = _run_id("deterministic", started)
-    contexts = load_window_contexts(conn, window_ids=window_ids)
+    baseline_data_version = int(conn.execute("PRAGMA data_version").fetchone()[0])
+    source_reader = CachedSourceTranscriptReader()
+    contexts = load_window_contexts(
+        conn, window_ids=window_ids, source_reader=source_reader
+    )
+    prepared_window_fps = iter_window_input_rows(conn)
+    if (
+        expected_window_fps is not None
+        and prepared_window_fps != expected_window_fps
+    ):
+        raise DeterministicInputChanged(
+            "deterministic input changed before classification"
+        )
     report = triage_windows(contexts)
     ctx_by_id = {c.window_id: c for c in contexts}
 
-    input_fp_by_id: dict[str, str] = {}
-    if contexts:
-        ids = [c.window_id for c in contexts]
-        placeholders = ",".join("?" * len(ids))
-        for row in conn.execute(
-            f"""
-            SELECT w.id AS window_id,
-                   COALESCE(w.content_hash, '') AS wch,
-                   COALESCE(m.content_hash, '') AS mch,
-                   COALESCE(m.authored_by_agent, 0) AS aba,
-                   COALESCE(m.is_tool_plumbing, 0) AS plumb
-            FROM exchange_windows w
-            LEFT JOIN messages m ON m.id = w.request_message_id
-            WHERE w.id IN ({placeholders})
-            """,
-            ids,
-        ):
-            input_fp_by_id[str(row["window_id"])] = window_input_fingerprint(
-                window_content_hash=str(row["wch"] or ""),
-                request_content_hash=str(row["mch"] or ""),
-                authored_by_agent=bool(row["aba"]),
-                is_tool_plumbing=bool(row["plumb"]),
-            )
+    conn.execute("BEGIN IMMEDIATE")
+    if not source_reader.verify_current():
+        conn.rollback()
+        raise DeterministicInputChanged(
+            "canonical source changed during classification"
+        )
+    current_data_version = int(conn.execute("PRAGMA data_version").fetchone()[0])
+    if current_data_version != baseline_data_version:
+        conn.rollback()
+        raise DeterministicInputChanged(
+            "deterministic input changed during classification"
+        )
+    input_fp_by_id = dict(prepared_window_fps)
 
     conn.execute(
         """

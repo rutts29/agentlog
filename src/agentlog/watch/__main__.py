@@ -7,11 +7,19 @@ from pathlib import Path
 from agentlog.config import (
     DEFAULT_DB_PATH,
     WATCH_DEBOUNCE_SECONDS,
+    WATCH_MAX_WAIT_SECONDS,
     WATCH_POLL_SECONDS,
 )
 from agentlog.service.logging_setup import configure_daemon_logging, log_file_from_env
 from agentlog.watch.daemon import WatchDaemon
 from agentlog.watch.sources import existing_watch_roots
+
+
+def _non_negative_float(value: str) -> float:
+    parsed = float(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be non-negative")
+    return parsed
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -30,6 +38,12 @@ def main(argv: list[str] | None = None) -> int:
         type=float,
         default=WATCH_DEBOUNCE_SECONDS,
         help=f"Quiet period seconds per harness (default: {WATCH_DEBOUNCE_SECONDS})",
+    )
+    parser.add_argument(
+        "--max-wait",
+        type=_non_negative_float,
+        default=WATCH_MAX_WAIT_SECONDS,
+        help=f"Maximum seconds before ingest (default: {WATCH_MAX_WAIT_SECONDS})",
     )
     parser.add_argument(
         "--poll",
@@ -65,6 +79,7 @@ def main(argv: list[str] | None = None) -> int:
         db_path=args.db,
         sources=sources,
         debounce_seconds=args.debounce,
+        max_wait_seconds=args.max_wait,
         poll_seconds=args.poll,
         use_watchdog=not args.no_watchdog,
     )

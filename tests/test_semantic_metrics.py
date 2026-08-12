@@ -514,18 +514,28 @@ class RootClusterTests(SemanticMetricTestBase):
             {"codex:root"},
         )
 
-    def test_external_and_cross_harness_parent_ids_resolve(self) -> None:
+    def test_external_parent_ids_resolve_only_within_child_harness(self) -> None:
         self.fx.session("codex:root", external_id="root")
         # parent recorded as the bare external id rather than the canonical id
         self.fx.session("codex:child", external_id="child", parent="root")
-        # cross-harness handoff: claude worker pointing at the codex root
+        # A bare foreign ID is not evidence of cross-harness lineage.
         self.fx.session(
             "claude:worker", harness="claude", external_id="worker", parent="root"
         )
         self.conn.commit()
         roots = resolve_session_roots(self.conn)
         self.assertEqual(roots["codex:child"], "codex:root")
-        self.assertEqual(roots["claude:worker"], "codex:root")
+        self.assertEqual(roots["claude:worker"], "claude:worker")
+
+        self.fx.session(
+            "cursor:qualified",
+            harness="cursor",
+            external_id="qualified",
+            parent="codex:root",
+        )
+        self.conn.commit()
+        roots = resolve_session_roots(self.conn)
+        self.assertEqual(roots["cursor:qualified"], "cursor:qualified")
 
     def test_parent_cycle_terminates(self) -> None:
         self.fx.session("codex:a", external_id="a", parent="b")

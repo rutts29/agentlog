@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 import sqlite3
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 from urllib.parse import urlparse
@@ -21,13 +22,15 @@ from agentlog.api.model_rollup import collapse_by_model, strict_message_model_sq
 from agentlog.api.ranges import TimeRange, session_time_clause as _session_time_clause
 from agentlog.api.search import SourceReader, search_messages as _dual_search_messages
 from agentlog.session_identity import (
+    IdentityContext,
     build_identity_context,
+    lineage_parent_ids,
     logical_orchestrator_id,
     logical_root_session_id,
     logical_projection,
-    provider_backings,
-    provider_root_backings,
     provider_root_shadow_ids,
+    resolve_implicit_parent_ids,
+    is_internal_approval_guardian,
 )
 from agentlog.normalize.model_identity import display_model
 from agentlog.source_reader import read_source_transcript
@@ -44,6 +47,10 @@ _SORT_COLUMNS = {
     "project": "project_label",
     "branch": "COALESCE(s.branch, '')",
 }
+
+_TREE_MAX_NODES = 500
+_TREE_MAX_DEPTH = 64
+_DETAIL_MAX_CHILDREN = 200
 
 
 def _project_label(repo: str | None, cwd: str | None) -> str:
@@ -121,6 +128,7 @@ def _model_label(row: sqlite3.Row | None) -> str:
 
 def ledger_counts(conn: sqlite3.Connection, tr: TimeRange) -> dict[str, Any]:
     sessions = _aggregate_sessions(conn, tr)
+    parents = lineage_parent_ids(conn)
     metric_ids = sorted({session.metric_session_id for session in sessions})
     if not metric_ids:
         return {
@@ -159,7 +167,7 @@ def ledger_counts(conn: sqlite3.Connection, tr: TimeRange) -> dict[str, Any]:
         "auto_reviews": int(row["auto_reviews"] or 0),
         "worker_briefs": int(row["worker_briefs"] or 0),
         "child_sessions": sum(
-            1 for session in sessions if session.row["parent_session_id"] is not None
+            1 for session in sessions if session.session_id in parents
         ),
     }
 
@@ -443,7 +451,11 @@ def duration_and_volume(
     }
 
 
-def session_facets(conn: sqlite3.Connection, tr: TimeRange) -> dict[str, Any]:
+def session_facets(
+    conn: sqlite3.Connection, tr: TimeRange, *, view: str | None = None
+) -> dict[str, Any]:
+    if view == "roots":
+        return _root_session_facets(conn, tr)
     sessions = _aggregate_sessions(conn, tr)
     metrics = _metric_rows(conn, sessions)
     buckets: dict[str, dict[str, int]] = {
@@ -478,6 +490,391 @@ def session_facets(conn: sqlite3.Connection, tr: TimeRange) -> dict[str, Any]:
     }
 
 
+@dataclass
+class _SessionTopology:
+    rows: dict[str, sqlite3.Row]
+    parent_by_id: dict[str, str]
+    children_by_id: dict[str, list[str]]
+    root_by_id: dict[str, str]
+    roots: set[str]
+    orphan_roots: set[str]
+    hidden_ids: set[str]
+    relationship_by_id: dict[str, str]
+    descendant_counts: dict[str, int]
+
+
+def _session_topology(
+    conn: sqlite3.Connection, identity: IdentityContext
+) -> _SessionTopology:
+    rows = {
+        str(row["id"]): row
+        for row in conn.execute("SELECT * FROM sessions ORDER BY id").fetchall()
+    }
+    physical_parents = resolve_implicit_parent_ids(rows.values())
+    unresolved = {
+        session_id
+        for session_id, row in rows.items()
+        if row["parent_session_id"] and session_id not in physical_parents
+    }
+
+    hidden_ids = provider_root_shadow_ids(conn, context=identity) | {
+        session_id
+        for session_id, row in rows.items()
+        if is_internal_approval_guardian(row)
+    }
+    visible_ids = set(rows).difference(hidden_ids)
+    parent_by_id: dict[str, str] = {}
+    relationship_by_id: dict[str, str] = {}
+    for session_id in sorted(visible_ids):
+        physical_parent = physical_parents.get(session_id)
+        if physical_parent is None:
+            continue
+        if physical_parent in hidden_ids:
+            owner = logical_orchestrator_id(
+                conn, physical_parent, context=identity
+            )
+            if owner in visible_ids and owner != session_id:
+                parent_by_id[session_id] = str(owner)
+                relationship_by_id[session_id] = "provider_child"
+            else:
+                unresolved.add(session_id)
+            continue
+        if physical_parent in visible_ids:
+            parent_by_id[session_id] = physical_parent
+            relationship_by_id[session_id] = "child"
+
+    for source_id, backings in identity.backings_by_source.items():
+        if source_id not in visible_ids:
+            continue
+        for backing in backings:
+            target_id = backing.get("target_session_id")
+            if (
+                backing.get("link_role") != "worker"
+                or not target_id
+                or str(target_id) not in visible_ids
+                or identity.owners_by_session.get(str(target_id), set())
+                != {source_id}
+                or str(target_id) == source_id
+            ):
+                continue
+            target = str(target_id)
+            ancestor = parent_by_id.get(target)
+            seen_ancestors: set[str] = set()
+            while ancestor and ancestor not in seen_ancestors:
+                if ancestor == source_id:
+                    break
+                seen_ancestors.add(ancestor)
+                ancestor = parent_by_id.get(ancestor)
+            if ancestor != source_id:
+                parent_by_id[target] = source_id
+                relationship_by_id[target] = "provider_worker"
+
+    cycle_roots: set[str] = set()
+    settled: set[str] = set()
+    for start in sorted(visible_ids):
+        if start in settled:
+            continue
+        path: list[str] = []
+        positions: dict[str, int] = {}
+        current: str | None = start
+        while current is not None and current not in settled:
+            if current in positions:
+                cycle = path[positions[current] :]
+                break_id = min(cycle)
+                parent_by_id.pop(break_id, None)
+                relationship_by_id.pop(break_id, None)
+                cycle_roots.add(break_id)
+                break
+            positions[current] = len(path)
+            path.append(current)
+            current = parent_by_id.get(current)
+        settled.update(path)
+
+    children_by_id: dict[str, list[str]] = {
+        session_id: [] for session_id in visible_ids
+    }
+    for child_id, parent_id in parent_by_id.items():
+        children_by_id[parent_id].append(child_id)
+    for child_ids in children_by_id.values():
+        child_ids.sort(
+            key=lambda child_id: (
+                str(rows[child_id]["started_at"] or ""),
+                child_id,
+            )
+        )
+
+    roots = {session_id for session_id in visible_ids if session_id not in parent_by_id}
+    root_by_id: dict[str, str] = {}
+    descendant_counts: dict[str, int] = {}
+
+    for root_id in sorted(roots):
+        stack = [root_id]
+        order: list[str] = []
+        while stack:
+            session_id = stack.pop()
+            root_by_id[session_id] = root_id
+            order.append(session_id)
+            stack.extend(children_by_id[session_id])
+        for session_id in reversed(order):
+            descendant_counts[session_id] = sum(
+                1 + descendant_counts[child_id]
+                for child_id in children_by_id[session_id]
+            )
+
+    orphan_roots = roots.intersection(unresolved.union(cycle_roots))
+    return _SessionTopology(
+        rows=rows,
+        parent_by_id=parent_by_id,
+        children_by_id=children_by_id,
+        root_by_id=root_by_id,
+        roots=roots,
+        orphan_roots=orphan_roots,
+        hidden_ids=hidden_ids,
+        relationship_by_id=relationship_by_id,
+        descendant_counts=descendant_counts,
+    )
+
+
+def _session_node_bases(
+    conn: sqlite3.Connection,
+    topology: _SessionTopology,
+    identity: IdentityContext,
+    session_ids: set[str],
+    root_navigation_id: str,
+) -> dict[str, dict[str, Any]]:
+    projections = {
+        session_id: logical_projection(
+            conn,
+            session_id,
+            str(topology.rows[session_id]["harness"]),
+            context=identity,
+        )
+        for session_id in session_ids
+    }
+    metric_id_by_session = {
+        session_id: str(
+            projections[session_id]["transcript_session_id"] or session_id
+        )
+        for session_id in session_ids
+    }
+    metric_ids = sorted(set(metric_id_by_session.values()))
+
+    def counts(table: str) -> dict[str, int]:
+        if not metric_ids:
+            return {}
+        placeholders = ",".join("?" for _ in metric_ids)
+        return {
+            str(row["session_id"]): int(row["c"])
+            for row in conn.execute(
+                f"SELECT session_id, COUNT(*) AS c FROM {table} "
+                f"WHERE session_id IN ({placeholders}) GROUP BY session_id",
+                metric_ids,
+            ).fetchall()
+        }
+
+    message_counts = counts("messages")
+    tool_counts = counts("tool_events")
+    bases: dict[str, dict[str, Any]] = {}
+    for session_id in session_ids:
+        row = topology.rows[session_id]
+        projection = projections[session_id]
+        metric_id = metric_id_by_session[session_id]
+        metric = topology.rows.get(metric_id, row)
+        parent_navigation_id = topology.parent_by_id.get(session_id)
+        base = {
+            "id": session_id,
+            "navigation_id": session_id,
+            "parent_navigation_id": parent_navigation_id,
+            "root_navigation_id": root_navigation_id,
+            "harness": row["harness"],
+            **projection,
+            "model": display_model(metric["model_canonical"]),
+            "model_raw": metric["model"],
+            "effort": metric["effort"],
+            "project": _project_label(row["repo"], row["cwd"]),
+            "started_at": row["started_at"],
+            "ended_at": row["ended_at"],
+            "parent_session_id": row["parent_session_id"],
+            "thread_source": row["thread_source"],
+            "message_count": message_counts.get(metric_id, 0),
+            "tool_count": tool_counts.get(metric_id, 0),
+            "child_count": len(topology.children_by_id[session_id]),
+            "descendant_count": topology.descendant_counts[session_id],
+            "is_orphan": session_id in topology.orphan_roots,
+            "inherited_message_count": int(metric["inherited_message_count"] or 0),
+            "inherited_record_count": int(metric["inherited_record_count"] or 0),
+            "fork_context_status": metric["fork_context_status"],
+            "fork_context_boundary": metric["fork_context_boundary"],
+        }
+        relationship = topology.relationship_by_id.get(session_id)
+        if relationship:
+            base["relationship"] = relationship
+        bases[session_id] = base
+    return bases
+
+
+def _conversation_members(
+    topology: _SessionTopology, root_id: str
+) -> tuple[str, ...]:
+    members: list[str] = []
+    pending = [root_id]
+    while pending:
+        session_id = pending.pop()
+        members.append(session_id)
+        pending.extend(reversed(topology.children_by_id[session_id]))
+    return tuple(members)
+
+
+def _latest_timestamp(
+    topology: _SessionTopology, session_ids: tuple[str, ...]
+) -> str | None:
+    values = [
+        str(value)
+        for session_id in session_ids
+        for value in (
+            topology.rows[session_id]["started_at"],
+            topology.rows[session_id]["ended_at"],
+        )
+        if value
+    ]
+    if not values:
+        return None
+
+    def key(value: str) -> tuple[float, str]:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return parsed.timestamp(), value
+        except ValueError:
+            return float("-inf"), value
+
+    return max(values, key=key)
+
+
+def _eligible_session_ids_by_root(
+    conn: sqlite3.Connection,
+    tr: TimeRange,
+    topology: _SessionTopology,
+    identity: IdentityContext,
+) -> dict[str, set[str]]:
+    range_where, range_params = _session_time_clause(tr)
+    in_range_ids = {
+        str(row["id"])
+        for row in conn.execute(
+            f"SELECT s.id FROM sessions s WHERE {range_where}", range_params
+        ).fetchall()
+    }
+    eligible_by_root: dict[str, set[str]] = defaultdict(set)
+    for session_id in in_range_ids:
+        navigation_id = session_id
+        if session_id in topology.hidden_ids:
+            owner_id = logical_orchestrator_id(
+                conn, session_id, context=identity
+            )
+            if owner_id not in topology.rows:
+                continue
+            navigation_id = str(owner_id)
+        root_id = topology.root_by_id.get(navigation_id)
+        if root_id in topology.roots:
+            eligible_by_root[root_id].add(session_id)
+    return dict(eligible_by_root)
+
+
+def _model_values_by_session(
+    conn: sqlite3.Connection, session_ids: set[str]
+) -> dict[str, set[str]]:
+    values: dict[str, set[str]] = {session_id: set() for session_id in session_ids}
+    if not session_ids:
+        return values
+    placeholders = ",".join("?" for _ in session_ids)
+    sessions = conn.execute(
+        f"SELECT id, model_canonical FROM sessions WHERE id IN ({placeholders})",
+        sorted(session_ids),
+    ).fetchall()
+    for row in sessions:
+        values[str(row["id"])].add(display_model(row["model_canonical"]))
+    messages = conn.execute(
+        f"""
+        SELECT model_message.session_id,
+               {strict_message_model_sql(message_alias='model_message', session_alias='model_session')} AS model_value
+        FROM messages model_message
+        JOIN sessions model_session ON model_session.id = model_message.session_id
+        WHERE model_message.session_id IN ({placeholders})
+          AND model_message.role = 'assistant'
+        """,
+        sorted(session_ids),
+    ).fetchall()
+    for row in messages:
+        values[str(row["session_id"])].add(display_model(row["model_value"]))
+    return values
+
+
+def _root_session_facets(
+    conn: sqlite3.Connection, tr: TimeRange
+) -> dict[str, Any]:
+    identity = build_identity_context(conn)
+    topology = _session_topology(conn, identity)
+    eligible_by_root = _eligible_session_ids_by_root(
+        conn, tr, topology, identity
+    )
+    members_by_root = {
+        root_id: tuple(sorted(eligible_ids))
+        for root_id, eligible_ids in eligible_by_root.items()
+    }
+    member_ids = {
+        session_id
+        for members in members_by_root.values()
+        for session_id in members
+    }
+    projections = {
+        session_id: logical_projection(
+            conn,
+            session_id,
+            str(topology.rows[session_id]["harness"]),
+            context=identity,
+        )
+        for session_id in member_ids
+    }
+    metric_id_by_session = {
+        session_id: str(
+            projections[session_id]["transcript_session_id"] or session_id
+        )
+        for session_id in member_ids
+    }
+    model_values = _model_values_by_session(
+        conn, set(metric_id_by_session.values())
+    )
+    buckets: dict[str, dict[str, int]] = {
+        key: defaultdict(int)
+        for key in ("harness", "model", "effort", "branch", "project")
+    }
+    for members in members_by_root.values():
+        values: dict[str, set[str]] = {
+            key: set() for key in buckets
+        }
+        for session_id in members:
+            row = topology.rows[session_id]
+            metric_id = metric_id_by_session[session_id]
+            metric = topology.rows.get(metric_id, row)
+            values["harness"].add(str(projections[session_id]["logical_harness"]))
+            values["model"].update(model_values.get(metric_id, set()))
+            values["effort"].add(str(metric["effort"] or "(none)"))
+            values["branch"].add(str(row["branch"] or "(none)"))
+            values["project"].add(_project_label(row["repo"], row["cwd"]))
+        for key, distinct_values in values.items():
+            for value in distinct_values:
+                buckets[key][value] += 1
+
+    def items(key: str) -> list[dict[str, Any]]:
+        return [
+            {"value": value, "count": count}
+            for value, count in sorted(
+                buckets[key].items(), key=lambda item: (-item[1], item[0])
+            )[:40]
+        ]
+
+    return {key: items(key) for key in buckets}
+
+
 def list_sessions_v2(
     conn: sqlite3.Connection,
     tr: TimeRange,
@@ -493,141 +890,176 @@ def list_sessions_v2(
     cursor: int = 0,
     limit: int = 50,
 ) -> dict[str, Any]:
-    where, params = _session_time_clause(tr)
-    clauses = [where]
-    if branch:
-        ph = ",".join(f":b{i}" for i in range(len(branch)))
-        clauses.append(f"COALESCE(NULLIF(s.branch, ''), '(none)') IN ({ph})")
-        for i, b in enumerate(branch):
-            params[f"b{i}"] = b
-    if q:
-        clauses.append(
-            """(
-            s.id LIKE :q
-            OR COALESCE(s.repo, '') LIKE :q
-            OR COALESCE(s.cwd, '') LIKE :q
-            OR COALESCE(s.model, '') LIKE :q
-            OR COALESCE(s.model_canonical, '') LIKE :q
-            OR COALESCE(s.branch, '') LIKE :q
-        )"""
-        )
-        params["q"] = f"%{q}%"
-    where_sql = " AND ".join(clauses)
     sort_key = sort if sort in _SORT_COLUMNS else "started_at"
     direction = "ASC" if order.lower() == "asc" else "DESC"
-    needs_counts_for_sort = sort_key in {"messages", "tools", "windows"}
-
-    # Materialize project labels in Python for filter correctness + consistency
-    # with _project_label (SQL path-basename is brittle for URLs).
-    rows = conn.execute(
-        f"""
-        SELECT
-            s.id, s.harness, s.model_canonical, s.model AS model_raw,
-            s.effort, s.repo, s.cwd, s.branch,
-            s.started_at, s.ended_at, s.parent_session_id,
-            {_duration_seconds_sql()} AS duration_seconds
-        FROM sessions s
-        WHERE {where_sql}
-        """,
-        params,
-    ).fetchall()
-
     identity = build_identity_context(conn)
-    candidates: list[tuple[sqlite3.Row, dict[str, Any], str]] = []
-    shadow_ids = provider_root_shadow_ids(conn, context=identity)
-    for r in rows:
-        if r["id"] in shadow_ids:
-            continue
-        projection = logical_projection(
-            conn, str(r["id"]), str(r["harness"]), context=identity
-        )
-        if harness and projection["logical_harness"] not in harness:
-            continue
-        label = _project_label(r["repo"], r["cwd"])
-        if project and label not in project:
-            continue
-        candidates.append((r, projection, label))
-
-    metric_ids = sorted(
-        {
-            str(projection["transcript_session_id"] or row["id"])
-            for row, projection, _ in candidates
-        }
+    topology = _session_topology(conn, identity)
+    eligible_by_root = _eligible_session_ids_by_root(
+        conn, tr, topology, identity
     )
-    metric_rows: dict[str, sqlite3.Row] = {}
-    if metric_ids:
-        metric_ph = ",".join("?" for _ in metric_ids)
-        metric_rows = {
-            str(metric["id"]): metric
-            for metric in conn.execute(
-                f"""
-                SELECT id, model, model_canonical, effort
-                FROM sessions
-                WHERE id IN ({metric_ph})
-                """,
+    members_by_root = {
+        root_id: _conversation_members(topology, root_id)
+        for root_id in sorted(eligible_by_root)
+    }
+    member_ids = {
+        session_id
+        for members in members_by_root.values()
+        for session_id in members
+    }
+    member_ids.update(
+        session_id
+        for eligible_ids in eligible_by_root.values()
+        for session_id in eligible_ids
+    )
+    projections = {
+        session_id: logical_projection(
+            conn,
+            session_id,
+            str(topology.rows[session_id]["harness"]),
+            context=identity,
+        )
+        for session_id in member_ids
+    }
+    metric_id_by_session = {
+        session_id: str(
+            projections[session_id]["transcript_session_id"] or session_id
+        )
+        for session_id in member_ids
+    }
+    metric_ids = sorted(set(metric_id_by_session.values()))
+
+    model_values = _model_values_by_session(conn, set(metric_ids))
+
+    def node_matches(session_id: str) -> bool:
+        row = topology.rows[session_id]
+        projection = projections[session_id]
+        metric_id = metric_id_by_session[session_id]
+        metric = topology.rows.get(metric_id, row)
+        if harness and projection["logical_harness"] not in harness:
+            return False
+        if model and not set(model).intersection(model_values.get(metric_id, set())):
+            return False
+        effort_value = metric["effort"] or "(none)"
+        if effort and effort_value not in effort:
+            return False
+        branch_value = row["branch"] or "(none)"
+        if branch and branch_value not in branch:
+            return False
+        if project and _project_label(row["repo"], row["cwd"]) not in project:
+            return False
+        if q:
+            needle = q.casefold()
+            values = (
+                session_id,
+                row["repo"],
+                row["cwd"],
+                metric["model"],
+                metric["model_canonical"],
+                row["branch"],
+            )
+            if not any(
+                needle in str(value).casefold()
+                for value in values
+                if value not in (None, "")
+            ):
+                return False
+        return True
+
+    def counts(table: str) -> dict[str, int]:
+        if not metric_ids:
+            return {}
+        placeholders = ",".join("?" for _ in metric_ids)
+        return {
+            str(row["session_id"]): int(row["c"])
+            for row in conn.execute(
+                f"SELECT session_id, COUNT(*) AS c FROM {table} "
+                f"WHERE session_id IN ({placeholders}) GROUP BY session_id",
                 metric_ids,
             ).fetchall()
         }
 
-    metric_candidates: list[
-        tuple[sqlite3.Row, dict[str, Any], str, str, sqlite3.Row | None]
-    ] = []
-    for row, projection, label in candidates:
-        metric_id = str(projection["transcript_session_id"] or row["id"])
-        metric = metric_rows.get(metric_id)
-        metric_effort = metric["effort"] if metric is not None else row["effort"]
-        effort_value = metric_effort if metric_effort not in (None, "") else "(none)"
-        if effort and effort_value not in effort:
-            continue
-        metric_candidates.append((row, projection, label, metric_id, metric))
-
-    matching_metric_ids: set[str] | None = None
-    if model:
-        metric_ids = sorted({candidate[3] for candidate in metric_candidates})
-        matching_metric_ids = set()
-        if metric_ids:
-            metric_ph = ",".join("?" for _ in metric_ids)
-            model_ph = ",".join("?" for _ in model)
-            matching_metric_ids = {
-                str(row["session_id"])
-                for row in conn.execute(
-                    f"""
-                    SELECT DISTINCT model_message.session_id
-                    FROM messages model_message
-                    JOIN sessions model_session
-                      ON model_session.id = model_message.session_id
-                    WHERE model_message.session_id IN ({metric_ph})
-                      AND model_message.role = 'assistant'
-                      AND {strict_message_model_sql(message_alias='model_message', session_alias='model_session')} IN ({model_ph})
-                    """,
-                    [*metric_ids, *model],
-                ).fetchall()
-            }
+    message_counts = counts("messages")
+    tool_counts = counts("tool_events")
+    window_counts = counts("exchange_windows")
+    has_filters = bool(harness or model or effort or branch or project or q)
 
     items: list[dict[str, Any]] = []
-    for r, projection, label, metric_id, metric in metric_candidates:
-        if matching_metric_ids is not None and metric_id not in matching_metric_ids:
+    for root_id, members in members_by_root.items():
+        matching_members = [
+            session_id
+            for session_id in eligible_by_root[root_id]
+            if node_matches(session_id)
+        ]
+        if not matching_members:
             continue
-        dur = r["duration_seconds"]
+        matching_descendant_count = (
+            sum(session_id != root_id for session_id in matching_members)
+            if has_filters
+            else 0
+        )
+        row = topology.rows[root_id]
+        projection = projections[root_id]
+        metric_id = metric_id_by_session[root_id]
+        metric = topology.rows.get(metric_id, row)
+        conversation_metric_ids = {
+            metric_id_by_session[session_id] for session_id in members
+        }
+        duration_seconds = None
+        if row["started_at"] and row["ended_at"]:
+            try:
+                started = datetime.fromisoformat(
+                    str(row["started_at"]).replace("Z", "+00:00")
+                )
+                ended = datetime.fromisoformat(
+                    str(row["ended_at"]).replace("Z", "+00:00")
+                )
+                duration_seconds = max(0, int((ended - started).total_seconds()))
+            except ValueError:
+                duration_seconds = None
         items.append(
             {
-                "id": r["id"],
-                "harness": r["harness"],
+                "id": root_id,
+                "navigation_id": root_id,
+                "parent_navigation_id": None,
+                "root_navigation_id": root_id,
+                "harness": row["harness"],
                 **projection,
-                "model": display_model(
-                    metric["model_canonical"] if metric is not None else r["model_canonical"]
+                "model": display_model(metric["model_canonical"]),
+                "effort": metric["effort"],
+                "project": _project_label(row["repo"], row["cwd"]),
+                "repo": row["repo"],
+                "branch": row["branch"],
+                "started_at": row["started_at"],
+                "activity_at": _latest_timestamp(topology, members),
+                "latest_descendant_at": _latest_timestamp(topology, members[1:]),
+                "ended_at": row["ended_at"],
+                "duration_seconds": duration_seconds,
+                "message_count": sum(
+                    message_counts.get(session_id, 0)
+                    for session_id in conversation_metric_ids
                 ),
-                "effort": metric["effort"] if metric is not None else r["effort"],
-                "project": label,
-                "repo": r["repo"],
-                "branch": r["branch"],
-                "started_at": r["started_at"],
-                "ended_at": r["ended_at"],
-                "duration_seconds": int(dur) if dur is not None and dur >= 0 else None,
-                "message_count": 0,
-                "tool_count": 0,
-                "window_count": 0,
-                "parent_session_id": r["parent_session_id"],
+                "tool_count": sum(
+                    tool_counts.get(session_id, 0)
+                    for session_id in conversation_metric_ids
+                ),
+                "window_count": sum(
+                    window_counts.get(session_id, 0)
+                    for session_id in conversation_metric_ids
+                ),
+                "child_count": len(topology.children_by_id[root_id]),
+                "descendant_count": topology.descendant_counts[root_id],
+                "is_orphan": root_id in topology.orphan_roots,
+                "matched_in_descendant": bool(
+                    has_filters
+                    and root_id not in matching_members
+                    and matching_descendant_count
+                ),
+                "matching_descendant_count": matching_descendant_count,
+                "parent_session_id": row["parent_session_id"],
+                "inherited_message_count": int(metric["inherited_message_count"] or 0),
+                "inherited_record_count": int(metric["inherited_record_count"] or 0),
+                "fork_context_status": metric["fork_context_status"],
+                "fork_context_boundary": metric["fork_context_boundary"],
                 "status": "observed",
             }
         )
@@ -636,7 +1068,7 @@ def list_sessions_v2(
 
     def sort_value(item: dict[str, Any]) -> Any:
         if sort_key == "started_at":
-            return item["started_at"] or ""
+            return item["activity_at"] or ""
         if sort_key == "duration":
             return item["duration_seconds"] if item["duration_seconds"] is not None else -1
         if sort_key == "messages":
@@ -655,54 +1087,20 @@ def list_sessions_v2(
             return item["project"]
         if sort_key == "branch":
             return item["branch"] or ""
-        return item["started_at"] or ""
-
-    def _attach_counts(target: list[dict[str, Any]]) -> None:
-        if not target:
-            return
-        ids = [it["transcript_session_id"] or it["id"] for it in target]
-        placeholders = ",".join("?" * len(ids))
-        msg = {
-            r["session_id"]: int(r["c"])
-            for r in conn.execute(
-                f"SELECT session_id, COUNT(*) AS c FROM messages "
-                f"WHERE session_id IN ({placeholders}) GROUP BY session_id",
-                ids,
-            ).fetchall()
-        }
-        tools = {
-            r["session_id"]: int(r["c"])
-            for r in conn.execute(
-                f"SELECT session_id, COUNT(*) AS c FROM tool_events "
-                f"WHERE session_id IN ({placeholders}) GROUP BY session_id",
-                ids,
-            ).fetchall()
-        }
-        windows = {
-            r["session_id"]: int(r["c"])
-            for r in conn.execute(
-                f"SELECT session_id, COUNT(*) AS c FROM exchange_windows "
-                f"WHERE session_id IN ({placeholders}) GROUP BY session_id",
-                ids,
-            ).fetchall()
-        }
-        for it in target:
-            sid = it["transcript_session_id"] or it["id"]
-            it["message_count"] = msg.get(sid, 0)
-            it["tool_count"] = tools.get(sid, 0)
-            it["window_count"] = windows.get(sid, 0)
-
-    if needs_counts_for_sort:
-        _attach_counts(items)
+        return item["activity_at"] or ""
 
     items.sort(key=lambda item: str(item["id"]))
     items.sort(key=sort_value, reverse=reverse)
     total = len(items)
     offset = max(0, cursor)
     page = items[offset : offset + limit]
-    if not needs_counts_for_sort:
-        _attach_counts(page)
     return {
+        "view": "roots",
+        "count_scope": "full_conversation",
+        "note": (
+            "Range and filters choose matching branches; counts cover each "
+            "full conversation."
+        ),
         "total": total,
         "cursor": offset,
         "next_cursor": offset + limit if offset + limit < total else None,
@@ -743,6 +1141,7 @@ def session_detail_v2(
     if s is None:
         return None
     identity = build_identity_context(conn)
+    topology = _session_topology(conn, identity)
     projection = logical_projection(
         conn, resolved_id, str(s["harness"]), context=identity
     )
@@ -812,20 +1211,24 @@ def session_detail_v2(
         """,
         (transcript_id,),
     ).fetchone()
-    children = conn.execute(
-        """
-        SELECT id, harness, model, model_canonical, effort, started_at, ended_at,
-               (SELECT COUNT(*) FROM messages m WHERE m.session_id = sessions.id) AS message_count
-        FROM sessions
-        WHERE parent_session_id IN (?, ?, ?)
-        ORDER BY COALESCE(started_at, '') ASC
-        """,
-        (
-            transcript_id,
-            transcript["external_id"],
-            f"{transcript['harness']}:{transcript['external_id']}",
-        ),
-    ).fetchall()
+
+    navigation_id = resolved_id
+    if resolved_id in topology.hidden_ids:
+        owner_id = logical_orchestrator_id(conn, resolved_id, context=identity)
+        if owner_id in topology.rows:
+            navigation_id = str(owner_id)
+    root_navigation_id = topology.root_by_id.get(navigation_id, navigation_id)
+    parent_navigation_id = topology.parent_by_id.get(navigation_id)
+    all_child_ids = topology.children_by_id.get(navigation_id, [])
+    child_ids = all_child_ids[:_DETAIL_MAX_CHILDREN]
+    total_child_count = len(all_child_ids)
+    child_bases = _session_node_bases(
+        conn,
+        topology,
+        identity,
+        set(child_ids),
+        root_navigation_id,
+    )
 
     tools_by_msg: dict[str, list[dict[str, Any]]] = defaultdict(list)
     orphan_tools: list[dict[str, Any]] = []
@@ -908,6 +1311,9 @@ def session_detail_v2(
     return {
         "session": {
             "id": s["id"],
+            "navigation_id": navigation_id,
+            "parent_navigation_id": parent_navigation_id,
+            "root_navigation_id": root_navigation_id,
             "harness": s["harness"],
             **projection,
             "model": display_model(s["model_canonical"]),
@@ -922,6 +1328,17 @@ def session_detail_v2(
             "ended_at": s["ended_at"],
             "duration_seconds": dur,
             "parent_session_id": s["parent_session_id"],
+            "child_count": total_child_count,
+            "descendant_count": topology.descendant_counts.get(navigation_id, 0),
+            "is_orphan": navigation_id in topology.orphan_roots,
+            "inherited_message_count": int(
+                transcript["inherited_message_count"] or 0
+            ),
+            "inherited_record_count": int(
+                transcript["inherited_record_count"] or 0
+            ),
+            "fork_context_status": transcript["fork_context_status"],
+            "fork_context_boundary": transcript["fork_context_boundary"],
             "artifact_id": s["artifact_id"],
             "artifact_path": s["artifact_path"],
             "external_id": s["external_id"],
@@ -931,20 +1348,26 @@ def session_detail_v2(
         "messages": [_with_display_model(m) for m in messages],
         "tool_events": [dict(t) for t in tools],
         "skills": [dict(sk) for sk in skills],
-        "children": [
-            {
-                **_with_display_model(c),
-                **logical_projection(
-                    conn, str(c["id"]), str(c["harness"]), context=identity
-                ),
-            }
-            for c in children
-        ],
+        "children": [child_bases[child_id] for child_id in child_ids],
+        "children_bounds": {
+            "limit": _DETAIL_MAX_CHILDREN,
+            "returned_child_count": len(child_ids),
+            "total_child_count": total_child_count,
+            "truncated": len(child_ids) < total_child_count,
+            "omitted_child_count": total_child_count - len(child_ids),
+        },
+        "inherited_context": {
+            "status": transcript["fork_context_status"],
+            "message_count": int(transcript["inherited_message_count"] or 0),
+            "record_count": int(transcript["inherited_record_count"] or 0),
+            "boundary": transcript["fork_context_boundary"],
+            "parent_navigation_id": parent_navigation_id,
+        },
         "anatomy": {
             "message_count": len(messages),
             "tool_count": len(tools),
             "window_count": int(windows["c"]) if windows else 0,
-            "child_count": len(children),
+            "child_count": total_child_count,
             "tokens": None,
             "cost_est": None,
         },
@@ -981,9 +1404,14 @@ def search_messages(
 def _parent_match_sql(parent_alias: str = "p", child_alias: str = "c") -> str:
     """parent_session_id is often a bare external_id, while sessions.id is harness:external_id."""
     return f"""(
-        {child_alias}.parent_session_id = {parent_alias}.id
-        OR {child_alias}.parent_session_id = {parent_alias}.external_id
-        OR {child_alias}.parent_session_id = ({parent_alias}.harness || ':' || {parent_alias}.external_id)
+        {child_alias}.harness = {parent_alias}.harness
+        AND (
+            {child_alias}.parent_session_id = {parent_alias}.id
+            OR {child_alias}.parent_session_id IN (
+                {parent_alias}.external_id,
+                {parent_alias}.harness || ':' || {parent_alias}.external_id
+            )
+        )
     )"""
 
 
@@ -995,23 +1423,25 @@ def _resolve_session(
     ).fetchone()
     if row is not None:
         return row
-    return conn.execute(
+    candidates = conn.execute(
         """
         SELECT * FROM sessions
         WHERE external_id = ?
-           OR id LIKE '%' || ?
-        ORDER BY CASE WHEN external_id = ? THEN 0 ELSE 1 END
-        LIMIT 1
+           OR external_id LIKE '%/' || ?
+           OR id LIKE '%/' || ?
+        ORDER BY id
         """,
         (session_id, session_id, session_id),
-    ).fetchone()
+    ).fetchall()
+    unique = {str(candidate["id"]): candidate for candidate in candidates}
+    return next(iter(unique.values())) if len(unique) == 1 else None
 
 
 def orchestration_overview(
     conn: sqlite3.Connection, tr: TimeRange, *, limit: int = 40
 ) -> dict[str, Any]:
     where, params = _session_time_clause(tr, alias="p")
-    root_edges = conn.execute(
+    candidate_rows = conn.execute(
         f"""
         SELECT
             p.id,
@@ -1022,14 +1452,22 @@ def orchestration_overview(
             p.repo,
             p.cwd,
             p.started_at,
-            p.ended_at,
-            c.id AS child_id
+            p.ended_at
         FROM sessions p
-        JOIN sessions c ON {_parent_match_sql("p", "c")}
         WHERE {where}
         """,
         params,
     ).fetchall()
+    candidates_by_id = {str(row["id"]): row for row in candidate_rows}
+    implicit_parents = resolve_implicit_parent_ids(
+        conn.execute(
+            "SELECT id, harness, external_id, parent_session_id FROM sessions"
+        ).fetchall()
+    )
+    children_by_root: dict[str, set[str]] = {}
+    for child_id, parent_id in implicit_parents.items():
+        if parent_id in candidates_by_id:
+            children_by_root.setdefault(parent_id, set()).add(child_id)
 
     identity = build_identity_context(conn)
     kind_where, kind_params = _session_time_clause(tr)
@@ -1063,12 +1501,10 @@ def orchestration_overview(
         ).fetchall()
         signals = {r["request_kind"]: int(r["c"]) for r in kinds}
     root_shadow_ids = provider_root_shadow_ids(conn, context=identity)
-    physical_roots: dict[str, sqlite3.Row] = {}
-    children_by_root: dict[str, set[str]] = {}
-    for edge in root_edges:
-        physical_id = str(edge["id"])
-        physical_roots.setdefault(physical_id, edge)
-        children_by_root.setdefault(physical_id, set()).add(str(edge["child_id"]))
+    physical_roots = {
+        root_id: candidates_by_id[root_id]
+        for root_id in children_by_root
+    }
 
     link_children_by_source: dict[str, set[str]] = {}
     for source_id, backings in identity.backings_by_source.items():
@@ -1230,159 +1666,83 @@ def orchestration_overview(
 def orchestration_tree(
     conn: sqlite3.Connection, session_id: str
 ) -> dict[str, Any] | None:
-    root = _resolve_session(conn, session_id)
-    if root is None:
+    requested = _resolve_session(conn, session_id)
+    if requested is None:
         return None
     identity = build_identity_context(conn)
-    metric_rows: dict[str, sqlite3.Row | None] = {}
+    topology = _session_topology(conn, identity)
+    requested_id = str(requested["id"])
+    requested_navigation_id = requested_id
+    if requested_id in topology.hidden_ids:
+        owner_id = logical_orchestrator_id(conn, requested_id, context=identity)
+        if owner_id in topology.rows:
+            requested_navigation_id = str(owner_id)
+    root_id = topology.root_by_id.get(
+        requested_navigation_id, requested_navigation_id
+    )
+    if root_id not in topology.rows or root_id in topology.hidden_ids:
+        return None
 
-    def metric_row(session_id: str) -> sqlite3.Row | None:
-        if session_id not in metric_rows:
-            metric_rows[session_id] = conn.execute(
-                """
-                SELECT model, model_canonical, effort
-                FROM sessions
-                WHERE id = ?
-                """,
-                (session_id,),
-            ).fetchone()
-        return metric_rows[session_id]
-
-    def children_of(row: sqlite3.Row) -> list[sqlite3.Row]:
-        return conn.execute(
-            """
-            SELECT * FROM sessions
-            WHERE parent_session_id IN (?, ?, ?)
-            ORDER BY COALESCE(started_at, '') ASC
-            """,
-            (
-                row["id"],
-                row["external_id"],
-                f"{row['harness']}:{row['external_id']}",
-            ),
-        ).fetchall()
-
-    def node_ids(nodes: list[dict[str, Any]]) -> set[str]:
-        seen: set[str] = set()
-        pending = list(nodes)
-        while pending:
-            node = pending.pop()
-            node_id = str(node["id"])
-            if node_id in seen:
-                continue
-            seen.add(node_id)
-            pending.extend(node["children"])
-        return seen
-
-    def node_for(row: sqlite3.Row, depth: int = 0) -> dict[str, Any]:
-        # Guard pathological cycles / extreme fan-out depth.
-        if depth > 12:
-            kids: list[sqlite3.Row] = []
-        else:
-            kids = children_of(row)
-        relationships: dict[str, str] = {}
-        provider_links: list[dict[str, Any]] = []
-        root_target_ids: set[str] = set()
-        if row["harness"] == "t3code":
-            known = {str(k["id"]) for k in kids}
-            provider_links = provider_backings(
-                conn, str(row["id"]), context=identity
+    branch_ids: list[str] = []
+    pending = [(root_id, 0)]
+    while pending and len(branch_ids) < _TREE_MAX_NODES:
+        current, depth = pending.pop()
+        branch_ids.append(current)
+        if depth < _TREE_MAX_DEPTH:
+            pending.extend(
+                (child_id, depth + 1)
+                for child_id in reversed(topology.children_by_id[current])
             )
-            for backing in provider_root_backings(
-                conn, str(row["id"]), context=identity
-            ):
-                target_id = backing["target_session_id"]
-                if target_id:
-                    root_target_ids.add(str(target_id))
-                if not target_id:
-                    continue
-                target = conn.execute(
-                    "SELECT * FROM sessions WHERE id = ?", (target_id,)
-                ).fetchone()
-                if target is None:
-                    continue
-                for child in children_of(target):
-                    child_id = str(child["id"])
-                    if child_id in known:
-                        continue
-                    kids.append(child)
-                    known.add(child_id)
-        projection = logical_projection(
-            conn, str(row["id"]), str(row["harness"]), context=identity
+    emitted_ids = set(branch_ids)
+    bases = _session_node_bases(
+        conn, topology, identity, emitted_ids, root_id
+    )
+
+    nodes: dict[str, dict[str, Any]] = {}
+    returned_subtree_counts: dict[str, int] = {}
+    for node_id in reversed(branch_ids):
+        emitted_children = [
+            child_id
+            for child_id in topology.children_by_id[node_id]
+            if child_id in emitted_ids
+        ]
+        returned_descendant_count = sum(
+            returned_subtree_counts[child_id] for child_id in emitted_children
         )
-        count_session_id = projection["transcript_session_id"] or str(row["id"])
-        metric = metric_row(count_session_id) or row
-        msg_n = conn.execute(
-            "SELECT COUNT(*) AS c FROM messages WHERE session_id = ?",
-            (count_session_id,),
-        ).fetchone()
-        tool_n = conn.execute(
-            "SELECT COUNT(*) AS c FROM tool_events WHERE session_id = ?",
-            (count_session_id,),
-        ).fetchone()
-        node = {
-            "id": row["id"],
-            "harness": row["harness"],
-            **projection,
-            "model": display_model(metric["model_canonical"]),
-            "model_raw": metric["model"],
-            "effort": metric["effort"],
-            "project": _project_label(row["repo"], row["cwd"]),
-            "started_at": row["started_at"],
-            "ended_at": row["ended_at"],
-            "message_count": int(msg_n["c"]) if msg_n else 0,
-            "tool_count": int(tool_n["c"]) if tool_n else 0,
-            "children": [node_for(k, depth + 1) for k in kids],
+        omitted_descendant_count = max(
+            0,
+            topology.descendant_counts.get(node_id, 0)
+            - returned_descendant_count,
+        )
+        returned_subtree_counts[node_id] = returned_descendant_count + 1
+        nodes[node_id] = {
+            **bases[node_id],
+            "children_truncated": omitted_descendant_count > 0,
+            "omitted_descendant_count": omitted_descendant_count,
+            "children": [
+                nodes[child_id]
+                for child_id in emitted_children
+            ],
         }
-        if row["harness"] == "t3code":
-            reachable = node_ids(node["children"])
-            for backing in provider_links:
-                target_id = backing["target_session_id"]
-                if not target_id or str(target_id) in root_target_ids:
-                    continue
-                if str(target_id) in reachable:
-                    continue
-                target = conn.execute(
-                    "SELECT * FROM sessions WHERE id = ?", (target_id,)
-                ).fetchone()
-                if target is None:
-                    continue
-                child = node_for(target, depth + 1)
-                node["children"].append(child)
-                relationships[str(target_id)] = "provider_worker"
-                reachable.update(node_ids([child]))
-        for child in node["children"]:
-            relation = relationships.get(str(child["id"]))
-            if relation:
-                child["relationship"] = relation
-        return node
-
-    # If caller passed a child, walk up to the true root for a full tree.
-    walk = root
-    seen: set[str] = set()
-    while walk["parent_session_id"] and walk["id"] not in seen:
-        seen.add(walk["id"])
-        parent = _resolve_session(conn, walk["parent_session_id"])
-        if parent is None:
-            break
-        walk = parent
-
-    owner_id = logical_orchestrator_id(conn, str(walk["id"]), context=identity)
-    if owner_id:
-        owner = conn.execute(
-            "SELECT * FROM sessions WHERE id = ?", (owner_id,)
-        ).fetchone()
-        if owner is not None:
-            walk = owner
-
-    tree = node_for(walk)
+    tree = nodes[root_id]
+    total_node_count = topology.descendant_counts.get(root_id, 0) + 1
+    returned_node_count = len(branch_ids)
     return {
-        "root_id": walk["id"],
+        "root_id": root_id,
         "requested_id": session_id,
+        "requested_navigation_id": requested_navigation_id,
+        "bounds": {
+            "max_nodes": _TREE_MAX_NODES,
+            "max_depth": _TREE_MAX_DEPTH,
+            "returned_node_count": returned_node_count,
+            "total_node_count": total_node_count,
+            "truncated": returned_node_count < total_node_count,
+            "omitted_node_count": total_node_count - returned_node_count,
+        },
         "tree": tree,
         "note": (
-            "Supervisor → worker tree from parent_session_id links "
-            "(matches id or bare external_id)."
+            "Session tree from resolved physical parents and observed worker links. "
+            "Provider transcript shadows are provenance, not duplicate nodes."
         ),
     }
 

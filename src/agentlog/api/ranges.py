@@ -5,6 +5,15 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 
+_INDEX_SCAN_MARGIN = timedelta(days=1)
+
+
+def _utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
 @dataclass(frozen=True)
 class TimeRange:
     key: str
@@ -15,11 +24,11 @@ class TimeRange:
 
     @property
     def start_iso(self) -> str | None:
-        return self.start.isoformat() if self.start else None
+        return _utc(self.start).isoformat() if self.start else None
 
     @property
     def end_iso(self) -> str:
-        return self.end.isoformat()
+        return _utc(self.end).isoformat()
 
 
 def _parse_iso(value: str) -> datetime:
@@ -92,17 +101,38 @@ def session_time_clause(
     end_param: str = "end",
     alias: str = "s",
 ) -> tuple[str, dict[str, Any]]:
-    """Index-friendly session time filter matching COALESCE(started_at, '') semantics.
+    """Offset-safe session time filter with an index-backed candidate scan.
 
     With a start bound, NULL started_at is excluded (empty string fails >= start).
     With only an end bound (range=all), NULL started_at is included.
-    Avoids wrapping started_at in COALESCE so idx_sessions_started can range-scan.
+    The one-day lexical window covers every valid ISO offset; julianday applies
+    the exact instant comparison after idx_sessions_started narrows candidates.
     """
-    params: dict[str, Any] = {end_param: tr.end_iso}
+    end = _utc(tr.end)
+    end_scan_param = f"{end_param}_scan"
+    params: dict[str, Any] = {
+        end_param: end.isoformat(),
+        end_scan_param: (end + _INDEX_SCAN_MARGIN).isoformat(),
+    }
     col = f"{alias}.started_at"
     if tr.start is not None:
-        params[start_param] = tr.start_iso
-        clause = f"{col} >= :{start_param} AND {col} < :{end_param}"
+        start = _utc(tr.start)
+        start_scan_param = f"{start_param}_scan"
+        params[start_param] = start.isoformat()
+        params[start_scan_param] = (
+            start - _INDEX_SCAN_MARGIN
+        ).isoformat()
+        clause = (
+            f"{col} >= :{start_scan_param} "
+            f"AND {col} < :{end_scan_param} "
+            f"AND julianday({col}) >= julianday(:{start_param}) "
+            f"AND julianday({col}) < julianday(:{end_param})"
+        )
     else:
-        clause = f"({col} IS NULL OR {col} < :{end_param})"
+        clause = (
+            f"({col} IS NULL OR ("
+            f"{col} < :{end_scan_param} "
+            f"AND julianday({col}) < julianday(:{end_param})"
+            f"))"
+        )
     return clause, params

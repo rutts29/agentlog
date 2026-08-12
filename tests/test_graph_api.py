@@ -92,6 +92,66 @@ class GraphApiTests(unittest.TestCase):
         self.assertEqual(by_id["codex:kid-1"]["parent_id"], "codex:sup-1")
         self.assertEqual(by_id["codex:kid-2"]["parent_id"], "codex:sup-1")
 
+    def test_orchestration_edges_reject_cross_harness_parent_collisions(self) -> None:
+        conn = connect(self.path)
+        conn.executemany(
+            """
+            INSERT INTO sessions
+              (id, harness, external_id, parent_session_id, started_at, ended_at, cwd)
+            VALUES (?, ?, ?, ?, '2026-07-01T00:02:00+00:00',
+                    '2026-07-01T00:03:00+00:00', '/tmp/foreign')
+            """,
+            [
+                ("cursor:qualified", "cursor", "qualified", "codex:sup-1"),
+                ("claude:bare", "claude", "bare", "sup-1"),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        body = self._get()
+        by_id = {
+            node["id"]: node
+            for node in body["nodes"]
+            if node["kind"] == "session"
+        }
+        self.assertIsNone(by_id["cursor:qualified"]["parent_id"])
+        self.assertIsNone(by_id["claude:bare"]["parent_id"])
+
+    def test_typed_provider_worker_link_is_the_only_cross_harness_edge(self) -> None:
+        conn = connect(self.path)
+        conn.executescript(
+            """
+            INSERT INTO sessions
+              (id, harness, external_id, started_at, ended_at, cwd)
+            VALUES ('t3code:owner', 't3code', 'owner',
+                    '2026-07-01T00:00:00+00:00', '2026-07-01T00:05:00+00:00',
+                    '/tmp/alpha'),
+                   ('codex:typed-worker', 'codex', 'typed-worker',
+                    '2026-07-01T00:01:00+00:00', '2026-07-01T00:04:00+00:00',
+                    '/tmp/alpha');
+            INSERT INTO session_links
+              (source_session_id, target_session_id, link_type, target_harness,
+               target_external_id, link_role)
+            VALUES ('t3code:owner', 'codex:typed-worker', 'provider_backing',
+                    'codex', 'typed-worker', 'worker');
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        body = self._get()
+        nodes = {
+            node["id"]: node for node in body["nodes"] if node["kind"] == "session"
+        }
+        self.assertEqual(nodes["codex:typed-worker"]["parent_id"], "t3code:owner")
+        edges = {
+            (edge["source"], edge["target"])
+            for edge in body["edges"]
+            if edge["kind"] == "orchestration"
+        }
+        self.assertIn(("t3code:owner", "codex:typed-worker"), edges)
+
     def test_membership_edges_link_every_session_to_its_repo(self) -> None:
         body = self._get()
         member = [e for e in body["edges"] if e["kind"] == "membership"]

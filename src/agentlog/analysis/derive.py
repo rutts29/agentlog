@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from agentlog.analysis.extractors.deterministic import (
+    DeterministicInputChanged,
     KIND_DETERMINISTIC,
     corpus_fingerprint,
     iter_window_input_rows,
@@ -234,7 +235,15 @@ def run_derive(
             notes=["no stale windows; watermark refreshed"],
         )
 
-    report, run_id = run_deterministic(conn, window_ids=targets)
+    try:
+        report, run_id = run_deterministic(
+            conn,
+            window_ids=targets,
+            expected_window_fps=window_fps,
+        )
+    except DeterministicInputChanged:
+        conn.rollback()
+        raise
     classified_after = _classified_count(conn)
     write_watermark(
         conn,

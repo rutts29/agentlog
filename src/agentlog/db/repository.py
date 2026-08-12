@@ -127,8 +127,24 @@ def _uid(session_id: str, usage_source: str, seq: int) -> str:
     return hashlib.sha1(raw.encode()).hexdigest()[:24]
 
 
+def _nonnegative_int(value: object) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _optional_text(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
 _SESSION_IDENTITY_COLUMNS = (
     "parent_session_id",
+    "originator",
+    "thread_source",
     "started_at",
     "ended_at",
     "repo",
@@ -370,12 +386,21 @@ class Repository:
         result: ParseResult,
         *,
         artifact_id: int | None,
+        replace_transcript_identity: bool = False,
+        replace_source_identity: bool = False,
+        replace_fork_provenance: bool = False,
     ) -> None:
         from agentlog.ingest.cursor import prefer_repo
 
         session = result.session
         row = self.conn.execute(
-            "SELECT repo, cwd, parent_session_id FROM sessions WHERE id = ?",
+            """
+            SELECT repo, cwd, parent_session_id, started_at,
+                   originator, thread_source,
+                   inherited_message_count, inherited_record_count,
+                   fork_context_status, fork_context_boundary
+            FROM sessions WHERE id = ?
+            """,
             (session_id,),
         ).fetchone()
         if row is None:
@@ -384,7 +409,101 @@ class Repository:
         cwd = session.cwd if repo == session.repo and session.cwd else row["cwd"]
         if repo != row["repo"] and session.cwd:
             cwd = session.cwd
-        parent = session.parent_session_id or row["parent_session_id"]
+        parent = (
+            session.parent_session_id
+            if replace_transcript_identity
+            else session.parent_session_id or row["parent_session_id"]
+        )
+        started_at = (
+            _iso(session.started_at)
+            if replace_transcript_identity
+            else row["started_at"]
+        )
+        originator = (
+            session.originator
+            if replace_source_identity
+            else session.originator or row["originator"]
+        )
+        thread_source = (
+            session.thread_source
+            if replace_source_identity
+            else session.thread_source or row["thread_source"]
+        )
+        extras = result.extras
+        inherited_message_count = (
+            _nonnegative_int(extras.get("inherited_message_count"))
+            if replace_fork_provenance or "inherited_message_count" in extras
+            else int(row["inherited_message_count"])
+        )
+        inherited_record_count = (
+            _nonnegative_int(extras.get("inherited_record_count"))
+            if replace_fork_provenance or "inherited_record_count" in extras
+            else int(row["inherited_record_count"])
+        )
+        fork_context_status = (
+            _optional_text(extras.get("fork_context_status"))
+            if replace_fork_provenance or "fork_context_status" in extras
+            else row["fork_context_status"]
+        )
+        fork_context_boundary = (
+            _optional_text(extras.get("fork_context_boundary"))
+            if replace_fork_provenance or "fork_context_boundary" in extras
+            else row["fork_context_boundary"]
+        )
+        if replace_transcript_identity:
+            ident = _identity_for(
+                session.model,
+                provider_hint=session.provider,
+                agent_profile_hint=session.agent_profile,
+            )
+            self.conn.execute(
+                """
+                UPDATE sessions SET
+                    parent_session_id = ?,
+                    started_at = ?,
+                    ended_at = ?,
+                    repo = ?,
+                    cwd = ?,
+                    branch = ?,
+                    commit_sha = ?,
+                    model = ?,
+                    model_canonical = ?,
+                    provider = ?,
+                    agent_profile = ?,
+                    effort = ?,
+                    effort_source = ?,
+                    originator = ?,
+                    thread_source = ?,
+                    inherited_message_count = ?,
+                    inherited_record_count = ?,
+                    fork_context_status = ?,
+                    fork_context_boundary = ?
+                WHERE id = ?
+                """,
+                (
+                    session.parent_session_id,
+                    _iso(session.started_at),
+                    _iso(session.ended_at),
+                    session.repo,
+                    session.cwd,
+                    session.branch,
+                    session.commit_sha,
+                    session.model,
+                    ident.canonical,
+                    ident.provider,
+                    ident.agent_profile,
+                    session.effort,
+                    session.effort_source,
+                    session.originator,
+                    session.thread_source,
+                    _nonnegative_int(extras.get("inherited_message_count")),
+                    _nonnegative_int(extras.get("inherited_record_count")),
+                    _optional_text(extras.get("fork_context_status")),
+                    _optional_text(extras.get("fork_context_boundary")),
+                    session_id,
+                ),
+            )
+            return
         if session.model is not None:
             ident = _identity_for(
                 session.model,
@@ -394,6 +513,7 @@ class Repository:
             self.conn.execute(
                 """
                 UPDATE sessions SET
+                    started_at = ?,
                     ended_at = COALESCE(?, ended_at),
                     model = ?,
                     model_canonical = ?,
@@ -405,11 +525,18 @@ class Repository:
                     branch = COALESCE(?, branch),
                     commit_sha = COALESCE(?, commit_sha),
                     repo = ?,
-                    parent_session_id = COALESCE(?, parent_session_id),
+                    parent_session_id = ?,
+                    originator = ?,
+                    thread_source = ?,
+                    inherited_message_count = ?,
+                    inherited_record_count = ?,
+                    fork_context_status = ?,
+                    fork_context_boundary = ?,
                     artifact_id = COALESCE(?, artifact_id)
                 WHERE id = ?
                 """,
                 (
+                    started_at,
                     _iso(session.ended_at),
                     session.model,
                     ident.canonical,
@@ -422,6 +549,12 @@ class Repository:
                     session.commit_sha,
                     repo,
                     parent,
+                    originator,
+                    thread_source,
+                    inherited_message_count,
+                    inherited_record_count,
+                    fork_context_status,
+                    fork_context_boundary,
                     artifact_id,
                     session_id,
                 ),
@@ -430,6 +563,7 @@ class Repository:
             self.conn.execute(
                 """
                 UPDATE sessions SET
+                    started_at = ?,
                     ended_at = COALESCE(?, ended_at),
                     provider = COALESCE(?, provider),
                     agent_profile = COALESCE(?, agent_profile),
@@ -439,11 +573,18 @@ class Repository:
                     branch = COALESCE(?, branch),
                     commit_sha = COALESCE(?, commit_sha),
                     repo = ?,
-                    parent_session_id = COALESCE(?, parent_session_id),
+                    parent_session_id = ?,
+                    originator = ?,
+                    thread_source = ?,
+                    inherited_message_count = ?,
+                    inherited_record_count = ?,
+                    fork_context_status = ?,
+                    fork_context_boundary = ?,
                     artifact_id = COALESCE(?, artifact_id)
                 WHERE id = ?
                 """,
                 (
+                    started_at,
                     _iso(session.ended_at),
                     session.provider,
                     session.agent_profile,
@@ -454,6 +595,12 @@ class Repository:
                     session.commit_sha,
                     repo,
                     parent,
+                    originator,
+                    thread_source,
+                    inherited_message_count,
+                    inherited_record_count,
+                    fork_context_status,
+                    fork_context_boundary,
                     artifact_id,
                     session_id,
                 ),
@@ -582,11 +729,35 @@ class Repository:
         )
         incoming_links = list(result.extras.get("session_links", []))
         links = previous_links + incoming_links
+        inherited_message_count = _nonnegative_int(
+            result.extras.get("inherited_message_count")
+        )
+        inherited_record_count = _nonnegative_int(
+            result.extras.get("inherited_record_count")
+        )
+        fork_context_status = _optional_text(
+            result.extras.get("fork_context_status")
+        )
+        fork_context_boundary = _optional_text(
+            result.extras.get("fork_context_boundary")
+        )
 
         if (
             preserve_existing_legacy
             and existing_storage == LEGACY_MATERIALIZED
         ):
+            if self.session_artifact_id(session_id) == artifact_id:
+                self._merge_session_metadata(
+                    session_id,
+                    result,
+                    artifact_id=None,
+                    replace_source_identity=not append,
+                    replace_fork_provenance=not append,
+                )
+                self.replace_session_links(session_id, links)
+                self.resolve_session_links(
+                    session.harness.value, session.external_id
+                )
             return session_id
 
         if (
@@ -599,7 +770,12 @@ class Repository:
             if existing_storage == SOURCE_BACKED:
                 self._assert_source_prefix(session_id, result)
                 self._merge_session_metadata(
-                    session_id, result, artifact_id=None
+                    session_id,
+                    result,
+                    artifact_id=None,
+                    replace_transcript_identity=True,
+                    replace_source_identity=True,
+                    replace_fork_provenance=True,
                 )
             else:
                 existing_n = self.max_message_seq(session_id)
@@ -613,6 +789,12 @@ class Repository:
                         session_id,
                         result,
                         artifact_id=None,
+                        replace_source_identity=(
+                            self.session_artifact_id(session_id) == artifact_id
+                        ),
+                        replace_fork_provenance=(
+                            self.session_artifact_id(session_id) == artifact_id
+                        ),
                     )
                     self.replace_session_links(
                         session_id,
@@ -627,10 +809,13 @@ class Repository:
                     """
                     INSERT INTO sessions (
                         id, harness, external_id, parent_session_id, artifact_id,
+                        originator, thread_source,
+                        inherited_message_count, inherited_record_count,
+                        fork_context_status, fork_context_boundary,
                         started_at, ended_at, repo, cwd, branch, commit_sha,
                         model, model_canonical, provider, agent_profile,
                         effort, effort_source, transcript_storage
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         session_id,
@@ -638,6 +823,12 @@ class Repository:
                         session.external_id,
                         session.parent_session_id,
                         artifact_id,
+                        session.originator,
+                        session.thread_source,
+                        inherited_message_count,
+                        inherited_record_count,
+                        fork_context_status,
+                        fork_context_boundary,
                         _iso(session.started_at),
                         _iso(session.ended_at),
                         session.repo,
@@ -855,6 +1046,212 @@ class Repository:
             )
 
         return session_id
+
+    def assert_no_claim_evidence_for_transcript_rewrite(
+        self, session_id: str
+    ) -> None:
+        evidence = self.conn.execute(
+            """
+            SELECT ce.id
+            FROM claim_evidence ce
+            WHERE ce.session_id = ?
+               OR instr(COALESCE(ce.message_id, ''), ? || ':m:') = 1
+               OR ce.message_id IN (
+                    SELECT id FROM messages WHERE session_id = ?
+                  )
+               OR ce.window_id IN (
+                    SELECT id FROM exchange_windows WHERE session_id = ?
+                  )
+            LIMIT 1
+            """,
+            (session_id, session_id, session_id, session_id),
+        ).fetchone()
+        if evidence is not None:
+            raise TranscriptStorageError(
+                f"source-backed session {session_id} has claim evidence; "
+                "transcript rewrite refused"
+            )
+
+    def legacy_continuation_status(
+        self, *, artifact_id: int, result: ParseResult
+    ) -> str | None:
+        session_id = _sid(
+            result.session.harness.value, result.session.external_id
+        )
+        row = self.conn.execute(
+            "SELECT artifact_id, transcript_storage FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        if (
+            row is None
+            or row["transcript_storage"] != LEGACY_MATERIALIZED
+            or row["artifact_id"] != artifact_id
+        ):
+            return None
+        stored = self.conn.execute(
+            "SELECT seq, role, content_hash FROM messages "
+            "WHERE session_id = ? ORDER BY seq",
+            (session_id,),
+        ).fetchall()
+        if len(result.messages) < len(stored):
+            return "shrunk"
+        for row, message in zip(stored, result.messages):
+            if (
+                int(row["seq"]) != message.seq
+                or str(row["role"]) != message.role
+                or str(row["content_hash"]) != message.content_hash
+            ):
+                return "diverged"
+        return "extension" if len(result.messages) > len(stored) else "unchanged"
+
+    def record_source_sync_diagnostic(
+        self, session_id: str, *, status: str, warning: str | None
+    ) -> None:
+        self.conn.execute(
+            "UPDATE sessions SET source_sync_status = ?, "
+            "source_sync_warning = ?, source_sync_checked_at = ? WHERE id = ?",
+            (
+                status,
+                warning,
+                datetime.now().astimezone().isoformat(),
+                session_id,
+            ),
+        )
+
+    def _assert_no_task_cluster_for_transcript_rewrite(
+        self, session_id: str
+    ) -> None:
+        cluster = self.conn.execute(
+            """
+            SELECT tc.id
+            FROM task_clusters tc
+            WHERE tc.root_session_id = ?
+               OR tc.segment_start_message_id IN (
+                    SELECT id FROM messages WHERE session_id = ?
+                  )
+               OR tc.segment_end_message_id IN (
+                    SELECT id FROM messages WHERE session_id = ?
+                  )
+            LIMIT 1
+            """,
+            (session_id, session_id, session_id),
+        ).fetchone()
+        if cluster is not None:
+            raise TranscriptStorageError(
+                f"session {session_id} has a derived task cluster; "
+                "transcript rewrite refused"
+            )
+
+    def promote_legacy_continuation(
+        self,
+        *,
+        artifact_id: int,
+        result: ParseResult,
+        windows: Iterable[
+            tuple[str, str, str]
+            | tuple[str, str, str, str]
+            | tuple[str, str, str, str, str]
+        ],
+    ) -> str | None:
+        session_id = _sid(
+            result.session.harness.value, result.session.external_id
+        )
+        status = self.legacy_continuation_status(
+            artifact_id=artifact_id, result=result
+        )
+        if status in {"diverged", "shrunk"}:
+            verb = "shrank" if status == "shrunk" else "diverged"
+            raise TranscriptStorageError(
+                f"legacy session {session_id} {verb} in its canonical source"
+            )
+        if status != "extension":
+            return None
+        self.assert_no_claim_evidence_for_transcript_rewrite(session_id)
+        self._assert_no_task_cluster_for_transcript_rewrite(session_id)
+
+        with _savepoint(self.conn, "promote_legacy_continuation"):
+            for table in ("tool_events", "skill_exposures", "token_usage"):
+                self.conn.execute(
+                    f"DELETE FROM {table} WHERE session_id = ?",
+                    (session_id,),
+                )
+            self.conn.execute(
+                "UPDATE messages SET text = '' WHERE session_id = ?",
+                (session_id,),
+            )
+            self.conn.execute(
+                "UPDATE sessions SET transcript_storage = ?, "
+                "source_sync_status = 'current', source_sync_warning = NULL, "
+                "source_sync_checked_at = ? WHERE id = ?",
+                (
+                    SOURCE_BACKED,
+                    datetime.now().astimezone().isoformat(),
+                    session_id,
+                ),
+            )
+            promoted_id = self.save_parse_result(
+                artifact_id=artifact_id,
+                result=result,
+                append=False,
+                transcript_storage=SOURCE_BACKED,
+            )
+            self.replace_exchange_windows(promoted_id, windows)
+        return promoted_id
+
+    def rewrite_source_backed_parse_result(
+        self,
+        *,
+        artifact_id: int,
+        result: ParseResult,
+        windows: Iterable[
+            tuple[str, str, str]
+            | tuple[str, str, str, str]
+            | tuple[str, str, str, str, str]
+        ],
+        previous_parser_version: str,
+        current_parser_version: str,
+    ) -> str:
+        session = result.session
+        session_id = _sid(session.harness.value, session.external_id)
+        if previous_parser_version == current_parser_version:
+            raise TranscriptStorageError(
+                f"source-backed session {session_id} requires a parser version "
+                "change for an exact rewrite"
+            )
+        if self.session_transcript_storage(session_id) != SOURCE_BACKED:
+            raise TranscriptStorageError(
+                f"session {session_id} is not source-backed"
+            )
+        if self.session_artifact_id(session_id) != artifact_id:
+            raise TranscriptStorageError(
+                f"source-backed session {session_id} belongs to another artifact"
+            )
+        self.assert_no_claim_evidence_for_transcript_rewrite(session_id)
+        self._assert_no_task_cluster_for_transcript_rewrite(session_id)
+
+        with _savepoint(self.conn, "rewrite_source_backed_parse_result"):
+            self.conn.execute(
+                "DELETE FROM exchange_windows WHERE session_id = ?",
+                (session_id,),
+            )
+            for table in (
+                "tool_events",
+                "skill_exposures",
+                "token_usage",
+                "messages",
+            ):
+                self.conn.execute(
+                    f"DELETE FROM {table} WHERE session_id = ?",
+                    (session_id,),
+                )
+            rewritten_id = self.save_parse_result(
+                artifact_id=artifact_id,
+                result=result,
+                append=False,
+                transcript_storage=SOURCE_BACKED,
+            )
+            self.replace_exchange_windows(rewritten_id, windows)
+        return rewritten_id
 
     def max_message_seq(self, session_id: str) -> int:
         row = self.conn.execute(

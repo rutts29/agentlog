@@ -22,7 +22,9 @@ from agentlog.api.model_rollup import (
     SESSION_START_MODEL,
     SESSION_START_MODEL_SQL,
 )
-from agentlog.source_reader import read_source_transcript
+from agentlog.source_reader import (
+    CachedSourceTranscriptReader,
+)
 
 DEFAULT_SESSION_LIMIT = 10
 MAX_SESSION_LIMIT = 50
@@ -80,12 +82,16 @@ def _duration_seconds_sql(alias: str = "s") -> str:
     """
 
 
-def _first_user_preview(conn: sqlite3.Connection, session_id: str) -> str | None:
+def _first_user_preview(
+    conn: sqlite3.Connection,
+    session_id: str,
+    source_reader: CachedSourceTranscriptReader | None = None,
+) -> str | None:
     storage = conn.execute(
         "SELECT transcript_storage FROM sessions WHERE id = ?", (session_id,)
     ).fetchone()
     if storage is not None and storage["transcript_storage"] == "source_backed":
-        source = read_source_transcript(conn, session_id)
+        source = (source_reader or CachedSourceTranscriptReader())(conn, session_id)
         if not source.ready:
             return None
         for message in source.messages:
@@ -110,7 +116,11 @@ def _first_user_preview(conn: sqlite3.Connection, session_id: str) -> str | None
     return preview or None
 
 
-def _session_meta(conn: sqlite3.Connection, session_id: str) -> dict[str, Any] | None:
+def _session_meta(
+    conn: sqlite3.Connection,
+    session_id: str,
+    source_reader: CachedSourceTranscriptReader | None = None,
+) -> dict[str, Any] | None:
     row = conn.execute(
         f"""
         SELECT
@@ -141,7 +151,9 @@ def _session_meta(conn: sqlite3.Connection, session_id: str) -> dict[str, Any] |
     source = None
     source_read = None
     if transcript_storage == "source_backed":
-        source_read = read_source_transcript(conn, transcript_id)
+        source_read = (source_reader or CachedSourceTranscriptReader())(
+            conn, transcript_id
+        )
         source = {
             "status": source_read.status,
             "identity": source_read.source_identity,
@@ -159,7 +171,7 @@ def _session_meta(conn: sqlite3.Connection, session_id: str) -> dict[str, Any] |
             None,
         )
     else:
-        title = _first_user_preview(conn, transcript_id)
+        title = _first_user_preview(conn, transcript_id, source_reader)
     message_count = int(row["message_count"])
     if source_read is not None and source_read.ready:
         message_count = len(source_read.messages)
@@ -215,6 +227,7 @@ def search_sessions(
     session_ids: list[str] = []
     seen: set[str] = set()
     provenance: dict[str, str] = {}
+    source_reader = CachedSourceTranscriptReader()
     match = _fts_match(q)
     session_columns = {
         str(row[1]) for row in conn.execute("PRAGMA table_info(sessions)").fetchall()
@@ -277,7 +290,7 @@ def search_sessions(
             ).fetchone()
             if metric_row is None or metric_row["transcript_storage"] != "source_backed":
                 continue
-            result = read_source_transcript(conn, source_session.metric_session_id)
+            result = source_reader(conn, source_session.metric_session_id)
             if not result.ready:
                 continue
             if not any(
@@ -338,7 +351,7 @@ def search_sessions(
     for sid in session_ids:
         if len(sessions) >= limit:
             break
-        meta = _session_meta(conn, sid)
+        meta = _session_meta(conn, sid, source_reader)
         if meta is not None:
             meta["provenance"] = provenance.get(sid, "metadata")
             sessions.append(meta)
@@ -359,10 +372,11 @@ def get_session(
     message_limit: int = DEFAULT_MESSAGE_LIMIT,
 ) -> dict[str, Any]:
     """Return session detail; messages are truncated and capped."""
-    meta = _session_meta(conn, session_id)
+    source_reader = CachedSourceTranscriptReader()
+    meta = _session_meta(conn, session_id, source_reader)
     if meta is None and ":" not in session_id:
         for prefix in ("codex:", "claude:", "cursor:", "warp:", "hermes:"):
-            meta = _session_meta(conn, prefix + session_id)
+            meta = _session_meta(conn, prefix + session_id, source_reader)
             if meta is not None:
                 session_id = prefix + session_id
                 break
@@ -374,7 +388,7 @@ def get_session(
     ).fetchone()
     projection = logical_projection(conn, session_id, str(session_row["harness"]))
     transcript_id = str(projection["transcript_session_id"] or session_id)
-    source_read = read_source_transcript(conn, transcript_id)
+    source_read = source_reader(conn, transcript_id)
     if source_read.status == "source_unavailable":
         return {
             "error": "source_unavailable",
