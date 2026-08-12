@@ -11,6 +11,30 @@ from agentlog.analysis.insights import import_session_fact_packet
 from agentlog.api.queries import _insight_provenance, insights_feed
 from agentlog.api.ranges import parse_range
 from agentlog.db.schema import connect, init_db
+from agentlog.ingest.base import content_hash_text, hash_prefix
+
+
+def _codex_message(role: str, text: str) -> bytes:
+    return (
+        json.dumps(
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": role,
+                    "content": [
+                        {
+                            "type": (
+                                "input_text" if role == "user" else "output_text"
+                            ),
+                            "text": text,
+                        }
+                    ],
+                },
+            }
+        )
+        + "\n"
+    ).encode()
 
 
 def _claim(**kwargs) -> Claim:
@@ -686,6 +710,107 @@ class InsightsFeedTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "evidence quote not found"):
             import_session_fact_packet(
                 self.conn, packet, model="cursor-grok-4.5-high-fast"
+            )
+
+    def test_imported_session_fact_hydrates_exact_source_backed_message(self) -> None:
+        external_id = "019fbdec-7065-7470-bb1e-dfa6c0d38237"
+        session_id = f"codex:{external_id}"
+        source = Path(self._tmp.name) / (
+            f"rollout-2026-08-11T10-00-00-{external_id}.jsonl"
+        )
+        source.write_bytes(
+            _codex_message("user", "check the source")
+            + _codex_message(
+                "assistant", "Canonical evidence survived promotion exactly."
+            )
+        )
+        size = source.stat().st_size
+        self.conn.execute(
+            """
+            INSERT INTO artifacts
+              (harness, path, size, mtime_ns, content_hash, parsed_offset,
+               parser_version, transcript_storage)
+            VALUES ('codex', ?, ?, ?, ?, ?, 'test', 'legacy_materialized')
+            """,
+            (
+                str(source),
+                size,
+                source.stat().st_mtime_ns,
+                hash_prefix(source, size),
+                size,
+            ),
+        )
+        artifact_id = self.conn.execute(
+            "SELECT id FROM artifacts WHERE path = ?", (str(source),)
+        ).fetchone()["id"]
+        self.conn.execute(
+            """
+            INSERT INTO sessions
+              (id, harness, external_id, artifact_id, started_at, repo,
+               transcript_storage)
+            VALUES (?, 'codex', ?, ?, '2026-08-11T10:00:00+00:00', 'demo',
+                    'source_backed')
+            """,
+            (session_id, external_id, artifact_id),
+        )
+        for seq, role, text in (
+            (1, "user", "check the source"),
+            (2, "assistant", "Canonical evidence survived promotion exactly."),
+        ):
+            self.conn.execute(
+                "INSERT INTO messages "
+                "(id,session_id,seq,role,text,content_hash) "
+                "VALUES (?,?,?,?, '', ?)",
+                (
+                    f"{session_id}:m:{seq}",
+                    session_id,
+                    seq,
+                    role,
+                    content_hash_text(text),
+                ),
+            )
+        self.conn.commit()
+        packet = Path(self._tmp.name) / "source-backed-facts.json"
+        packet.write_text(
+            json.dumps(
+                {
+                    "run_id": "facts-source-backed",
+                    "items": [
+                        {
+                            "session_id": session_id,
+                            "message_seq": 2,
+                            "kind": "verification",
+                            "title": "Canonical evidence remained available",
+                            "body": "The fact is grounded in its source transcript.",
+                            "quote": "evidence survived promotion exactly",
+                            "does_not_prove": "That unrelated sessions are valid.",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        stats = import_session_fact_packet(
+            self.conn, packet, model="gpt-5.6-sol"
+        )
+
+        self.assertEqual(stats["claims"], 1)
+        evidence = self.conn.execute(
+            "SELECT message_id, quote FROM claim_evidence"
+        ).fetchone()
+        self.assertEqual(evidence["message_id"], f"{session_id}:m:2")
+        self.assertEqual(
+            evidence["quote"], "evidence survived promotion exactly"
+        )
+        self.conn.execute(
+            "UPDATE messages SET content_hash = 'mismatch' "
+            "WHERE id = ?",
+            (f"{session_id}:m:2",),
+        )
+        with self.assertRaisesRegex(ValueError, "canonical evidence unavailable"):
+            import_session_fact_packet(
+                self.conn, packet, model="gpt-5.6-sol"
             )
 
 

@@ -45,8 +45,14 @@ const WRAP_TAGS =
 const BRIEF_HEURISTIC =
   /^(full repository path:|you are running as a subagent|## (task|brief)\b|<task>)/i;
 
+const COLLABORATION_BRIEF_HEURISTIC =
+  /^message type:\s*(new_task|message)\b[\s\S]*?\npayload:/i;
+
 const NOTIFICATION_HEURISTIC =
   /^(<system_notification|\[?(task|background shell|subagent) (notification|completed)|a background (command|agent))/i;
+
+const AGENT_CONTEXT_HEURISTIC =
+  /^<(codex_internal_context|recommended_plugins|skills_instructions|permissions(?:_instructions|\s+instructions)?|memory|multi_agent_mode|apps_instructions|plugins_instructions)\b/i;
 
 /** Cursor emits these inside <user_query> after subagent/background completion. */
 const SYNTHETIC_QUERY_HEURISTIC =
@@ -66,12 +72,13 @@ export function classifySpeaker(msg: {
   text: string;
   request_kind?: string | null;
   is_tool_plumbing?: boolean;
+  authored_by_agent?: boolean;
   skills?: string[];
-}): SpeakerSpec {
+}, context?: { isChildSession?: boolean }): SpeakerSpec {
   const text = msg.text || "";
   const kind = msg.request_kind || null;
 
-  if (msg.role === "system") {
+  if (msg.role === "system" || msg.role === "developer") {
     const isSkill = (msg.skills?.length ?? 0) > 0;
     return {
       kind: isSkill ? "skill" : "system",
@@ -116,6 +123,33 @@ export function classifySpeaker(msg: {
     };
   }
 
+  if (msg.authored_by_agent && AGENT_CONTEXT_HEURISTIC.test(text.trimStart())) {
+    return {
+      kind: "synthetic",
+      label: "context",
+      detail: "agent context",
+      color: "var(--speaker-synthetic)",
+      collapsed: true,
+      extractedQuery: null,
+    };
+  }
+
+  if (
+    msg.authored_by_agent &&
+    context?.isChildSession &&
+    (BRIEF_HEURISTIC.test(text.trimStart()) ||
+      COLLABORATION_BRIEF_HEURISTIC.test(text.trimStart()))
+  ) {
+    return {
+      kind: "worker_brief",
+      label: "brief",
+      detail: kind || "agent-authored",
+      color: "var(--speaker-brief)",
+      collapsed: text.length > 600,
+      extractedQuery: null,
+    };
+  }
+
   if (kind && BRIEF_KINDS.has(kind)) {
     return {
       kind: "worker_brief",
@@ -131,7 +165,7 @@ export function classifySpeaker(msg: {
     const q = extractUserQuery(text);
     return {
       kind: "synthetic",
-      label: "harness",
+      label: "context",
       detail: kind,
       color: "var(--speaker-synthetic)",
       collapsed: true,
@@ -144,7 +178,7 @@ export function classifySpeaker(msg: {
     if (q !== null && SYNTHETIC_QUERY_HEURISTIC.test(q.trimStart())) {
       return {
         kind: "synthetic",
-        label: "harness",
+        label: "context",
         detail: "follow-up",
         color: "var(--speaker-synthetic)",
         collapsed: true,
@@ -188,7 +222,7 @@ export function classifySpeaker(msg: {
   if (NOTIFICATION_HEURISTIC.test(text.trimStart())) {
     return {
       kind: "synthetic",
-      label: "harness",
+      label: "context",
       detail: "notification",
       color: "var(--speaker-synthetic)",
       collapsed: true,
@@ -199,7 +233,7 @@ export function classifySpeaker(msg: {
     if (SYNTHETIC_QUERY_HEURISTIC.test(q.trimStart())) {
       return {
         kind: "synthetic",
-        label: "harness",
+        label: "context",
         detail: "follow-up",
         color: "var(--speaker-synthetic)",
         collapsed: true,
@@ -218,7 +252,7 @@ export function classifySpeaker(msg: {
   if (looksWrapped(text)) {
     return {
       kind: "synthetic",
-      label: "harness",
+      label: "context",
       detail: "injected",
       color: "var(--speaker-synthetic)",
       collapsed: true,
@@ -267,9 +301,9 @@ export const SPEAKER_LEGEND: Array<{
   },
   {
     kind: "synthetic",
-    label: "harness",
+    label: "context",
     color: "var(--speaker-synthetic)",
-    description: "Harness-synthetic (wrapped, notifications, auto-review)",
+    description: "Runtime and harness-injected context",
   },
   {
     kind: "system",

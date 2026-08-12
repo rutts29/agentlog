@@ -29,6 +29,7 @@ from agentlog.analysis.performance.outcomes import (
     SECONDARY_OUTCOMES,
 )
 from agentlog.safety.write_guard import assert_writable
+from agentlog.session_identity import physical_root_session_ids
 
 
 class ProtocolMutationError(RuntimeError):
@@ -401,7 +402,7 @@ class ExperimentService:
         ).fetchone()
         if session is None:
             raise ValueError(f"unknown session: {root_session_id}")
-        if session["parent_session_id"]:
+        if physical_root_session_ids(self.conn).get(root_session_id) != root_session_id:
             raise ValueError("refusing to link a subagent session as root")
 
         cluster_id = self._ensure_root_cluster(root_session_id)

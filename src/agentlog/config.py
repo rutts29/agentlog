@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-PARSER_VERSION = "13"
+PARSER_VERSION = "15"
 
 HOME = Path.home()
 DEFAULT_DB_PATH = HOME / ".agentlog" / "agentlog.db"
@@ -48,6 +48,7 @@ T3CODE_STATE_DB = T3CODE_HOME / "userdata" / "state.sqlite"
 T3CODE_CACHES_DIR = T3CODE_HOME / "caches"
 
 WATCH_DEBOUNCE_SECONDS = 30.0
+WATCH_MAX_WAIT_SECONDS = 120.0
 WATCH_POLL_SECONDS = 60.0
 
 # Live presence: transcript mtime within this window ⇒ session is "active".

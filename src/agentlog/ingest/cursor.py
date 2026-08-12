@@ -50,6 +50,13 @@ _SKILL_NAME_RE = re.compile(
     r"^\s*Skill\s+Name:\s*(?P<name>[^\r\n]+?)\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
+_SIDE_CHAT_BOUNDARY_RE = re.compile(
+    r"\A\s*(?:</system_reminder>\s*)?"
+    r"(?:<timestamp>[^\r\n]*</timestamp>\s*)?"
+    r"<side_chat_boundary>\s*\r?\nSide chat boundary\."
+    r".*?</side_chat_boundary>\s*\Z",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 _UNKNOWN_REPOS = frozenset({"", "unknown", "empty-window"})
@@ -183,6 +190,14 @@ class _UserTurn:
     key: str
     model: str | None
     created_at: Any  # datetime | None — avoid circular import typing noise
+
+
+@dataclass(frozen=True)
+class _SideChatBoundary:
+    start_offset: int
+    end_offset: int
+    inherited_message_count: int
+    inherited_record_count: int
 
 
 @dataclass
@@ -430,6 +445,32 @@ def _message_timestamp(obj: dict[str, Any], text: str) -> Any:
     return None
 
 
+def _side_chat_boundary(data: bytes, *, source: str) -> _SideChatBoundary | None:
+    boundaries: list[_SideChatBoundary] = []
+    message_count = 0
+    record_count = 0
+    for start, end, obj, _err in iter_jsonl_bytes(data, source=source):
+        if obj is not None:
+            role = obj.get("role")
+            msg = obj.get("message") if isinstance(obj.get("message"), dict) else {}
+            text = extract_text(msg.get("content"))
+            if role == "user" and _SIDE_CHAT_BOUNDARY_RE.search(text):
+                boundaries.append(
+                    _SideChatBoundary(
+                        start_offset=start,
+                        end_offset=end,
+                        inherited_message_count=message_count,
+                        inherited_record_count=record_count,
+                    )
+                )
+            if role in ("user", "assistant", "system"):
+                message_count += 1
+        record_count += 1
+    if len(boundaries) > 1:
+        raise ValueError(f"{source}: multiple Cursor side-chat boundaries")
+    return boundaries[0] if boundaries else None
+
+
 def _parent_transcript_path(path: Path) -> Path | None:
     """.../agent-transcripts/<parent-uuid>/subagents/<child>.jsonl → parent jsonl."""
     if path.parent.name != "subagents":
@@ -499,6 +540,15 @@ class CursorAdapter(TranscriptAdapter):
         parent = None
         if path.parent.name == "subagents":
             parent = path.parent.parent.name
+        side_chat_boundary = (
+            _side_chat_boundary(data, source=str(path))
+            if parent is not None
+            else None
+        )
+        data_offset = start_offset
+        if side_chat_boundary is not None:
+            data = data[side_chat_boundary.end_offset :]
+            data_offset += side_chat_boundary.end_offset
         repo = _repo_for_path(path)
         cwd = _infer_cwd(path) if repo is not None else None
         meta = lookup_composer_meta(_composer_id(path))
@@ -638,7 +688,11 @@ class CursorAdapter(TranscriptAdapter):
             ended_at = meta.ended_at or last_msg_ts
 
         # Child transcripts under subagents/: first user turn is the parent's Task prompt.
-        if parent is not None and start_offset == 0:
+        if (
+            parent is not None
+            and start_offset == 0
+            and side_chat_boundary is None
+        ):
             flag_parent_authored_prompt(messages)
             _clear_flag_if_copied_parent_history(path, messages)
         flag_synthetic_user_messages(messages)
@@ -658,11 +712,33 @@ class CursorAdapter(TranscriptAdapter):
             effort=effort,
             effort_source=effort_source,
         )
+        extras: dict[str, Any] = {}
+        if side_chat_boundary is not None:
+            extras = {
+                "inherited_message_count": (
+                    side_chat_boundary.inherited_message_count
+                ),
+                "inherited_record_count": side_chat_boundary.inherited_record_count,
+                "fork_context_status": "trimmed",
+                "fork_context_boundary": (
+                    f"cursor:byte:{start_offset + side_chat_boundary.start_offset}"
+                ),
+            }
+            if start_offset > 0:
+                extras.update(
+                    {
+                        "requires_full_reparse": True,
+                        "requires_full_reparse_reason": (
+                            "Cursor side-chat boundary discovered after checkpoint"
+                        ),
+                    }
+                )
         return ParseResult(
             session=session,
             messages=messages,
             tool_events=tools,
             skill_exposures=skills,
             warnings=warnings,
-            bytes_consumed=start_offset + bytes_consumed,
+            bytes_consumed=data_offset + bytes_consumed,
+            extras=extras,
         )

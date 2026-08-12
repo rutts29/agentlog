@@ -258,6 +258,34 @@ class SessionBriefTests(unittest.TestCase):
         self.assertEqual(parent_link["id"], parent)
         self.assertIn("Supervise", parent_link["description"])
 
+    def test_recorded_lineage_rejects_foreign_qualified_and_bare_ids(self) -> None:
+        self._session(
+            "codex:root",
+            harness="codex",
+            started="2026-08-09T07:00:00+00:00",
+        )
+        self._msg("secret", "codex:root", 1, "user", "foreign secret text")
+        for sid, parent in (
+            ("cursor:qualified", "codex:root"),
+            ("claude:bare", "root"),
+        ):
+            self._session(
+                sid,
+                harness=sid.split(":", 1)[0],
+                started="2026-08-09T07:10:00+00:00",
+                parent=parent,
+            )
+        self.conn.commit()
+
+        for sid in ("cursor:qualified", "claude:bare"):
+            brief = build_session_brief(self.conn, sid)
+            assert brief is not None
+            self.assertIsNone(brief["orchestration"]["parent"])
+            self.assertNotIn("foreign secret text", render_brief_markdown(brief))
+        root = build_session_brief(self.conn, "codex:root")
+        assert root is not None
+        self.assertEqual(root["orchestration"]["children"], [])
+
     def test_cross_harness_inference(self) -> None:
         cursor = "cursor:ai-sec/abc"
         codex = "codex:def456"
@@ -295,10 +323,16 @@ class SessionBriefTests(unittest.TestCase):
 
         brief = build_session_brief(self.conn, cursor)
         assert brief is not None
-        inferred = brief["orchestration"]["inferred_links"]
+        self.assertEqual(brief["orchestration"]["inferred_links"], [])
+
+        inferred_brief = build_session_brief(
+            self.conn, cursor, include_inferred=True
+        )
+        assert inferred_brief is not None
+        inferred = inferred_brief["orchestration"]["inferred_links"]
         self.assertEqual(len(inferred), 1)
         self.assertEqual(inferred[0]["kind"], "inferred")
-        md = render_brief_markdown(brief)
+        md = render_brief_markdown(inferred_brief)
         self.assertIn("inferred (cross-harness)", md)
         self.assertIn(codex, md)
 

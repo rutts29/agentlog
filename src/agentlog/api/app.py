@@ -319,8 +319,14 @@ def create_app(
     def facets(
         conn: sqlite3.Connection = Depends(get_conn),
         tr: TimeRange = Depends(_parse_range_dep),
+        view: str | None = Query(None),
     ) -> dict:
-        return {**range_params(tr), **descriptive.session_facets(conn, tr)}
+        if view not in {None, "roots"}:
+            raise HTTPException(status_code=400, detail="view must be roots")
+        return {
+            **range_params(tr),
+            **descriptive.session_facets(conn, tr, view=view),
+        }
 
     @app.get("/api/search")
     def search(

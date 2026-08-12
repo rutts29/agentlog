@@ -16,6 +16,7 @@ from typing import Any, Literal
 
 from agentlog.config import DEFAULT_DB_PATH, presence_path_for_db
 from agentlog.watch.presence import read_presence_file
+from agentlog.source_reader import CachedSourceTranscriptReader
 
 AttentionState = Literal[
     "live_waiting",
@@ -226,6 +227,7 @@ def _session_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
                 s.ended_at AS ended_at,
                 s.repo AS repo,
                 s.branch AS branch,
+                s.transcript_storage AS transcript_storage,
                 (
                     SELECT m.role FROM messages m
                     WHERE m.session_id = s.id
@@ -260,7 +262,7 @@ def _session_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
 
 def _logical_attention_rows(
     conn: sqlite3.Connection,
-    rows: list[sqlite3.Row],
+    rows: list[Any],
 ) -> tuple[
     list[dict[str, Any]],
     dict[str, str],
@@ -303,6 +305,33 @@ def _logical_attention_rows(
         runtime_harness_by_display,
         metric_by_display,
     )
+
+
+def _hydrate_attention_rows(
+    conn: sqlite3.Connection,
+    rows: list[sqlite3.Row],
+    reader: CachedSourceTranscriptReader,
+) -> list[dict[str, Any]]:
+    hydrated: list[dict[str, Any]] = []
+    for row in rows:
+        copied = dict(row)
+        if copied.get("transcript_storage") == "source_backed":
+            source = reader(conn, str(copied["id"]))
+            if not source.ready:
+                raise RuntimeError(
+                    f"canonical source unavailable for {copied['id']}: "
+                    f"{source.warning or source.status}"
+                )
+            messages = [
+                message for message in source.messages
+                if not bool(message.get("is_tool_plumbing"))
+            ]
+            if messages:
+                last = max(messages, key=lambda message: int(message["seq"]))
+                copied["last_role"] = last["role"]
+                copied["last_text"] = last["text"]
+        hydrated.append(copied)
+    return hydrated
 
 
 def _trailing_known_error_streak(
@@ -556,7 +585,10 @@ def derive_attention(
     resumable_max = timedelta(days=thresholds.resumable_max_days)
     recent_error_delta = timedelta(minutes=thresholds.recent_error_minutes)
 
-    physical_rows = _session_rows(conn)
+    source_reader = CachedSourceTranscriptReader()
+    physical_rows = _hydrate_attention_rows(
+        conn, _session_rows(conn), source_reader
+    )
     (
         rows,
         display_by_physical,
@@ -856,6 +888,8 @@ def derive_attention(
     if state is not None:
         out = [i for i in out if i.state == state]
 
+    if not source_reader.verify_current():
+        raise RuntimeError("canonical source changed during attention derivation")
     if return_stats:
         return out, stats
     return out

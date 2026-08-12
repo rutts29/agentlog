@@ -159,7 +159,7 @@ class TranscriptStorageCutoverTests(unittest.TestCase):
                     transcript_storage=SOURCE_BACKED,
                 )
 
-    def test_existing_legacy_session_is_not_mutated_by_ingest(self) -> None:
+    def test_divergent_legacy_session_fails_closed_without_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             path = root / ROLLOUT
@@ -185,12 +185,15 @@ class TranscriptStorageCutoverTests(unittest.TestCase):
                 append=False,
                 transcript_storage=LEGACY_MATERIALIZED,
             )
+            repo.conn.commit()
             before = repo.conn.execute(
                 "SELECT text FROM messages WHERE session_id = ?",
                 ("codex:019fbdec-7065-7470-bb1e-dfa6c0d38237",),
             ).fetchone()["text"]
 
-            _ingest_one(repo, CodexAdapter(), path, IngestStats())
+            with self.assertRaisesRegex(TranscriptStorageError, "diverged"):
+                _ingest_one(repo, CodexAdapter(), path, IngestStats())
+            repo.conn.rollback()
 
             after = repo.conn.execute(
                 "SELECT text FROM messages WHERE session_id = ?",
@@ -199,6 +202,260 @@ class TranscriptStorageCutoverTests(unittest.TestCase):
 
         self.assertEqual(before, "legacy text")
         self.assertEqual(after, "legacy text")
+
+    def test_legacy_session_refreshes_identity_without_replacing_transcript(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._repo(Path(tmp))
+            artifact_id = repo.upsert_artifact(
+                harness="codex",
+                path="/tmp/legacy-identity.jsonl",
+                size=1,
+                mtime_ns=1,
+                content_hash="old",
+                parsed_offset=1,
+                parser_version="old",
+                transcript_storage=LEGACY_MATERIALIZED,
+            )
+            legacy = _result(
+                ("user", "legacy text"),
+                ("assistant", "legacy answer"),
+                external_id="continued",
+            )
+            session_id = repo.save_parse_result(
+                artifact_id=artifact_id,
+                result=legacy,
+                append=False,
+                transcript_storage=LEGACY_MATERIALIZED,
+            )
+            repo.conn.execute(
+                """
+                INSERT INTO exchange_windows
+                  (id, session_id, request_message_id, response_message_id,
+                   input_hash, content_hash)
+                VALUES ('legacy-window', ?, ?, ?, 'legacy-input', 'legacy-window')
+                """,
+                (
+                    session_id,
+                    f"{session_id}:m:1",
+                    f"{session_id}:m:2",
+                ),
+            )
+            repo.conn.execute(
+                """
+                INSERT INTO tool_events
+                  (id, session_id, message_id, seq, tool_name, action)
+                VALUES ('legacy-tool', ?, ?, 1, 'exec_command', 'call')
+                """,
+                (session_id, f"{session_id}:m:2"),
+            )
+            refreshed = _result(("user", "new source text"), external_id="continued")
+            refreshed.session.originator = "t3code_desktop"
+            refreshed.session.thread_source = "subagent"
+            refreshed.extras.update(
+                {
+                    "inherited_message_count": 4,
+                    "inherited_record_count": 7,
+                    "fork_context_status": "trimmed",
+                }
+            )
+
+            repo.save_parse_result(
+                artifact_id=artifact_id,
+                result=refreshed,
+                append=False,
+                transcript_storage=LEGACY_MATERIALIZED,
+                preserve_existing_legacy=True,
+            )
+
+            row = repo.conn.execute(
+                "SELECT * FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            assert row is not None
+            text = repo.conn.execute(
+                "SELECT text FROM messages WHERE session_id = ?", (session_id,)
+            ).fetchone()["text"]
+            self.assertEqual(text, "legacy text")
+            self.assertEqual(row["artifact_id"], artifact_id)
+            self.assertEqual(row["transcript_storage"], LEGACY_MATERIALIZED)
+            self.assertEqual(row["originator"], "t3code_desktop")
+            self.assertEqual(row["thread_source"], "subagent")
+            self.assertEqual(row["inherited_message_count"], 4)
+            self.assertEqual(
+                repo.conn.execute(
+                    "SELECT id FROM exchange_windows WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()["id"],
+                "legacy-window",
+            )
+            self.assertEqual(
+                repo.conn.execute(
+                    "SELECT id FROM tool_events WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()["id"],
+                "legacy-tool",
+            )
+
+    def test_legacy_session_refreshes_present_and_later_provider_links(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._repo(Path(tmp))
+            t3_artifact = repo.upsert_artifact(
+                harness="t3code",
+                path="/tmp/legacy-t3.sqlite",
+                size=1,
+                mtime_ns=1,
+                content_hash="old-t3",
+                parsed_offset=1,
+                parser_version="old",
+                transcript_storage=LEGACY_MATERIALIZED,
+            )
+            legacy = _result(
+                ("user", "legacy root text"),
+                external_id="root",
+                harness=Harness.T3CODE,
+            )
+            root_id = repo.save_parse_result(
+                artifact_id=t3_artifact,
+                result=legacy,
+                append=False,
+                transcript_storage=LEGACY_MATERIALIZED,
+            )
+            repo.conn.execute(
+                "INSERT INTO sessions (id, harness, external_id) VALUES (?, ?, ?)",
+                ("codex:present", "codex", "present"),
+            )
+            refreshed = _result(
+                ("user", "new root text"),
+                external_id="root",
+                harness=Harness.T3CODE,
+            )
+            refreshed.extras["session_links"] = [
+                {
+                    "link_type": "provider_backing",
+                    "target_harness": "codex",
+                    "target_external_id": "present",
+                    "link_role": "root",
+                },
+                {
+                    "link_type": "provider_backing",
+                    "target_harness": "codex",
+                    "target_external_id": "later",
+                    "link_role": "worker",
+                },
+            ]
+
+            repo.save_parse_result(
+                artifact_id=t3_artifact,
+                result=refreshed,
+                append=False,
+                transcript_storage=LEGACY_MATERIALIZED,
+                preserve_existing_legacy=True,
+            )
+
+            links = {
+                row["target_external_id"]: row["target_session_id"]
+                for row in repo.conn.execute(
+                    "SELECT target_external_id, target_session_id "
+                    "FROM session_links WHERE source_session_id = ?",
+                    (root_id,),
+                )
+            }
+            self.assertEqual(links["present"], "codex:present")
+            self.assertIsNone(links["later"])
+            codex_artifact = repo.upsert_artifact(
+                harness="codex",
+                path="/tmp/later.jsonl",
+                size=1,
+                mtime_ns=1,
+                content_hash="later",
+                parsed_offset=1,
+                parser_version="28",
+            )
+            repo.save_parse_result(
+                artifact_id=codex_artifact,
+                result=_result(("assistant", "done"), external_id="later"),
+                append=False,
+            )
+            resolved = repo.conn.execute(
+                "SELECT target_session_id FROM session_links "
+                "WHERE source_session_id = ? AND target_external_id = 'later'",
+                (root_id,),
+            ).fetchone()
+            self.assertEqual(resolved["target_session_id"], "codex:later")
+            text = repo.conn.execute(
+                "SELECT text FROM messages WHERE session_id = ?", (root_id,)
+            ).fetchone()["text"]
+            self.assertEqual(text, "legacy root text")
+
+    def test_alternate_artifact_cannot_refresh_legacy_identity_or_links(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._repo(Path(tmp))
+            canonical_artifact = repo.upsert_artifact(
+                harness="codex",
+                path="/tmp/canonical.jsonl",
+                size=1,
+                mtime_ns=1,
+                content_hash="canonical",
+                parsed_offset=1,
+                parser_version="old",
+                transcript_storage=LEGACY_MATERIALIZED,
+            )
+            alternate_artifact = repo.upsert_artifact(
+                harness="codex",
+                path="/tmp/alternate.jsonl",
+                size=1,
+                mtime_ns=1,
+                content_hash="alternate",
+                parsed_offset=1,
+                parser_version="old",
+                transcript_storage=LEGACY_MATERIALIZED,
+            )
+            session_id = repo.save_parse_result(
+                artifact_id=canonical_artifact,
+                result=_result(("user", "canonical"), external_id="same-id"),
+                append=False,
+                transcript_storage=LEGACY_MATERIALIZED,
+            )
+            injected = _result(("user", "alternate"), external_id="same-id")
+            injected.session.originator = "t3code_desktop"
+            injected.session.parent_session_id = "attacker-parent"
+            injected.extras["session_links"] = [
+                {
+                    "link_type": "provider_backing",
+                    "target_harness": "codex",
+                    "target_external_id": "attacker",
+                }
+            ]
+
+            repo.save_parse_result(
+                artifact_id=alternate_artifact,
+                result=injected,
+                append=False,
+                transcript_storage=LEGACY_MATERIALIZED,
+                preserve_existing_legacy=True,
+            )
+
+            row = repo.conn.execute(
+                "SELECT * FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            assert row is not None
+            self.assertEqual(row["artifact_id"], canonical_artifact)
+            self.assertIsNone(row["originator"])
+            self.assertIsNone(row["parent_session_id"])
+            self.assertEqual(
+                repo.conn.execute(
+                    "SELECT COUNT(*) AS c FROM session_links "
+                    "WHERE source_session_id = ?",
+                    (session_id,),
+                ).fetchone()["c"],
+                0,
+            )
+            self.assertEqual(
+                repo.conn.execute(
+                    "SELECT text FROM messages WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()["text"],
+                "canonical",
+            )
 
     def test_legacy_sqlite_artifact_can_add_a_source_backed_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

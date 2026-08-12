@@ -23,8 +23,10 @@ from agentlog.session_identity import (
     provider_backing_shadow_ids,
     provider_canonical_root_backing_ids,
     provider_root_shadow_ids,
+    resolve_implicit_parent_ids,
+    is_internal_approval_guardian,
 )
-from agentlog.source_reader import read_source_transcript
+from agentlog.source_reader import CachedSourceTranscriptReader
 from agentlog.analysis.coach.proof import (
     EVIDENCE_MESSAGE,
     EVIDENCE_SKILL,
@@ -279,28 +281,13 @@ def _timestamp_sort_key(value: Any) -> tuple[int, str]:
 
 def _session_roots(rows: list[sqlite3.Row]) -> tuple[dict[str, str], dict[str, sqlite3.Row]]:
     by_id = {str(r["id"]): r for r in rows}
-    by_external: dict[str, list[str]] = {}
-    for row in rows:
-        by_external.setdefault(str(row["external_id"] or ""), []).append(str(row["id"]))
+    parents = resolve_implicit_parent_ids(rows)
     roots: dict[str, str] = {}
     for sid in sorted(by_id):
         cur, seen = sid, set()
-        while cur in by_id and cur not in seen and by_id[cur]["parent_session_id"]:
+        while cur in parents and cur not in seen:
             seen.add(cur)
-            raw_parent = str(by_id[cur]["parent_session_id"])
-            if raw_parent in by_id:
-                cur = raw_parent
-                continue
-            candidates = [
-                candidate
-                for candidate in by_external.get(raw_parent, [])
-                if str(by_id[candidate]["harness"] or "") == str(by_id[cur]["harness"] or "")
-            ]
-            # A bare external parent is safe only when unique within the
-            # child's harness. Never guess across harnesses with the same ID.
-            cur = candidates[0] if len(candidates) == 1 else cur
-            if cur == sid or not candidates:
-                break
+            cur = parents[cur]
         roots[sid] = cur if cur in by_id else sid
     return roots, by_id
 
@@ -492,14 +479,20 @@ def _projection_source_ids(
     *,
     identity: Any,
 ) -> set[str]:
-    return {
-        sid
-        for sid, session in sessions.items()
-        if str(session["harness"] or "") == "t3code"
-        and logical_projection(conn, sid, "t3code", context=identity)[
-            "transcript_session_id"
-        ]
-    }
+    excluded: set[str] = set()
+    for sid, session in sessions.items():
+        if str(session["harness"] or "") != "t3code":
+            continue
+        projection = logical_projection(conn, sid, "t3code", context=identity)
+        transcript_id = projection["transcript_session_id"]
+        if transcript_id:
+            excluded.add(sid)
+            continue
+        if session["transcript_storage"] == "source_backed":
+            canonical_backing = identity.canonical_root_backing_by_source.get(sid)
+            if canonical_backing:
+                excluded.add(canonical_backing)
+    return excluded
 
 
 def _copied_history_duplicate_windows(
@@ -508,21 +501,10 @@ def _copied_history_duplicate_windows(
     logical_roots: Mapping[str, str],
     sessions: Mapping[str, sqlite3.Row],
 ) -> dict[str, str]:
-    by_external: dict[tuple[str, str], list[str]] = {}
-    for session_id, session in sessions.items():
-        by_external.setdefault(
-            (str(session["harness"] or ""), str(session["external_id"] or "")), []
-        ).append(session_id)
+    parents = resolve_implicit_parent_ids(sessions.values())
 
     def parent(session_id: str) -> str:
-        session = sessions.get(session_id)
-        if session is None:
-            return ""
-        raw = str(session["parent_session_id"] or "")
-        if raw in sessions:
-            return raw
-        candidates = by_external.get((str(session["harness"] or ""), raw), [])
-        return candidates[0] if len(candidates) == 1 else ""
+        return parents.get(session_id, "")
 
     def ancestor(older: str, newer: str) -> bool:
         current = newer
@@ -682,6 +664,11 @@ def _window_rows(
     excluded_synthetic_by_kind: dict[str, int] = {}
     for sid, row in by_id.items():
         root = roots[sid]
+        if is_internal_approval_guardian(row):
+            excluded_sessions.add(sid)
+            if sid == root:
+                excluded_roots.add(root)
+            continue
         if _excluded_label(row["harness"], row["external_id"], row["model"], row["model_canonical"], row["agent_profile"]):
             excluded_sessions.add(sid)
             if sid == root:
@@ -702,7 +689,7 @@ def _window_rows(
     source_messages, source_provenance = _source_messages(
         conn,
         source_sessions,
-        reader=source_transcript_reader or read_source_transcript,
+        reader=source_transcript_reader or CachedSourceTranscriptReader(),
     )
     _validate_source_message_ledger(conn, source_messages)
     legacy_sessions = sorted(set(by_id) - source_backed)

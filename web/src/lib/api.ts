@@ -48,6 +48,15 @@ export type ProviderBacking = {
   evidence_json?: string | null;
 };
 
+export type RuntimeBackingProvenance = {
+  status: "validated" | string;
+  harness: string;
+  session_id: string;
+  external_id?: string | null;
+  artifact_id?: number | null;
+  artifact_path?: string | null;
+};
+
 /** Optional identity projection fields added after the physical ledger API. */
 export type SessionIdentityFields = {
   logical_harness?: string | null;
@@ -55,6 +64,7 @@ export type SessionIdentityFields = {
   orchestrator_session_id?: string | null;
   transcript_session_id?: string | null;
   provider_backings?: ProviderBacking[] | null;
+  runtime_backing_provenance?: RuntimeBackingProvenance | null;
 };
 
 export type SessionIdentityLike = {
@@ -86,8 +96,49 @@ export function runtimeHarness(item: SessionIdentityLike): string {
   return item.runtime_harness || item.harness || logicalHarness(item);
 }
 
+export function authoritativeParentNavigationId(item: {
+  parent_navigation_id?: string | null;
+  parent_session_id?: string | null;
+}): string | null {
+  if (Object.prototype.hasOwnProperty.call(item, "parent_navigation_id")) {
+    return item.parent_navigation_id ?? null;
+  }
+  return item.parent_session_id ?? null;
+}
+
+export function displaySessionIdentity(
+  item: SessionIdentityLike & {
+    id: string;
+    external_id?: string | null;
+  },
+): string {
+  const physicalId = item.id.trim();
+  const logical = logicalHarness(item);
+  const runtime = runtimeHarness(item);
+  if (physicalId.startsWith(`${logical}:`) || logical === runtime) {
+    return physicalId;
+  }
+
+  const runtimePrefix = `${runtime}:`;
+  const externalId =
+    item.external_id?.trim() ||
+    (physicalId.startsWith(runtimePrefix)
+      ? physicalId.slice(runtimePrefix.length)
+      : "");
+  if (!externalId) return physicalId;
+  if (externalId.startsWith(`${logical}:`)) return externalId;
+
+  const physicalPrefix = `${runtime}:`;
+  const bareExternal =
+    physicalPrefix && externalId.startsWith(physicalPrefix)
+      ? externalId.slice(physicalPrefix.length)
+      : externalId;
+  return `${logical}:${bareExternal}`;
+}
+
 export type SessionRow = SessionIdentityFields & {
   id: string;
+  navigation_id?: string;
   harness: string;
   model: string;
   effort: string | null;
@@ -96,10 +147,17 @@ export type SessionRow = SessionIdentityFields & {
   branch: string | null;
   started_at: string | null;
   ended_at: string | null;
+  activity_at?: string | null;
+  latest_descendant_at?: string | null;
   duration_seconds: number | null;
   message_count: number;
   tool_count: number;
   window_count?: number;
+  child_count?: number;
+  descendant_count?: number;
+  is_orphan?: boolean;
+  matched_in_descendant?: boolean;
+  matching_descendant_count?: number;
   parent_session_id?: string | null;
   transcript_storage?: TranscriptStorage | null;
   status: string;
@@ -338,14 +396,14 @@ export function fetchRecent(range: string, limit?: number) {
   });
 }
 
-export function fetchFacets(range: string) {
+export function fetchFacets(range: string, view?: "roots") {
   return getJson<{
     harness: Array<{ value: string; count: number }>;
     model: Array<{ value: string; count: number }>;
     effort: Array<{ value: string; count: number }>;
     branch: Array<{ value: string; count: number }>;
     project: Array<{ value: string; count: number }>;
-  }>("/api/facets", { range });
+  }>("/api/facets", { range, view });
 }
 
 export function fetchSessions(
@@ -364,6 +422,8 @@ export function fetchSessions(
   },
 ) {
   return getJson<{
+    count_scope: "full_conversation";
+    note: string;
     total: number;
     cursor: number;
     next_cursor: number | null;
@@ -405,6 +465,7 @@ export type TimelineMessage = {
   effort: string | null;
   text: string;
   is_tool_plumbing: boolean;
+  authored_by_agent: boolean;
   request_kind?: string | null;
   skills?: string[];
   tool_events: ToolEvent[];
@@ -423,10 +484,29 @@ export type TimelineOrphanTool = {
 
 export type TimelineItem = TimelineMessage | TimelineOrphanTool;
 
+export type InheritedContext = {
+  status: string | null;
+  message_count: number;
+  record_count: number;
+  boundary: string | null;
+  parent_navigation_id: string | null;
+};
+
+export type ChildrenBounds = {
+  limit: number;
+  returned_child_count: number;
+  total_child_count: number;
+  truncated: boolean;
+  omitted_child_count: number;
+};
+
 export function fetchSessionDetail(sessionId: string) {
   return getJson<{
     session: SessionIdentityFields & {
       id: string;
+      navigation_id?: string;
+      parent_navigation_id?: string | null;
+      root_navigation_id?: string;
       harness: string;
       model: string | null;
       effort: string | null;
@@ -452,6 +532,8 @@ export function fetchSessionDetail(sessionId: string) {
       artifact_path: string | null;
       source?: TranscriptSource | null;
     } | null;
+    inherited_context?: InheritedContext | null;
+    children_bounds?: ChildrenBounds;
     timeline: TimelineItem[];
     skills: Array<{ skill_name: string; exposure_type: string; c: number }>;
     children: Array<SessionIdentityFields & {
@@ -544,13 +626,28 @@ export function fetchSessionTree(sessionId: string) {
   return getJson<{
     root_id: string;
     requested_id: string;
+    requested_navigation_id?: string;
     tree: TreeNode;
+    bounds?: TreeBounds;
     note: string;
   }>(`/api/sessions/${encodeURIComponent(sessionId)}/tree`);
 }
 
+export type TreeBounds = {
+  max_nodes: number;
+  max_depth: number;
+  returned_node_count: number;
+  total_node_count: number;
+  truncated: boolean;
+  omitted_node_count: number;
+};
+
 export type TreeNode = SessionIdentityFields & {
   id: string;
+  navigation_id?: string;
+  parent_navigation_id?: string | null;
+  root_navigation_id?: string;
+  thread_source?: string | null;
   harness: string;
   model: string;
   effort: string | null;
@@ -559,6 +656,10 @@ export type TreeNode = SessionIdentityFields & {
   ended_at: string | null;
   message_count: number;
   tool_count: number;
+  child_count?: number;
+  descendant_count?: number;
+  children_truncated?: boolean;
+  omitted_descendant_count?: number;
   relationship?: string | null;
   children: TreeNode[];
 };

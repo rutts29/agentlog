@@ -7,7 +7,13 @@ consumes this after the current rebuild.
 ## Detection
 
 The watch daemon (`python -m agentlog.watch`) updates an in-memory presence map
-on every transcript file change **before** the 30s ingest debounce:
+on every transcript file change **before** ingest. Ingest waits for a 30-second
+quiet period but is queued after at most 120 seconds of continuous changes.
+Each harness has one independent ingest worker, so discovery, parsing, and
+window preparation proceed independently; later changes coalesce into one
+follow-up pass. Short SQLite write transactions remain serialized and may
+briefly queue another writer. Deterministic derivation runs on its own single
+coalescing worker after ingest:
 
 - A session is **active** while its source `.jsonl` was touched within the last
   `active_seconds` (default **90s**, tunable via

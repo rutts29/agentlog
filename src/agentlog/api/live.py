@@ -27,6 +27,9 @@ from agentlog.config import (
     presence_path_for_db,
 )
 from agentlog.registry.harnesses import get_harness
+from agentlog.session_identity import (
+    lineage_parent_ids,
+)
 from agentlog.watch.presence import external_id_for_path, read_presence_file, session_id_for
 from agentlog.watch.scan import (
     PEEK_CACHE,
@@ -121,11 +124,12 @@ def _load_db_meta(db_path: Path, ids: list[str]) -> dict[str, dict]:
             """,
             ids,
         ).fetchall()
+        resolved_parents = lineage_parent_ids(conn)
         meta: dict[str, dict] = {
             str(row["id"]): {
                 "session_id": str(row["id"]),
                 "repo": row["repo"] or row["cwd"],
-                "parent_session_id": row["parent_session_id"],
+                "parent_session_id": resolved_parents.get(str(row["id"])),
                 "title": None,
             }
             for row in rows

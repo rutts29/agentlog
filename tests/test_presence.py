@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 
 from agentlog.api.app import create_app
 from agentlog.api.events import iter_event_sse
+from agentlog.api.live import live_payload
 from agentlog.db.schema import connect, init_db
 from agentlog.watch.presence import (
     PresenceMap,
@@ -335,6 +336,57 @@ class PresenceApiTests(unittest.TestCase):
         self.assertTrue(body["sessions"][0]["pending_ingest"])
         self.assertEqual(body["sessions"][0]["state"], "streaming")
         self.assertIn("presence.json", body["path"])
+
+    def test_foreign_parent_reference_does_not_promote_or_count_worker(self) -> None:
+        conn = connect(self.db)
+        conn.executemany(
+            """
+            INSERT INTO sessions (id, harness, external_id, parent_session_id, repo)
+            VALUES (?, ?, ?, ?, '/tmp/project')
+            """,
+            [
+                ("codex:root", "codex", "root", None),
+                ("cursor:proj/live-1", "cursor", "proj/live-1", "codex:root"),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        body = live_payload(
+            self.db,
+            presence_path=self.presence,
+            now=self.now,
+            scan=False,
+        )
+        self.assertEqual(body["counts"]["workers"], 0)
+        self.assertEqual([row["session_id"] for row in body["sessions"]], ["cursor:proj/live-1"])
+        self.assertIsNone(body["sessions"][0]["parent_session_id"])
+
+    def test_typed_provider_worker_link_promotes_cross_harness_owner(self) -> None:
+        conn = connect(self.db)
+        conn.executescript(
+            """
+            INSERT INTO sessions (id, harness, external_id, repo)
+            VALUES ('t3code:owner', 't3code', 'owner', '/tmp/project'),
+                   ('cursor:proj/live-1', 'cursor', 'proj/live-1', '/tmp/project');
+            INSERT INTO session_links
+              (source_session_id, target_session_id, link_type, target_harness,
+               target_external_id, link_role)
+            VALUES ('t3code:owner', 'cursor:proj/live-1', 'provider_backing',
+                    'cursor', 'proj/live-1', 'worker');
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        body = live_payload(
+            self.db,
+            presence_path=self.presence,
+            now=self.now,
+            scan=False,
+        )
+        self.assertEqual(body["counts"]["workers"], 1)
+        self.assertEqual(body["sessions"][0]["parent_session_id"], "t3code:owner")
 
     def test_sse_emits_presence_on_change(self) -> None:
         data = json.loads(self.presence.read_text(encoding="utf-8"))

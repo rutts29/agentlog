@@ -1,17 +1,33 @@
-import { useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useOutletContext, useSearchParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
-import { fetchFacets, fetchSessions, logicalHarness, runtimeHarness } from "@/lib/api";
+import {
+  fetchFacets,
+  fetchSessionTree,
+  fetchSessions,
+  logicalHarness,
+  runtimeHarness,
+  type TreeNode,
+} from "@/lib/api";
 import { PanelCard } from "@/components/ui/card";
 import { EmptyState } from "@/components/EmptyState";
 import { HarnessTag, ModelBadge, RuntimeHarnessLabel } from "@/components/ui/badges";
 import { cn, formatDuration, formatFullTime, harnessColor } from "@/lib/utils";
 import { useViewShortcuts } from "@/lib/keyboard";
+import { projectBranchTree } from "@/lib/sessionTree";
 
 type Ctx = { range: string };
 
 function multi(params: URLSearchParams, key: string): string[] {
   return params.getAll(key).filter(Boolean);
+}
+
+function detailHref(id: string, params: URLSearchParams): string {
+  const next = new URLSearchParams(params);
+  next.delete("root");
+  next.delete("msg");
+  const search = next.toString();
+  return `/sessions/${encodeURIComponent(id)}${search ? `?${search}` : ""}`;
 }
 
 const FILTER_KEYS = ["harness", "model", "effort", "project", "branch", "q"] as const;
@@ -30,10 +46,11 @@ export function Sessions() {
   const order = params.get("order") ?? "desc";
   const cursor = Number(params.get("cursor") || "0");
   const [selected, setSelected] = useState(-1);
+  const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
 
   const facets = useQuery({
-    queryKey: ["facets", range],
-    queryFn: () => fetchFacets(range),
+    queryKey: ["facets", "roots", range],
+    queryFn: () => fetchFacets(range, "roots"),
   });
   const list = useQuery({
     queryKey: [
@@ -80,9 +97,8 @@ export function Sessions() {
       return true;
     }
     if (e.key === "Enter" && selected >= 0 && items[selected]) {
-      navigate(
-        `/sessions/${encodeURIComponent(items[selected].id)}?${params.toString()}`,
-      );
+      const item = items[selected];
+      navigate(detailHref(item.navigation_id ?? item.id, params));
       return true;
     }
     return false;
@@ -154,18 +170,25 @@ export function Sessions() {
 
   return (
     <div className="space-y-3">
-      <div className="flex items-baseline justify-between">
-        <h1 className="text-[18px] font-semibold tracking-tight">Sessions</h1>
+      <div className="flex flex-wrap items-end justify-between gap-2">
+        <div>
+          <h1 className="text-[18px] font-semibold tracking-tight">Sessions</h1>
+          <p className="mt-0.5 text-[11px] text-faint-foreground">
+            {list.data.note}
+          </p>
+        </div>
         <div className="flex items-center gap-3 text-[12px] text-muted-foreground">
           <span className="text-faint-foreground">
             <kbd>j</kbd> <kbd>k</kbd> rows · <kbd>↵</kbd> open
           </span>
-          <span className="tabular">{list.data.total.toLocaleString()} matching</span>
+          <span className="tabular">
+            {list.data.total.toLocaleString()} root conversations
+          </span>
         </div>
       </div>
 
       <div className="rounded-card border border-border bg-card p-3">
-        <div className="grid grid-cols-6 gap-2">
+        <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-6">
           <FacetSelect
             label="Harness"
             value={harness[0] ?? ""}
@@ -237,7 +260,7 @@ export function Sessions() {
       </div>
 
       <PanelCard
-        title="Ledger"
+        title="Conversations"
         aside={`${cursor + 1}–${Math.min(cursor + items.length, list.data.total)} of ${list.data.total.toLocaleString()}`}
       >
         {items.length === 0 ? (
@@ -252,7 +275,7 @@ export function Sessions() {
             <table className="w-full text-left text-[12px]">
               <thead>
                 <tr className="microlabel border-b border-border text-[10px] text-faint-foreground">
-                  <SortTh label="Start" col="started_at" sort={sort} order={order} onClick={toggleSort} first />
+                  <SortTh label="Activity" col="started_at" sort={sort} order={order} onClick={toggleSort} first />
                   <SortTh label="Harness" col="harness" sort={sort} order={order} onClick={toggleSort} />
                   <SortTh label="Model" col="model" sort={sort} order={order} onClick={toggleSort} />
                   <SortTh label="Project" col="project" sort={sort} order={order} onClick={toggleSort} />
@@ -260,19 +283,21 @@ export function Sessions() {
                   <SortTh label="Dur" col="duration" sort={sort} order={order} onClick={toggleSort} right />
                   <SortTh label="Msgs" col="messages" sort={sort} order={order} onClick={toggleSort} right />
                   <SortTh label="Tools" col="tools" sort={sort} order={order} onClick={toggleSort} right />
-                  <SortTh label="Win" col="windows" sort={sort} order={order} onClick={toggleSort} right last />
+                  <SortTh label="Win" col="windows" sort={sort} order={order} onClick={toggleSort} right />
+                  <th className="microlabel py-2 pr-4 text-right text-[10px] font-medium">
+                    Branches
+                  </th>
                 </tr>
               </thead>
               <tbody>
-                {items.map((s, i) => (
+                {items.map((s, i) => {
+                  const descendantCount = s.descendant_count ?? s.child_count ?? 0;
+                  const isExpanded = expanded.has(s.id);
+                  return (
+                  <Fragment key={s.id}>
                   <tr
-                    key={s.id}
                     id={`session-row-${i}`}
-                    onClick={() =>
-                      navigate(
-                        `/sessions/${encodeURIComponent(s.id)}?${params.toString()}`,
-                      )
-                    }
+                    onClick={() => navigate(detailHref(s.navigation_id ?? s.id, params))}
                     className={cn(
                       "cursor-pointer border-b border-border-faint last:border-0 hover:bg-muted/40",
                       selected === i && "bg-muted/60",
@@ -284,13 +309,47 @@ export function Sessions() {
                     }
                   >
                     <td className="px-4 py-1.5">
-                      <Link
-                        to={`/sessions/${encodeURIComponent(s.id)}?${params.toString()}`}
-                        onClick={(e) => e.stopPropagation()}
-                        className="tabular whitespace-nowrap text-muted-foreground hover:text-foreground"
-                      >
-                        {formatFullTime(s.started_at)}
-                      </Link>
+                      <div className="flex min-w-[180px] items-start gap-2">
+                        {descendantCount > 0 ? (
+                          <button
+                            type="button"
+                            aria-expanded={isExpanded}
+                            aria-controls={`session-tree-${i}`}
+                            aria-label={`${isExpanded ? "Collapse" : "Expand"} child sessions for ${s.id}`}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setExpanded((current) => {
+                                const next = new Set(current);
+                                if (next.has(s.id)) next.delete(s.id);
+                                else next.add(s.id);
+                                return next;
+                              });
+                            }}
+                            className="mt-0.5 inline-flex h-5 w-5 shrink-0 items-center justify-center rounded border border-border text-[12px] text-muted-foreground hover:border-ring hover:text-foreground"
+                          >
+                            <span aria-hidden>{isExpanded ? "−" : "+"}</span>
+                          </button>
+                        ) : (
+                          <span aria-hidden className="inline-block h-5 w-5 shrink-0" />
+                        )}
+                        <div className="flex min-w-0 flex-col items-start gap-0.5">
+                          <span className="inline-flex items-center rounded-[4px] border border-border px-1.5 py-[2px] text-[10px] leading-none text-muted-foreground">
+                            Main
+                          </span>
+                        <Link
+                          to={detailHref(s.navigation_id ?? s.id, params)}
+                          onClick={(e) => e.stopPropagation()}
+                          className="tabular whitespace-nowrap text-muted-foreground hover:text-foreground"
+                        >
+                          {formatFullTime(s.activity_at ?? s.started_at)}
+                        </Link>
+                        {s.activity_at && s.started_at && s.activity_at !== s.started_at ? (
+                          <span className="tabular whitespace-nowrap text-[10px] text-faint-foreground">
+                            started {formatFullTime(s.started_at)}
+                          </span>
+                          ) : null}
+                        </div>
+                      </div>
                     </td>
                     <td className="py-1.5">
                       <div className="flex flex-col items-start gap-1">
@@ -299,6 +358,19 @@ export function Sessions() {
                           logicalHarness={logicalHarness(s)}
                           runtimeHarness={runtimeHarness(s)}
                         />
+                        {s.is_orphan ? (
+                          <span className="text-[10px] text-status-warn">
+                            Unlinked branch
+                          </span>
+                        ) : null}
+                        {s.matched_in_descendant ? (
+                          <span className="whitespace-nowrap text-[10px] text-muted-foreground">
+                            Matched in branch
+                            {(s.matching_descendant_count ?? 0) > 1
+                              ? ` ×${s.matching_descendant_count}`
+                              : ""}
+                          </span>
+                        ) : null}
                       </div>
                     </td>
                     <td className="max-w-[220px] py-1.5 pr-2">
@@ -322,8 +394,21 @@ export function Sessions() {
                     <td className="tabular px-4 py-1.5 text-right text-muted-foreground">
                       {s.window_count ?? "—"}
                     </td>
+                    <td className="tabular py-1.5 pr-4 text-right text-muted-foreground">
+                      {descendantCount > 0
+                        ? descendantCount.toLocaleString()
+                        : "—"}
+                    </td>
                   </tr>
-                ))}
+                  {isExpanded ? (
+                    <SessionTreeRows
+                      id={`session-tree-${i}`}
+                      rootId={s.id}
+                      params={params}
+                    />
+                  ) : null}
+                  </Fragment>
+                );})}
               </tbody>
             </table>
           </div>
@@ -357,6 +442,106 @@ export function Sessions() {
         </div>
       </PanelCard>
     </div>
+  );
+}
+
+function SessionTreeRows({
+  id,
+  rootId,
+  params,
+}: {
+  id: string;
+  rootId: string;
+  params: URLSearchParams;
+}) {
+  const tree = useQuery({
+    queryKey: ["session-tree", rootId],
+    queryFn: () => fetchSessionTree(rootId),
+    enabled: Boolean(rootId),
+  });
+  const projection = useMemo(
+    () => projectBranchTree(tree.data?.tree),
+    [tree.data?.tree],
+  );
+
+  return (
+    <tr id={id} className="border-b border-border-faint bg-muted/10">
+      <td colSpan={10} className="px-4 py-2">
+        {tree.isLoading ? (
+          <div className="pl-7 text-[11px] text-muted-foreground">Loading child sessions…</div>
+        ) : tree.isError || !tree.data ? (
+          <div className="pl-7 text-[11px] text-status-warn">Child sessions unavailable.</div>
+        ) : (
+          <div className="space-y-1">
+            <TreeRows nodes={tree.data.tree.children} visibleIds={new Set(projection.rows.map(({ node }) => node.id))} params={params} depth={1} parentHarness={logicalHarness(tree.data.tree)} />
+            {projection.omittedNodeCount > 0 ? (
+              <div className="pl-7 text-[10px] text-faint-foreground">
+                +{projection.omittedNodeCount.toLocaleString()} child sessions omitted by the 500-node / 64-level bound.
+              </div>
+            ) : null}
+          </div>
+        )}
+      </td>
+    </tr>
+  );
+}
+
+function TreeRows({
+  nodes,
+  visibleIds,
+  params,
+  depth,
+  parentHarness,
+}: {
+  nodes: TreeNode[];
+  visibleIds: Set<string>;
+  params: URLSearchParams;
+  depth: number;
+  parentHarness: string;
+}) {
+  return (
+    <>
+      {nodes.map((node) => {
+        if (!visibleIds.has(node.id)) return null;
+        const role = node.thread_source === "subagent" || node.relationship === "provider_worker" ? "Worker" : "Branch";
+        return (
+          <div
+            key={node.id}
+            className="min-w-0 border-l-2 pl-3"
+            style={{
+              marginLeft: `${Math.min(depth - 1, 63) * 12}px`,
+              borderLeftColor: `color-mix(in srgb, ${harnessColor(parentHarness)} 45%, transparent)`,
+            }}
+          >
+            <Link
+              to={detailHref(node.navigation_id ?? node.id, params)}
+              className="group block min-w-0 rounded-control border border-border-faint px-3 py-2 hover:border-border hover:bg-muted/30"
+              style={{ borderLeftWidth: 2, borderLeftColor: harnessColor(logicalHarness(node)) }}
+            >
+              <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
+                <span className="inline-flex shrink-0 items-center rounded-[4px] border border-border px-1.5 py-[2px] text-[10px] leading-none text-muted-foreground">
+                  {role}
+                </span>
+                <HarnessTag harness={logicalHarness(node)} />
+                <RuntimeHarnessLabel logicalHarness={logicalHarness(node)} runtimeHarness={runtimeHarness(node)} />
+                <span className="min-w-0 truncate font-mono text-[11px] text-muted-foreground group-hover:text-foreground">
+                  {node.id}
+                </span>
+                <span className="tabular ml-auto shrink-0 text-[10px] text-faint-foreground">
+                  {formatFullTime(node.started_at)}
+                </span>
+              </div>
+              <div className="mt-1 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-faint-foreground">
+                <ModelBadge model={node.model} harness={runtimeHarness(node)} effort={node.effort} />
+                <span className="tabular">{node.message_count} msgs · {node.tool_count} tools</span>
+                {node.children.length > 0 ? <span className="tabular">· {node.descendant_count ?? node.children.length} descendants</span> : null}
+              </div>
+            </Link>
+            <TreeRows nodes={node.children} visibleIds={visibleIds} params={params} depth={depth + 1} parentHarness={logicalHarness(node)} />
+          </div>
+        );
+      })}
+    </>
   );
 }
 

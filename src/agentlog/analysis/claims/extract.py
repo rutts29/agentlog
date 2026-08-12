@@ -28,6 +28,12 @@ from agentlog.analysis.claims.models import (
 )
 from agentlog.analysis.claims.scope import project_label
 from agentlog.analysis.skills import skill_aliases
+from agentlog.source_reader import CachedSourceTranscriptReader
+from agentlog.session_identity import (
+    build_identity_context,
+    logical_projection,
+    logical_session_root_ids,
+)
 
 THEME_PATTERNS: list[tuple[str, re.Pattern[str], str]] = [
     (
@@ -200,20 +206,31 @@ def _json_list(raw: str | None) -> list[Any]:
 
 
 def _root_session_count(conn: sqlite3.Connection) -> int:
-    row = conn.execute(
-        """
-        SELECT COUNT(*) AS c FROM sessions
-        WHERE parent_session_id IS NULL
-          AND COALESCE(external_id, '') NOT LIKE 'skills:%'
-        """
-    ).fetchone()
-    return int(row["c"]) if row else 0
+    return len(_eligible_logical_root_ids(conn))
+
+
+def _eligible_logical_root_ids(conn: sqlite3.Connection) -> set[str]:
+    roots = logical_session_root_ids(conn)
+    return {
+        roots[str(row["id"])]
+        for row in conn.execute(
+            "SELECT id FROM sessions WHERE COALESCE(external_id, '') NOT LIKE 'skills:%'"
+        )
+    }
 
 
 def _extract_skill_claims(conn: sqlite3.Connection, now: str) -> list[Claim]:
     if not _table_exists(conn, "skills") or not _table_exists(conn, "skill_exposures"):
         return []
     claims: list[Claim] = []
+    logical_roots = logical_session_root_ids(conn)
+    eligible_session_ids = {
+        str(row["id"])
+        for row in conn.execute(
+            "SELECT id FROM sessions WHERE COALESCE(external_id, '') NOT LIKE 'skills:%'"
+        )
+    }
+    eligible_roots = _eligible_logical_root_ids(conn)
     total_sessions = _root_session_count(conn)
     skills = conn.execute(
         """
@@ -244,7 +261,13 @@ def _extract_skill_claims(conn: sqlite3.Connection, now: str) -> list[Claim]:
             if exp_name in aliases or bare in aliases:
                 matched_rows.extend(rows)
         session_ids = sorted({str(r["session_id"]) for r in matched_rows})
-        n_sessions = len(session_ids)
+        exposed_roots = {
+            logical_roots.get(session_id, session_id)
+            for session_id in session_ids
+            if session_id in eligible_session_ids
+        }
+        exposed_roots.intersection_update(eligible_roots)
+        n_sessions = len(exposed_roots)
         exposure_count = len(matched_rows)
         name = str(skill["name"])
         source = str(skill["source"])
@@ -373,24 +396,39 @@ def _extract_skill_claims(conn: sqlite3.Connection, now: str) -> list[Claim]:
 
 
 def _extract_harness_model_claims(conn: sqlite3.Connection, now: str) -> list[Claim]:
-    rows = conn.execute(
+    session_rows = conn.execute(
         """
-        SELECT
-            COALESCE(NULLIF(repo, ''), NULLIF(cwd, ''), '(unknown)') AS project_key,
-            repo,
-            cwd,
-            harness,
-            COALESCE(NULLIF(model_canonical, ''), NULLIF(model, ''), '(unknown)') AS model,
-            COUNT(*) AS sessions
+        SELECT id, harness, external_id, repo, cwd, model, model_canonical
         FROM sessions
-        WHERE parent_session_id IS NULL
-          AND COALESCE(external_id, '') NOT LIKE 'skills:%'
-        GROUP BY 1, 2, 3, 4, 5
-        HAVING sessions >= ?
-        ORDER BY sessions DESC
-        """,
-        (MIN_SESSIONS_FLOOR,),
+        WHERE COALESCE(external_id, '') NOT LIKE 'skills:%'
+        """
     ).fetchall()
+    rows_by_id = {str(row["id"]): row for row in session_rows}
+    logical_roots = logical_session_root_ids(conn)
+    identity = build_identity_context(conn)
+    rows: list[dict[str, Any]] = []
+    for root_id in sorted(set(logical_roots.values())):
+        root = rows_by_id.get(root_id)
+        if root is None:
+            continue
+        projection = logical_projection(
+            conn, root_id, str(root["harness"]), context=identity
+        )
+        metric_id = str(
+            identity.canonical_root_backing_by_source.get(root_id)
+            or projection["transcript_session_id"]
+            or root_id
+        )
+        metric = rows_by_id.get(metric_id, root)
+        rows.append(
+            {
+                "repo": root["repo"] or metric["repo"],
+                "cwd": root["cwd"] or metric["cwd"],
+                "harness": projection["logical_harness"],
+                "model": metric["model_canonical"] or metric["model"] or "(unknown)",
+                "sessions": 1,
+            }
+        )
     claims: list[Claim] = []
     # Aggregate by project label for cleaner subjects.
     by_project: dict[str, list[Any]] = defaultdict(list)
@@ -400,6 +438,8 @@ def _extract_harness_model_claims(conn: sqlite3.Connection, now: str) -> list[Cl
 
     for label, items in by_project.items():
         total = sum(int(r["sessions"]) for r in items)
+        if total < MIN_SESSIONS_FLOOR:
+            continue
         support = _support_status(total)
         # Keep top models for the project.
         model_counts: Counter[str] = Counter()
@@ -551,7 +591,9 @@ def _theme_blob(text: str, spans_json: str | None) -> str:
     return f"{text or ''}\n" + "\n".join(quotes)
 
 
-def _extract_theme_claims(conn: sqlite3.Connection, now: str) -> list[Claim]:
+def _extract_theme_claims(
+    conn: sqlite3.Connection, now: str, source_reader: CachedSourceTranscriptReader
+) -> list[Claim]:
     if not _table_exists(conn, "ux_observations"):
         return []
     label_basis = _label_basis(conn)
@@ -582,6 +624,22 @@ def _extract_theme_claims(conn: sqlite3.Connection, now: str) -> list[Claim]:
         """
     ).fetchall()
 
+    source_text: dict[str, str] = {}
+    source_ids = {
+        str(row["session_id"])
+        for row in rows
+        if conn.execute(
+            "SELECT transcript_storage FROM sessions WHERE id = ?", (row["session_id"],)
+        ).fetchone()["transcript_storage"] == "source_backed"
+    }
+    for session_id in source_ids:
+        source = source_reader(conn, session_id)
+        if not source.ready:
+            raise RuntimeError(
+                f"canonical source unavailable for {session_id}: "
+                f"{source.warning or source.status}"
+            )
+        source_text.update({str(message["id"]): str(message["text"]) for message in source.messages})
     theme_windows: dict[str, list[Any]] = defaultdict(list)
     theme_sessions: dict[str, set[str]] = defaultdict(set)
     theme_projects: dict[str, Counter[str]] = defaultdict(Counter)
@@ -607,7 +665,7 @@ def _extract_theme_claims(conn: sqlite3.Connection, now: str) -> list[Claim]:
             continue
         if kinds and not (kinds & _OWNERISH):
             continue
-        text = str(r["text"] or "")
+        text = source_text.get(str(r["request_message_id"]), str(r["text"] or ""))
         # Harness-generated reviewer/worker envelopes are not owner instructions.
         if text.lstrip().startswith("You are reviewing") or text.lstrip().startswith(
             "The coordinator sent"
@@ -818,8 +876,12 @@ def derive_claims(
     claims.extend(_extract_skill_claims(conn, ts))
     claims.extend(_extract_harness_model_claims(conn, ts))
     claims.extend(_extract_tool_failure_claims(conn, ts))
+    source_reader = CachedSourceTranscriptReader()
     if include_llm_derived:
-        claims.extend(_extract_theme_claims(conn, ts))
+        claims.extend(_extract_theme_claims(conn, ts, source_reader))
+
+    if not source_reader.verify_current():
+        raise RuntimeError("canonical source changed during claim extraction")
 
     prior: list[Claim] = []
     if _table_exists(conn, "claims"):

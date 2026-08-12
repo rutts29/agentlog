@@ -196,7 +196,10 @@ class CoachMaterializeTests(unittest.TestCase):
             "emitted_source_hash": _sha256(source_text), "quote": "Please verify",
             "quote_start": 0, "quote_end": len("Please verify"),
         }
-        with patch("agentlog.analysis.coach.materialize.read_source_transcript", return_value=result) as reader:
+        with patch(
+            "agentlog.source_reader.CachedSourceTranscriptReader.__call__",
+            return_value=result,
+        ) as reader:
             self.assertEqual(_verify_message_evidence(self.conn, evidence, "source", window, {}), "")
         reader.assert_called_once_with(self.conn, "source")
 
@@ -958,15 +961,14 @@ class CoachMaterializeTests(unittest.TestCase):
         with self.assertRaisesRegex(MaterializationError, "lineage contains a cycle"):
             plan_materialization(self.conn, run_dir)
 
-    def test_shared_unresolved_parent_cannot_inflate_root_support(self):
+    def test_shared_unresolved_parent_is_not_lineage(self):
         self._seed_roots(10)
         self.conn.execute(
             "UPDATE sessions SET parent_session_id = 'shared-missing-parent'"
         )
         self.conn.commit()
         run_dir, _, _, _, _ = self._build_run()
-        with self.assertRaisesRegex(MaterializationError, "shared unresolved parent"):
-            plan_materialization(self.conn, run_dir)
+        plan_materialization(self.conn, run_dir)
 
     def test_uncited_packetized_window_change_invalidates_the_run(self):
         self._seed_roots(10)

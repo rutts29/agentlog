@@ -68,6 +68,9 @@ _IMAGE_PLACEHOLDERS = frozenset(
     }
 )
 _CONTINUE_STUB_RE = re.compile(r"^<continue\s*/?>$", re.IGNORECASE)
+_INTERRUPTED_REQUEST_RE = re.compile(
+    r"^\[request interrupted by user\]$", re.IGNORECASE
+)
 _RECOMMENDED_PLUGINS_RE = re.compile(
     r"^\s*<recommended_plugins>.*</environment_context>\s*$",
     re.IGNORECASE | re.DOTALL,
@@ -166,6 +169,8 @@ def classify_synthetic_user_text(text: str) -> SyntheticFlags:
         return SyntheticFlags(authored_by_agent=True)
     if _CONTINUE_STUB_RE.fullmatch(stripped):
         return SyntheticFlags(authored_by_agent=True)
+    if _INTERRUPTED_REQUEST_RE.fullmatch(stripped):
+        return SyntheticFlags(is_tool_plumbing=True)
     if stripped.casefold() in _IMAGE_PLACEHOLDERS:
         return SyntheticFlags(is_tool_plumbing=True)
     if "<user_query" in stripped.casefold():

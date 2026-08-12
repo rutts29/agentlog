@@ -10,8 +10,14 @@ from unittest.mock import patch
 from agentlog import source_reader
 from agentlog.api.descriptive import session_detail_v2
 from agentlog.db.schema import connect, init_db
-from agentlog.ingest.base import content_hash_text, hash_prefix
-from agentlog.source_reader import read_source_transcript
+from agentlog.ingest.base import TranscriptAdapter, content_hash_text, hash_prefix
+from agentlog.normalize.models import (
+    Harness,
+    NormalizedMessage,
+    NormalizedSession,
+    ParseResult,
+)
+from agentlog.source_reader import CachedSourceTranscriptReader, read_source_transcript
 
 
 def _line(role: str, text: str) -> bytes:
@@ -33,6 +39,41 @@ def _line(role: str, text: str) -> bytes:
         )
         + "\n"
     ).encode()
+
+
+class _MultiSessionSqliteAdapter(TranscriptAdapter):
+    harness = Harness.T3CODE
+    supports_byte_append = False
+    parse_calls = 0
+
+    def discover(self) -> list[Path]:
+        return []
+
+    def parse_chunk(self, path, data, *, start_offset):
+        raise NotImplementedError
+
+    def parse_path(self, path, data, *, start_offset):
+        type(self).parse_calls += 1
+        return [
+            ParseResult(
+                session=NormalizedSession(
+                    harness=Harness.T3CODE,
+                    external_id=external_id,
+                ),
+                messages=[
+                    NormalizedMessage(
+                        seq=1,
+                        role="user",
+                        text=text,
+                        content_hash=content_hash_text(text),
+                    )
+                ],
+            )
+            for external_id, text in (
+                ("first", "first shared source message"),
+                ("second", "second shared source message"),
+            )
+        ]
 
 
 class SourceTranscriptReaderTests(unittest.TestCase):
@@ -152,6 +193,93 @@ class SourceTranscriptReaderTests(unittest.TestCase):
         self.assertTrue(result.ready)
         self.assertGreaterEqual(calls, 2)
         self.assertEqual(result.messages[-1]["text"], "boundary append")
+
+    def test_checkpoint_blocked_parse_is_not_served_as_ready(self) -> None:
+        blocked = ParseResult(
+            session=NormalizedSession(
+                harness=Harness.CODEX,
+                external_id="019fbdec-7065-7470-bb1e-dfa6c0d38237",
+            ),
+            extras={
+                "checkpoint_blocked": True,
+                "checkpoint_blocked_reason": "ambiguous fork boundary",
+            },
+        )
+        with patch(
+            "agentlog.source_reader._parse_current",
+            return_value=([blocked], "blocked-source-hash"),
+        ):
+            result = read_source_transcript(self.conn, self.session_id)
+
+        self.assertEqual(result.status, "source_changed")
+        self.assertEqual(result.messages, [])
+        self.assertEqual(result.warning, "ambiguous fork boundary")
+
+    def test_operation_cache_parses_and_fingerprints_shared_sqlite_once(self) -> None:
+        sqlite_path = Path(self._tmp.name) / "shared.sqlite"
+        source = sqlite3.connect(sqlite_path)
+        source.execute("CREATE TABLE source_marker (id INTEGER PRIMARY KEY)")
+        source.commit()
+        source.close()
+        self.conn.execute(
+            """
+            INSERT INTO artifacts
+              (harness, path, size, mtime_ns, content_hash, parsed_offset,
+               parser_version, transcript_storage)
+            VALUES ('t3code', ?, ?, ?, 'shared', 0, 'source-test',
+                    'legacy_materialized')
+            """,
+            (
+                str(sqlite_path),
+                sqlite_path.stat().st_size,
+                sqlite_path.stat().st_mtime_ns,
+            ),
+        )
+        artifact_id = self.conn.execute(
+            "SELECT MAX(id) AS id FROM artifacts"
+        ).fetchone()["id"]
+        for external_id, text in (
+            ("first", "first shared source message"),
+            ("second", "second shared source message"),
+        ):
+            session_id = f"t3code:{external_id}"
+            self.conn.execute(
+                """
+                INSERT INTO sessions
+                  (id, harness, external_id, artifact_id, transcript_storage)
+                VALUES (?, 't3code', ?, ?, 'source_backed')
+                """,
+                (session_id, external_id, artifact_id),
+            )
+            self.conn.execute(
+                """
+                INSERT INTO messages
+                  (id, session_id, seq, role, text, content_hash)
+                VALUES (?, ?, 1, 'user', '', ?)
+                """,
+                (f"{session_id}:m:1", session_id, content_hash_text(text)),
+            )
+        self.conn.commit()
+
+        _MultiSessionSqliteAdapter.parse_calls = 0
+        reader = CachedSourceTranscriptReader()
+        with (
+            patch.dict(
+                source_reader._ADAPTERS,
+                {Harness.T3CODE.value: _MultiSessionSqliteAdapter},
+            ),
+            patch(
+                "agentlog.source_reader.sqlite_fingerprint",
+                wraps=source_reader.sqlite_fingerprint,
+            ) as fingerprint,
+        ):
+            first = reader(self.conn, "t3code:first")
+            second = reader(self.conn, "t3code:second")
+
+        self.assertTrue(first.ready)
+        self.assertTrue(second.ready)
+        self.assertEqual(_MultiSessionSqliteAdapter.parse_calls, 1)
+        self.assertEqual(fingerprint.call_count, 1)
 
     def test_sqlite_rewrite_with_same_session_id_fails_closed(self) -> None:
         source_path = Path(self._tmp.name) / "hermes.db"

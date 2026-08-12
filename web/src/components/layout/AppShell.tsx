@@ -98,9 +98,9 @@ export function AppShell() {
     : "—";
 
   return (
-    <div className="flex h-screen overflow-hidden">
-      <aside className="flex w-[200px] shrink-0 flex-col border-r border-border bg-card">
-        <div className="flex items-center gap-2 px-4 pb-3 pt-4">
+    <div className="flex h-screen flex-col overflow-hidden sm:flex-row">
+      <aside className="flex h-10 w-full shrink-0 items-center border-b border-border bg-card sm:h-auto sm:w-[200px] sm:flex-col sm:items-stretch sm:border-b-0 sm:border-r">
+        <div className="flex shrink-0 items-center gap-2 px-3 sm:px-4 sm:pb-3 sm:pt-4">
           <svg width="14" height="14" viewBox="0 0 14 14" aria-hidden>
             <rect x="0.5" y="0.5" width="13" height="13" rx="2" fill="none" stroke="var(--muted-foreground)" />
             <rect x="3" y="7.5" width="2" height="3.5" fill="var(--harness-codex)" />
@@ -109,13 +109,16 @@ export function AppShell() {
           </svg>
           <span className="text-[14px] font-semibold tracking-tight">agentlog</span>
         </div>
-        <nav className="flex flex-1 flex-col gap-4 overflow-y-auto px-2 pt-1">
+        <nav
+          aria-label="Primary"
+          className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto px-1 py-1 sm:flex-col sm:items-stretch sm:gap-4 sm:overflow-x-visible sm:overflow-y-auto sm:px-2 sm:pt-1"
+        >
           {NAV_SECTIONS.map((section) => (
-            <div key={section.title}>
-              <div className="microlabel px-3 pb-1 text-[10px] text-faint-foreground">
+            <div key={section.title} className="contents sm:block">
+              <div className="microlabel hidden px-3 pb-1 text-[10px] text-faint-foreground sm:block">
                 {section.title}
               </div>
-              <div className="flex flex-col gap-px">
+              <div className="contents sm:flex sm:flex-col sm:gap-px">
                 {section.items.map((item) => (
                   <NavLink
                     key={item.to}
@@ -123,7 +126,7 @@ export function AppShell() {
                     end={item.end}
                     className={({ isActive }) =>
                       cn(
-                        "relative rounded-control px-3 py-1.5 text-[13px] text-muted-foreground hover:text-foreground",
+                        "relative shrink-0 rounded-control px-3 py-1.5 text-[13px] text-muted-foreground hover:text-foreground",
                         isActive &&
                           "bg-muted text-foreground before:absolute before:left-0 before:top-[7px] before:h-[12px] before:w-[2px] before:rounded-full before:bg-primary",
                       )
@@ -136,7 +139,7 @@ export function AppShell() {
             </div>
           ))}
         </nav>
-        <div className="border-t border-border px-4 py-3">
+        <div className="hidden border-t border-border px-4 py-3 sm:block">
           <div className="flex items-baseline gap-1.5">
             <span className="tabular text-[15px] font-semibold text-foreground">
               {meta.data?.freshness.sessions.toLocaleString() ?? "—"}
@@ -154,12 +157,12 @@ export function AppShell() {
         </div>
       </aside>
 
-      <div className="flex min-w-0 flex-1 flex-col">
-        <header className="flex h-11 shrink-0 items-center gap-3 border-b border-border px-5">
-          <div className="text-[12px] text-faint-foreground">
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+        <header className="flex h-11 shrink-0 items-center gap-3 border-b border-border px-3 sm:px-5">
+          <div className="hidden text-[12px] text-faint-foreground sm:block">
             Descriptive usage ledger · observational history
           </div>
-          <div className="ml-auto flex items-center gap-3">
+          <div className="ml-auto flex w-full items-center justify-between gap-3 sm:w-auto sm:justify-start">
             <button
               type="button"
               onClick={() => setPaletteOpen(true)}

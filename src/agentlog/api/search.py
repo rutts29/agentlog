@@ -198,6 +198,8 @@ def _scan_source_session(
     max_messages: int,
 ) -> tuple[list[Mapping[str, Any]], Mapping[str, Any], bool]:
     messages, metadata = _reader_result(source_reader, conn, session_id)
+    if str(metadata.get("status") or "") != "ready":
+        return [], metadata, False
     truncated = len(messages) > max_messages
     hits: list[Mapping[str, Any]] = []
     for message in messages[:max_messages]:
@@ -329,9 +331,9 @@ def search_messages(
     source_truncated = False
     source_warnings: list[str] = []
     if source_reader is None and source_sessions:
-        from agentlog.source_reader import read_source_transcript
+        from agentlog.source_reader import CachedSourceTranscriptReader
 
-        source_reader = read_source_transcript
+        source_reader = CachedSourceTranscriptReader()
     if source_reader is not None and source_sessions:
         scan_limit = max(1, min(int(source_scan_limit), MAX_SOURCE_SCAN_LIMIT))
         ordered = sorted(

@@ -18,6 +18,7 @@ from agentlog.analysis.extractors.taxonomy import (
     USER_TEXT_CAP,
 )
 from agentlog.safety.redaction import REDACTION_VERSION, RedactionReport, redact_text
+from agentlog.source_reader import CachedSourceTranscriptReader
 
 
 def _trunc(text: str, cap: int) -> str:
@@ -38,6 +39,7 @@ def load_window_contexts(
     conn: sqlite3.Connection,
     *,
     window_ids: Iterable[str] | None = None,
+    source_reader: CachedSourceTranscriptReader | None = None,
 ) -> list[WindowContext]:
     """Reconstruct exchange windows with seq-range assistant/tool context."""
     if window_ids is not None:
@@ -48,7 +50,8 @@ def load_window_contexts(
         windows = list(
             conn.execute(
                 f"""
-                SELECT ew.*, s.harness, s.model AS session_model
+                SELECT ew.*, s.harness, s.model AS session_model,
+                       s.transcript_storage
                 FROM exchange_windows ew
                 JOIN sessions s ON s.id = ew.session_id
                 WHERE ew.id IN ({placeholders})
@@ -61,7 +64,8 @@ def load_window_contexts(
         windows = list(
             conn.execute(
                 """
-                SELECT ew.*, s.harness, s.model AS session_model
+                SELECT ew.*, s.harness, s.model AS session_model,
+                       s.transcript_storage
                 FROM exchange_windows ew
                 JOIN sessions s ON s.id = ew.session_id
                 ORDER BY s.harness, ew.id
@@ -69,9 +73,26 @@ def load_window_contexts(
             )
         )
 
+    reader = source_reader or CachedSourceTranscriptReader()
+    source_text: dict[str, str] = {}
+    source_sessions = {
+        str(window["session_id"])
+        for window in windows
+        if str(window["transcript_storage"] or "legacy_materialized") == "source_backed"
+    }
+    for session_id in sorted(source_sessions):
+        source = reader(conn, session_id)
+        if not source.ready:
+            raise RuntimeError(
+                f"canonical source unavailable for {session_id}: "
+                f"{source.warning or source.status}"
+            )
+        source_text.update(
+            {str(message["id"]): str(message["text"]) for message in source.messages}
+        )
     out: list[WindowContext] = []
     for win in windows:
-        ctx = _build_one(conn, win)
+        ctx = _build_one(conn, win, source_text=source_text)
         out.append(ctx)
     return out
 
@@ -160,7 +181,12 @@ def _window_tools(
     return sorted(linked + orphans, key=lambda r: int(r["seq"]))
 
 
-def _build_one(conn: sqlite3.Connection, win: sqlite3.Row) -> WindowContext:
+def _build_one(
+    conn: sqlite3.Connection,
+    win: sqlite3.Row,
+    *,
+    source_text: dict[str, str],
+) -> WindowContext:
     session_id = win["session_id"]
     req = conn.execute(
         "SELECT * FROM messages WHERE id = ?", (win["request_message_id"],)
@@ -223,7 +249,7 @@ def _build_one(conn: sqlite3.Connection, win: sqlite3.Row) -> WindowContext:
 
     assistant_parts: list[str] = []
     for msg in assistants:
-        t = (msg["text"] or "").strip()
+        t = source_text.get(str(msg["id"]), msg["text"] or "").strip()
         if t:
             assistant_parts.append(t)
     # Prefer last narrations + final when over budget.
@@ -238,8 +264,12 @@ def _build_one(conn: sqlite3.Connection, win: sqlite3.Row) -> WindowContext:
         succ_s = "?" if succ is None else ("1" if succ else "0")
         timeline.append(f"{te['tool_name']}|{te['action']}|{succ_s}")
 
-    req_text = req["text"] or ""
-    next_text = (next_user["text"] if next_user is not None else "") or ""
+    req_text = source_text.get(str(req["id"]), req["text"] or "")
+    next_text = (
+        source_text.get(str(next_user["id"]), next_user["text"] or "")
+        if next_user is not None
+        else ""
+    )
 
     return WindowContext(
         window_id=win["id"],

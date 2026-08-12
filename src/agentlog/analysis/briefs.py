@@ -17,6 +17,11 @@ from agentlog.analysis.attention import (
     _incomplete_todo_in_text,
     derive_attention,
 )
+from agentlog.session_identity import (
+    explicit_worker_parent_ids,
+    implicit_parent_ids,
+)
+from agentlog.source_reader import CachedSourceTranscriptReader
 
 # Soft budget for rendered Markdown (characters).
 MARKDOWN_BUDGET = 2048
@@ -140,10 +145,33 @@ def _parent_keys(row: sqlite3.Row) -> tuple[str, ...]:
     )
 
 
-def _first_user_text(conn: sqlite3.Connection, session_id: str) -> str | None:
+def _hydrated_message_text(
+    conn: sqlite3.Connection,
+    session_id: str,
+    reader: CachedSourceTranscriptReader,
+) -> dict[str, str]:
+    row = conn.execute(
+        "SELECT transcript_storage FROM sessions WHERE id = ?", (session_id,)
+    ).fetchone()
+    if row is None or row["transcript_storage"] != "source_backed":
+        return {}
+    source = reader(conn, session_id)
+    if not source.ready:
+        raise RuntimeError(
+            f"canonical source unavailable for {session_id}: "
+            f"{source.warning or source.status}"
+        )
+    return {str(message["id"]): str(message["text"]) for message in source.messages}
+
+
+def _first_user_text(
+    conn: sqlite3.Connection,
+    session_id: str,
+    reader: CachedSourceTranscriptReader,
+) -> str | None:
     row = conn.execute(
         """
-        SELECT text FROM messages
+        SELECT id, text FROM messages
         WHERE session_id = ?
           AND role = 'user'
           AND COALESCE(is_tool_plumbing, 0) = 0
@@ -154,15 +182,20 @@ def _first_user_text(conn: sqlite3.Connection, session_id: str) -> str | None:
         """,
         (session_id,),
     ).fetchone()
-    return str(row["text"]) if row else None
+    if row is None:
+        return None
+    return _hydrated_message_text(conn, session_id, reader).get(
+        str(row["id"]), str(row["text"] or "")
+    )
 
 
 def _last_role_text(
-    conn: sqlite3.Connection, session_id: str, role: str
+    conn: sqlite3.Connection, session_id: str, role: str,
+    reader: CachedSourceTranscriptReader,
 ) -> str | None:
     row = conn.execute(
         """
-        SELECT text FROM messages
+        SELECT id, text FROM messages
         WHERE session_id = ?
           AND role = ?
           AND COALESCE(is_tool_plumbing, 0) = 0
@@ -173,7 +206,11 @@ def _last_role_text(
         """,
         (session_id, role),
     ).fetchone()
-    return str(row["text"]) if row else None
+    if row is None:
+        return None
+    return _hydrated_message_text(conn, session_id, reader).get(
+        str(row["id"]), str(row["text"] or "")
+    )
 
 
 def _message_models(conn: sqlite3.Connection, session_id: str) -> list[str]:
@@ -281,44 +318,56 @@ def _format_duration(seconds: int | None) -> str:
     return f"{hours}h {rem}m" if rem else f"{hours}h"
 
 
-def _one_line_desc(conn: sqlite3.Connection, session_id: str) -> str:
-    text = _first_user_text(conn, session_id)
+def _one_line_desc(
+    conn: sqlite3.Connection, session_id: str, reader: CachedSourceTranscriptReader
+) -> str:
+    text = _first_user_text(conn, session_id, reader)
     return _clip(_humanize_user_text(text), _CLIP_SHORT) or "(no user message)"
 
 
 def _recorded_parent(
-    conn: sqlite3.Connection, row: sqlite3.Row
+    conn: sqlite3.Connection, row: sqlite3.Row, reader: CachedSourceTranscriptReader
 ) -> dict[str, Any] | None:
-    parent_ref = row["parent_session_id"]
-    if not parent_ref:
+    session_id = str(row["id"])
+    parent_id = implicit_parent_ids(conn).get(session_id)
+    kind = "recorded"
+    if parent_id is None:
+        parent_id = explicit_worker_parent_ids(conn).get(session_id)
+        kind = "observed_worker"
+    if parent_id is None:
         return None
-    parent = resolve_session(conn, str(parent_ref))
+    parent = conn.execute(
+        "SELECT * FROM sessions WHERE id = ?", (parent_id,)
+    ).fetchone()
     if parent is None:
-        return {
-            "id": str(parent_ref),
-            "harness": None,
-            "kind": "recorded",
-            "description": "(parent not in database)",
-        }
+        return None
     return {
         "id": str(parent["id"]),
         "harness": parent["harness"],
-        "kind": "recorded",
-        "description": _one_line_desc(conn, str(parent["id"])),
+        "kind": kind,
+        "description": _one_line_desc(conn, str(parent["id"]), reader),
     }
 
 
 def _recorded_children(
-    conn: sqlite3.Connection, row: sqlite3.Row
+    conn: sqlite3.Connection, row: sqlite3.Row, reader: CachedSourceTranscriptReader
 ) -> tuple[list[dict[str, Any]], int]:
-    kids = conn.execute(
-        """
-        SELECT id, harness FROM sessions
-        WHERE parent_session_id IN (?, ?, ?)
-        ORDER BY COALESCE(started_at, '') ASC
-        """,
-        _parent_keys(row),
-    ).fetchall()
+    session_id = str(row["id"])
+    parents = implicit_parent_ids(conn)
+    explicit = explicit_worker_parent_ids(conn)
+    child_ids = {
+        child_id
+        for child_id, parent_id in {**explicit, **parents}.items()
+        if parent_id == session_id
+    }
+    kids = [
+        child
+        for child in conn.execute(
+            "SELECT id, harness, started_at FROM sessions"
+        ).fetchall()
+        if str(child["id"]) in child_ids
+    ]
+    kids.sort(key=lambda child: (str(child["started_at"] or ""), str(child["id"])))
     out: list[dict[str, Any]] = []
     for kid in kids[:MAX_CHILDREN]:
         out.append(
@@ -326,7 +375,7 @@ def _recorded_children(
                 "id": str(kid["id"]),
                 "harness": kid["harness"],
                 "kind": "recorded",
-                "description": _one_line_desc(conn, str(kid["id"])),
+                "description": _one_line_desc(conn, str(kid["id"]), reader),
             }
         )
     return out, len(kids)
@@ -420,16 +469,18 @@ def infer_cross_harness_links(
         return []
 
     window = timedelta(hours=window_hours)
-    # Exclude own recorded lineage ids.
+    implicit_parents = implicit_parent_ids(conn)
+    explicit_parents = explicit_worker_parent_ids(conn)
+    resolved_parents = {**explicit_parents, **implicit_parents}
     lineage = set(_parent_keys(row))
-    if row["parent_session_id"]:
-        lineage.add(str(row["parent_session_id"]))
-    for kid in conn.execute(
-        "SELECT id, external_id FROM sessions WHERE parent_session_id IN (?, ?, ?)",
-        _parent_keys(row),
-    ):
-        lineage.add(str(kid["id"]))
-        lineage.add(str(kid["external_id"]))
+    parent_id = resolved_parents.get(str(row["id"]))
+    if parent_id:
+        lineage.add(parent_id)
+    lineage.update(
+        child_id
+        for child_id, candidate_parent in resolved_parents.items()
+        if candidate_parent == str(row["id"])
+    )
 
     candidates = conn.execute(
         """
@@ -444,10 +495,6 @@ def infer_cross_harness_links(
         FROM sessions s
         WHERE s.harness != ?
           AND s.id != ?
-          AND (
-            s.parent_session_id IS NULL
-            OR TRIM(s.parent_session_id) = ''
-          )
         """,
         (row["harness"], row["id"]),
     ).fetchall()
@@ -455,6 +502,8 @@ def infer_cross_harness_links(
     scored: list[tuple[float, InferredLink]] = []
     for cand in candidates:
         cid = str(cand["id"])
+        if cid in resolved_parents:
+            continue
         if cid in lineage or str(cand["external_id"]) in lineage:
             continue
         # Skip inventory/skills pseudo-sessions.
@@ -531,12 +580,13 @@ def build_session_brief(
     conn: sqlite3.Connection,
     session_id: str,
     *,
-    include_inferred: bool = True,
+    include_inferred: bool = False,
 ) -> dict[str, Any] | None:
     row = resolve_session(conn, session_id)
     if row is None:
         return None
     sid = str(row["id"])
+    source_reader = CachedSourceTranscriptReader()
 
     models = _message_models(conn, sid)
     if row["model"] and str(row["model"]) not in models:
@@ -557,12 +607,12 @@ def build_session_brief(
     duration = _duration_seconds(row["started_at"], row["ended_at"], last_msg_at)
 
     first_human = _clip(
-        _humanize_user_text(_first_user_text(conn, sid)), _CLIP_LONG
+        _humanize_user_text(_first_user_text(conn, sid, source_reader)), _CLIP_LONG
     )
     last_human = _clip(
-        _humanize_user_text(_last_role_text(conn, sid, "user")), _CLIP_LONG
+        _humanize_user_text(_last_role_text(conn, sid, "user", source_reader)), _CLIP_LONG
     )
-    last_assistant_raw = _last_role_text(conn, sid, "assistant")
+    last_assistant_raw = _last_role_text(conn, sid, "assistant", source_reader)
     last_assistant = _clip(last_assistant_raw, _CLIP_LONG)
     todos = _unresolved_todos(last_assistant_raw)
     attention = _attention_for_session(conn, sid)
@@ -577,8 +627,8 @@ def build_session_brief(
     if commits:
         work["commits"] = commits
 
-    parent = _recorded_parent(conn, row)
-    children, child_total = _recorded_children(conn, row)
+    parent = _recorded_parent(conn, row, source_reader)
+    children, child_total = _recorded_children(conn, row, source_reader)
     inferred = (
         [link.to_dict() for link in infer_cross_harness_links(conn, row)]
         if include_inferred
@@ -613,6 +663,8 @@ def build_session_brief(
             "attention": attention,
         },
     }
+    if not source_reader.verify_current():
+        raise RuntimeError("canonical source changed during brief construction")
     return brief
 
 

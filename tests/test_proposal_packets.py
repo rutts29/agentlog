@@ -1008,6 +1008,53 @@ class ProposalSchemaValidationTests(unittest.TestCase):
 
 
 class LogicalRootPacketTests(unittest.TestCase):
+    def test_foreign_parent_references_remain_independent_eligible_roots(self) -> None:
+        conn = connect(":memory:")
+        init_db(conn)
+        _seed_run(conn)
+        for sid, harness in (
+            ("codex:root", "codex"),
+            ("cursor:qualified", "cursor"),
+            ("claude:bare", "claude"),
+        ):
+            _seed_session(conn, sid=sid, harness=harness)
+            _seed_substantive_window(
+                conn,
+                sid=sid,
+                wid=f"w:{sid}",
+                text=f"evidence for {sid}",
+                turn_kinds=["correction"],
+            )
+        conn.execute(
+            "UPDATE sessions SET parent_session_id = 'codex:root' "
+            "WHERE id = 'cursor:qualified'"
+        )
+        conn.execute(
+            "UPDATE sessions SET parent_session_id = 'root' "
+            "WHERE id = 'claude:bare'"
+        )
+        conn.commit()
+
+        logical_roots = packets_mod._session_logical_roots(conn)
+        population = packets_mod._eligible_root_population(conn, logical_roots)
+        self.assertEqual(
+            packets_mod._eligible_root_session_ids(conn),
+            {"codex:root", "cursor:qualified", "claude:bare"},
+        )
+        windows = packets_mod._fetch_theme_windows(
+            conn,
+            where_sql="1=1",
+            limit=10,
+            report=RedactionReport(),
+            logical_roots=logical_roots,
+        )
+        self.assertEqual(population["root_cluster_count"], 3)
+        self.assertEqual(
+            {window["logical_root_id"] for window in windows},
+            {"codex:root", "cursor:qualified", "claude:bare"},
+        )
+        conn.close()
+
     def test_window_selection_reaches_independent_roots_beyond_duplicate_burst(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             conn = connect(Path(tmp) / "t.db")
@@ -1053,6 +1100,40 @@ class LogicalRootPacketTests(unittest.TestCase):
             _seed_run(conn)
             _seed_session(conn, sid="t3code:root", harness="t3code")
             _seed_session(conn, sid="codex:backing", harness="codex")
+            t3_artifact = conn.execute(
+                """
+                INSERT INTO artifacts
+                  (harness, path, size, mtime_ns, content_hash, parsed_offset,
+                   parser_version, transcript_storage)
+                VALUES ('t3code', '/tmp/t3-promoted.jsonl', 1, 1, 't3', 1,
+                        'test', 'source_backed')
+                """
+            ).lastrowid
+            backing_artifact = conn.execute(
+                """
+                INSERT INTO artifacts
+                  (harness, path, size, mtime_ns, content_hash, parsed_offset,
+                   parser_version, transcript_storage)
+                VALUES ('codex', '/tmp/codex-promoted.jsonl', 1, 1, 'codex', 1,
+                        'test', 'source_backed')
+                """
+            ).lastrowid
+            conn.execute(
+                """
+                UPDATE sessions
+                SET artifact_id = ?, transcript_storage = 'source_backed', provider = 'openai'
+                WHERE id = 't3code:root'
+                """,
+                (t3_artifact,),
+            )
+            conn.execute(
+                """
+                UPDATE sessions
+                SET artifact_id = ?, transcript_storage = 'source_backed', provider = 'openai'
+                WHERE id = 'codex:backing'
+                """,
+                (backing_artifact,),
+            )
             _seed_substantive_window(
                 conn,
                 sid="t3code:root",
@@ -1083,6 +1164,9 @@ class LogicalRootPacketTests(unittest.TestCase):
                 logical_roots["codex:backing"]["logical_root_id"], "t3code:root"
             )
             self.assertEqual(population["root_cluster_count"], 1)
+            self.assertEqual(
+                packets_mod._eligible_root_session_ids(conn), {"t3code:root"}
+            )
             self.assertEqual(
                 population["by_harness"],
                 [{"harness": "t3code", "root_cluster_count": 1}],

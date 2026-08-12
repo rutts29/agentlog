@@ -73,6 +73,8 @@ class NormalizedSession(BaseModel):
     harness: Harness
     external_id: str
     parent_session_id: str | None = None
+    originator: str | None = None
+    thread_source: str | None = None
     started_at: datetime | None = None
     ended_at: datetime | None = None
     repo: str | None = None

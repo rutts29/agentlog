@@ -230,6 +230,7 @@ def index_skills(
         if not root.is_dir():
             stats.missing_roots.append(f"{source}:{root}")
 
+    prepared: list[dict[str, str | None]] = []
     for source, path in discover_skill_files(roots):
         stats.scanned += 1
         try:
@@ -247,7 +248,32 @@ def index_skills(
         stored = text if len(text) <= CONTENT_STORE_CAP else text[:CONTENT_STORE_CAP]
         skill_id = _skill_id_for_path(path)
         source_path = str(path.resolve())
+        prepared.append(
+            {
+                "skill_id": skill_id,
+                "name": name,
+                "source": source,
+                "source_path": source_path,
+                "description": description,
+                "content_hash": content_hash,
+                "normalized_hash": normalized_hash,
+                "stored": stored,
+                "fm_status": fm_status,
+                "fm_error": fm_error,
+            }
+        )
 
+    for item in prepared:
+        skill_id = str(item["skill_id"])
+        name = str(item["name"])
+        source = str(item["source"])
+        source_path = str(item["source_path"])
+        description = item["description"]
+        content_hash = str(item["content_hash"])
+        normalized_hash = str(item["normalized_hash"])
+        stored = str(item["stored"])
+        fm_status = str(item["fm_status"])
+        fm_error = item["fm_error"]
         existing = conn.execute(
             "SELECT id, current_content_hash FROM skills WHERE source_path = ?",
             (source_path,),
@@ -426,6 +452,7 @@ def index_t3_visibility(
         stats.caches_dir_missing = True
         return stats
 
+    prepared: list[tuple[str, dict[str, Any], list[str], str]] = []
     for path in sorted(caches_dir.glob("*.json")):
         provider = path.stem
         try:
@@ -439,6 +466,9 @@ def index_t3_visibility(
         names = _t3_skill_names(data.get("skills"))
         stats.providers += 1
         stats.skills_seen += len(names)
+        prepared.append((provider, data, names, str(path.resolve())))
+
+    for provider, data, names, source_path in prepared:
         note = None if names else "no skills reported by this provider yet"
         conn.execute(
             """
@@ -464,7 +494,7 @@ def index_t3_visibility(
                 str(data.get("status")) if data.get("status") is not None else None,
                 len(names),
                 json.dumps(names),
-                str(path.resolve()),
+                source_path,
                 now,
                 note,
             ),

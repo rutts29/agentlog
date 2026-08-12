@@ -1,10 +1,15 @@
 import { Link, useOutletContext, useParams, useSearchParams } from "react-router-dom";
-import { useMemo } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
+  displaySessionIdentity,
+  authoritativeParentNavigationId,
   fetchSessionDetail,
+  fetchSessionTree,
   logicalHarness,
   runtimeHarness,
+  type InheritedContext,
+  type TreeNode,
   type TranscriptSource,
   type TimelineMessage,
 } from "@/lib/api";
@@ -19,6 +24,11 @@ import {
   TranscriptStorageBadge,
 } from "@/components/ui/badges";
 import { classifySpeaker, SPEAKER_LEGEND, type SpeakerKind } from "@/lib/speaker";
+import {
+  findBranchPath,
+  projectBranchTree,
+  type BranchTreeRow,
+} from "@/lib/sessionTree";
 import { formatDuration, formatDayTime, harnessColor } from "@/lib/utils";
 
 type Ctx = { range: string };
@@ -34,6 +44,41 @@ export function SessionDetail() {
     queryFn: () => fetchSessionDetail(sessionId),
     enabled: Boolean(sessionId),
   });
+  const treeQuery = useQuery({
+    queryKey: ["session-tree", sessionId],
+    queryFn: () => fetchSessionTree(sessionId),
+    enabled: Boolean(sessionId),
+  });
+  const isChildSession = Boolean(
+    q.data?.session && authoritativeParentNavigationId(q.data.session),
+  );
+  const branchNavRef = useRef<HTMLElement | null>(null);
+  const selectedTreeId = q.data?.session.navigation_id ?? q.data?.session.id ?? sessionId;
+  const branchProjection = useMemo(
+    () => projectBranchTree(treeQuery.data?.tree),
+    [treeQuery.data?.tree],
+  );
+  const branchPath = useMemo(
+    () =>
+      findBranchPath(
+        branchProjection.rows,
+        new Set([
+          sessionId,
+          selectedTreeId,
+          q.data?.session.id ?? "",
+        ]),
+      ),
+    [branchProjection.rows, q.data?.session.id, selectedTreeId, sessionId],
+  );
+  useEffect(() => {
+    const container = branchNavRef.current;
+    const selected = container?.querySelector<HTMLElement>("[aria-current='page']");
+    if (!container || !selected) return;
+    container.scrollTop = Math.max(
+      0,
+      selected.offsetTop - container.offsetTop - container.clientHeight / 2,
+    );
+  }, [selectedTreeId, treeQuery.data]);
 
   const messages = useMemo(
     () =>
@@ -46,11 +91,11 @@ export function SessionDetail() {
   const speakerCounts = useMemo(() => {
     const counts = new Map<SpeakerKind, number>();
     for (const m of messages) {
-      const k = classifySpeaker(m).kind;
+      const k = classifySpeaker(m, { isChildSession }).kind;
       counts.set(k, (counts.get(k) ?? 0) + 1);
     }
     return counts;
-  }, [messages]);
+  }, [messages, isChildSession]);
 
   const buckets = useMemo(() => {
     const n = Math.min(48, Math.max(12, messages.length));
@@ -58,10 +103,10 @@ export function SessionDetail() {
     messages.forEach((m, i) => {
       const b = out[Math.min(n - 1, Math.floor((i / messages.length) * n))];
       b.tools += m.tool_events.length;
-      if (classifySpeaker(m).kind === "human") b.human = true;
+      if (classifySpeaker(m, { isChildSession }).kind === "human") b.human = true;
     });
     return out;
-  }, [messages]);
+  }, [messages, isChildSession]);
 
   const modelsUsed = useMemo(() => {
     const counts = new Map<string, number>();
@@ -94,7 +139,7 @@ export function SessionDetail() {
     );
   }
 
-  const { session, timeline, anatomy, children, skills } = q.data;
+  const { session, timeline, anatomy, skills } = q.data;
   const source: TranscriptSource | null = session.source ?? q.data.transcript?.source ?? null;
   const sourceWarning = sourceWarningText(source);
   const transcriptId = session.transcript_session_id ?? q.data.transcript?.id ?? session.id;
@@ -104,22 +149,45 @@ export function SessionDetail() {
   const backSearch = (() => {
     const p = new URLSearchParams(params);
     p.delete("msg");
+    p.delete("root");
     return p.toString();
   })();
+  const currentNavigationId = session.navigation_id ?? session.id;
+  const branchCount = Math.max(
+    0,
+    treeQuery.data?.tree.descendant_count ??
+      (treeQuery.data?.bounds?.total_node_count ??
+        branchProjection.rows.length + branchProjection.omittedNodeCount) - 1,
+  );
+  const omittedBranchCount = Math.max(
+    treeQuery.data?.bounds?.omitted_node_count ?? 0,
+    branchProjection.omittedNodeCount,
+  );
+  const inheritedContext = q.data.inherited_context;
+  const runtimeBacking = session.runtime_backing_provenance;
+  const showInheritedContext = Boolean(
+    inheritedContext &&
+      (inheritedContext.status ||
+        inheritedContext.message_count > 0 ||
+        inheritedContext.record_count > 0),
+  );
   const maxBucketTools = Math.max(...buckets.map((b) => b.tools), 1);
 
   return (
     <div className="space-y-3">
       <div>
         <Link
-          to={`/sessions?${backSearch}`}
+          to={`/sessions${backSearch ? `?${backSearch}` : ""}`}
           className="text-[12px] text-muted-foreground hover:text-foreground"
         >
           ← Sessions <kbd className="ml-1">esc</kbd>
         </Link>
+        {branchPath && branchPath.length > 1 ? (
+          <BranchBreadcrumb path={branchPath} currentId={currentNavigationId} search={backSearch} />
+        ) : null}
         <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1.5">
           <h1 className="font-mono text-[15px] font-semibold tracking-tight">
-            {session.id}
+            {displaySessionIdentity(session)}
           </h1>
           <HarnessTag harness={logicalHarness(session)} />
           <RuntimeHarnessLabel
@@ -166,7 +234,7 @@ export function SessionDetail() {
         </div>
       ) : null}
 
-      <div className="grid grid-cols-[minmax(0,1fr)_300px] items-start gap-3">
+      <div className="grid grid-cols-1 items-start gap-3 lg:grid-cols-[minmax(0,1fr)_300px]">
         {/* Left: the transcript. */}
         <PanelCard
           title="Transcript"
@@ -190,13 +258,29 @@ export function SessionDetail() {
                   </span>
                 ),
               )}
-              <span className="text-faint-foreground">
-                <kbd>n</kbd> next human
-              </span>
+              {(speakerCounts.get("human") ?? 0) > 0 ? (
+                <span className="text-faint-foreground">
+                  <kbd>n</kbd> next human
+                </span>
+              ) : null}
             </span>
           }
           className="p-0"
         >
+          {showInheritedContext && inheritedContext ? (
+            <InheritedContextRow
+              context={inheritedContext}
+              parentId={
+                Object.prototype.hasOwnProperty.call(
+                  inheritedContext,
+                  "parent_navigation_id",
+                )
+                  ? authoritativeParentNavigationId(inheritedContext)
+                  : authoritativeParentNavigationId(session)
+              }
+              search={backSearch}
+            />
+          ) : null}
           {timeline.length === 0 ? (
             <div className="p-4">
               <EmptyState
@@ -206,12 +290,16 @@ export function SessionDetail() {
               />
             </div>
           ) : (
-            <Transcript timeline={timeline} focusId={focus} />
+            <Transcript
+              timeline={timeline}
+              focusId={focus}
+              isChildSession={isChildSession}
+            />
           )}
         </PanelCard>
 
         {/* Right: session anatomy, sticky. */}
-        <div className="sticky top-0 space-y-3">
+        <div className="space-y-3 lg:sticky lg:top-0">
           <Card>
             <CardTitle>Anatomy</CardTitle>
             <div className="mt-2 grid grid-cols-2 gap-x-3 gap-y-2">
@@ -313,54 +401,45 @@ export function SessionDetail() {
             </Card>
           ) : null}
 
-          {children.length > 0 || session.parent_session_id ? (
+          {treeQuery.isLoading ? (
             <Card>
-              <CardTitle>Orchestration</CardTitle>
-              {session.parent_session_id ? (
-                <div className="mt-2 text-[11px] text-muted-foreground">
-                  <span className="text-faint-foreground">parent </span>
-                  <Link
-                    to={`/sessions/${encodeURIComponent(session.parent_session_id)}?${backSearch}`}
-                    className="font-mono hover:text-foreground"
+              <CardTitle>Conversation branches</CardTitle>
+              <div className="mt-2 text-[11px] text-faint-foreground">Loading branches…</div>
+            </Card>
+          ) : treeQuery.data ? (
+            <Card>
+              <div className="flex items-baseline justify-between gap-2">
+                <CardTitle>Conversation branches</CardTitle>
+                <span className="tabular text-[10px] text-faint-foreground">
+                  {branchCount.toLocaleString()} workers
+                </span>
+              </div>
+              <nav
+                ref={branchNavRef}
+                aria-label="Conversation branches"
+                className="mt-2 max-h-80 overflow-y-auto pr-1"
+              >
+                <BranchTree
+                  rows={branchProjection.rows}
+                  currentId={currentNavigationId}
+                  search={backSearch}
+                />
+                {omittedBranchCount > 0 ? (
+                  <div
+                    role="status"
+                    className="ml-2 mt-1 border-l border-border-faint px-2 py-1 text-[10px] text-faint-foreground"
                   >
-                    {session.parent_session_id}
-                  </Link>
-                </div>
-              ) : null}
-              {children.length > 0 ? (
-                <div className="mt-2 space-y-1">
-                  {children.map((c) => (
-                    <Link
-                      key={c.id}
-                      to={`/sessions/${encodeURIComponent(c.id)}?${backSearch}`}
-                      className="flex items-center gap-2 text-[11px] hover:text-foreground"
-                    >
-                      <span
-                        aria-hidden
-                        className="inline-block h-[5px] w-[5px] shrink-0 rounded-full"
-                        style={{ background: harnessColor(logicalHarness(c)) }}
-                      />
-                      <span className="min-w-0 truncate font-mono text-muted-foreground">
-                        {c.id}
-                      </span>
-                      <HarnessTag harness={logicalHarness(c)} muted className="shrink-0" />
-                      <RuntimeHarnessLabel
-                        logicalHarness={logicalHarness(c)}
-                        runtimeHarness={runtimeHarness(c)}
-                        className="shrink-0"
-                      />
-                      <span className="tabular ml-auto shrink-0 text-faint-foreground">
-                        {c.message_count} msgs
-                      </span>
-                    </Link>
-                  ))}
-                  <Link
-                    to={`/orchestration?root=${encodeURIComponent(session.id)}&${backSearch}`}
-                    className="mt-1 inline-block text-[11px] text-muted-foreground hover:text-foreground"
-                  >
-                    Open orchestration tree →
-                  </Link>
-                </div>
+                    … {omittedBranchCount.toLocaleString()} more branches not shown
+                  </div>
+                ) : null}
+              </nav>
+              {branchCount > 0 ? (
+                <Link
+                  to={`/orchestration?root=${encodeURIComponent(treeQuery.data.root_id)}${backSearch ? `&${backSearch}` : ""}`}
+                  className="mt-2 inline-block text-[11px] text-muted-foreground hover:text-foreground"
+                >
+                  Open runtime topology →
+                </Link>
               ) : null}
             </Card>
           ) : null}
@@ -374,7 +453,7 @@ export function SessionDetail() {
                     Orchestrator session
                   </div>
                   <Link
-                    to={`/sessions/${encodeURIComponent(orchestratorId!)}?${backSearch}`}
+                    to={sessionHref(orchestratorId!, backSearch)}
                     className="mt-1 block font-mono text-[11px] text-muted-foreground hover:text-foreground"
                   >
                     {orchestratorId}
@@ -402,7 +481,7 @@ export function SessionDetail() {
                     Backing transcript
                   </div>
                   <Link
-                    to={`/sessions/${encodeURIComponent(transcriptId)}?${backSearch}`}
+                    to={sessionHref(transcriptId, backSearch)}
                     className="mt-1 block font-mono text-[11px] text-muted-foreground hover:text-foreground"
                   >
                     {transcriptId}
@@ -411,6 +490,20 @@ export function SessionDetail() {
                     <CopyPath path={q.data.transcript?.artifact_path} />
                   </div>
                 </div>
+              ) : null}
+              {!isBackingSession && source?.status !== "legacy" && runtimeBacking ? (
+                <details className="border-t border-border-faint pt-2">
+                  <summary className="cursor-pointer list-none text-[11px] text-muted-foreground hover:text-foreground">
+                    Runtime backing · {runtimeBacking.harness} · validated
+                  </summary>
+                  <div className="mt-2 space-y-1.5 pl-2 text-[10px] text-faint-foreground">
+                    <div>Provenance only; not transcript content or counts.</div>
+                    <div className="break-all font-mono">
+                      {runtimeBacking.session_id}
+                    </div>
+                    <CopyPath path={runtimeBacking.artifact_path ?? null} />
+                  </div>
+                </details>
               ) : null}
             </div>
             {session.cwd ? (
@@ -422,6 +515,155 @@ export function SessionDetail() {
         </div>
       </div>
     </div>
+  );
+}
+
+function sessionHref(id: string, search: string): string {
+  return `/sessions/${encodeURIComponent(id)}${search ? `?${search}` : ""}`;
+}
+
+function shortSessionId(id: string): string {
+  const external = id.includes(":") ? id.slice(id.indexOf(":") + 1) : id;
+  return external.length > 13
+    ? `${external.slice(0, 8)}…${external.slice(-4)}`
+    : external;
+}
+
+function BranchBreadcrumb({
+  path,
+  currentId,
+  search,
+}: {
+  path: TreeNode[];
+  currentId: string;
+  search: string;
+}) {
+  return (
+    <nav aria-label="Session branch path" className="mt-2 flex min-w-0 items-center gap-1 text-[11px] text-faint-foreground">
+      {path.map((node, index) => {
+        const navigationId = node.navigation_id ?? node.id;
+        const current = navigationId === currentId || node.id === currentId;
+        return (
+          <span key={node.id} className="inline-flex min-w-0 items-center gap-1">
+            {index > 0 ? <span aria-hidden>›</span> : null}
+            {current ? (
+              <span aria-current="page" className="max-w-40 truncate font-mono text-muted-foreground">
+                {index === 0 ? "Main" : shortSessionId(node.id)}
+              </span>
+            ) : (
+              <Link
+                to={sessionHref(navigationId, search)}
+                className="max-w-40 truncate font-mono hover:text-foreground"
+              >
+                {index === 0 ? "Main" : shortSessionId(node.id)}
+              </Link>
+            )}
+          </span>
+        );
+      })}
+    </nav>
+  );
+}
+
+function InheritedContextRow({
+  context,
+  parentId,
+  search,
+}: {
+  context: InheritedContext;
+  parentId: string | null;
+  search: string;
+}) {
+  const counts = [
+    context.message_count > 0
+      ? `${context.message_count.toLocaleString()} inherited ${context.message_count === 1 ? "message" : "messages"}`
+      : null,
+    context.record_count > 0
+      ? `${context.record_count.toLocaleString()} source ${context.record_count === 1 ? "record" : "records"}`
+      : null,
+  ].filter(Boolean);
+
+  return (
+    <div className="grid grid-cols-[92px_minmax(0,1fr)] gap-x-3 border-b border-border-faint bg-background/30 px-4 py-2.5">
+      <div className="pt-[2px] text-right">
+        <div className="microlabel text-[10px] leading-4 text-faint-foreground">context</div>
+      </div>
+      <div className="min-w-0 border-l-2 border-border pl-3 text-[11px] text-muted-foreground">
+        <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+          <span>Inherited context from parent</span>
+          {parentId ? (
+            <Link to={sessionHref(parentId, search)} className="text-foreground/80 hover:text-foreground">
+              View parent →
+            </Link>
+          ) : null}
+        </div>
+        <div className="mt-0.5 text-faint-foreground">
+          {counts.length > 0 ? counts.join(" · ") : "Parent context"} · not repeated in this transcript
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function BranchTree({
+  rows,
+  currentId,
+  search,
+}: {
+  rows: BranchTreeRow[];
+  currentId: string;
+  search: string;
+}) {
+  return (
+    <ul role="tree">
+      {rows.map(({ node, depth }, index) => {
+        const navigationId = node.navigation_id ?? node.id;
+        const selected = navigationId === currentId || node.id === currentId;
+        const logical = logicalHarness(node);
+        const runtime = runtimeHarness(node);
+        return (
+          <li
+            key={`${navigationId}-${index}`}
+            role="treeitem"
+            aria-level={depth + 1}
+            style={{ paddingLeft: `${Math.min(depth, 12) * 8}px` }}
+          >
+            <Link
+              to={sessionHref(navigationId, search)}
+              aria-current={selected ? "page" : undefined}
+              className={`block rounded-control px-2 py-1.5 hover:bg-muted/50 ${selected ? "bg-muted/60" : ""}`}
+              style={
+                selected
+                  ? { boxShadow: `inset 2px 0 0 ${harnessColor(logical)}` }
+                  : undefined
+              }
+            >
+              <div className="flex min-w-0 items-baseline gap-2">
+                <span className="shrink-0 text-[11px] text-foreground/90">
+                  {depth === 0 ? "Main" : "Worker"}
+                </span>
+                <span
+                  className="min-w-0 truncate font-mono text-[10px] text-faint-foreground"
+                  title={node.id}
+                >
+                  {shortSessionId(node.id)}
+                </span>
+                <span className="tabular ml-auto shrink-0 text-[10px] text-faint-foreground">
+                  {node.message_count.toLocaleString()} msgs
+                </span>
+              </div>
+              <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1">
+                <HarnessTag harness={logical} muted className="text-[10px]" />
+                <RuntimeHarnessLabel
+                  logicalHarness={logical}
+                  runtimeHarness={runtime}
+                />
+              </div>
+            </Link>
+          </li>
+        );
+      })}
+    </ul>
   );
 }
 

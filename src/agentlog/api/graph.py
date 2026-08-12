@@ -18,6 +18,7 @@ from agentlog.api.queries import _project_label
 from agentlog.api.ranges import TimeRange, parse_range, range_params, session_time_clause
 from agentlog.session_identity import (
     build_identity_context,
+    lineage_parent_ids,
     logical_projection,
     provider_root_shadow_ids,
 )
@@ -82,21 +83,25 @@ def graph_payload(conn: sqlite3.Connection, tr: TimeRange) -> dict[str, Any]:
 
     truncated: dict[str, Any] | None = None
     if total > NODE_CAP:
-        # parent_session_id may be a bare external_id or harness:external_id,
-        # so match supervisors on all three spellings.
-        where = f"""({where} AND COALESCE(s.started_at, '') >= datetime(:end, '-90 days'))
-        OR EXISTS (
-            SELECT 1 FROM sessions c
-            WHERE c.parent_session_id IN
-                (s.id, s.external_id, s.harness || ':' || s.external_id)
-        )"""
+        where = f"({where} AND COALESCE(s.started_at, '') >= datetime(:end, '-90 days'))"
         physical_rows = conn.execute(
             f"{_SESSION_SQL} WHERE {where}", params
         ).fetchall()
+        shown_ids = {str(row["id"]) for row in physical_rows}
+        supervisor_ids = set(lineage_parent_ids(conn).values()) - shown_ids
+        if supervisor_ids:
+            placeholders = ",".join("?" for _ in supervisor_ids)
+            physical_rows.extend(
+                conn.execute(
+                    f"{_SESSION_SQL} WHERE s.id IN ({placeholders})",
+                    sorted(supervisor_ids),
+                ).fetchall()
+            )
+        hidden = max(0, total - len(physical_rows))
         truncated = {
             "shown": len(physical_rows),
-            "hidden": total - len(physical_rows),
-            "note": f"showing 90d · {total - len(physical_rows)} older sessions hidden",
+            "hidden": hidden,
+            "note": f"showing 90d · {hidden} older sessions hidden",
         }
     else:
         physical_rows = conn.execute(
@@ -143,7 +148,7 @@ def graph_payload(conn: sqlite3.Connection, tr: TimeRange) -> dict[str, Any]:
     rows = [session.row for session in visible]
     visible_by_id = {session.session_id: session for session in visible}
 
-    by_key: dict[str, str] = {}
+    lineage_parents = lineage_parent_ids(conn)
     presentation_by_physical: dict[str, str] = {}
     for r in physical_rows:
         session_id = str(r["id"])
@@ -155,17 +160,10 @@ def graph_payload(conn: sqlite3.Connection, tr: TimeRange) -> dict[str, Any]:
             if session_id in root_shadows and projection["orchestrator_session_id"]
             else session_id
         )
-        by_key[session_id] = session_id
-        by_key.setdefault(str(r["external_id"]), session_id)
-        by_key.setdefault(f"{r['harness']}:{r['external_id']}", session_id)
-
     child_counts: dict[str, int] = {}
     parent_of: dict[str, str] = {}
     for r in rows:
-        raw_parent = r["parent_session_id"]
-        if not raw_parent:
-            continue
-        resolved = by_key.get(str(raw_parent))
+        resolved = lineage_parents.get(str(r["id"]))
         if resolved is None or resolved == r["id"]:
             continue
         parent_id = presentation_by_physical.get(resolved, resolved)

@@ -9,6 +9,7 @@ from typing import Iterable
 from agentlog.session_identity import (
     IdentityContext,
     build_identity_context,
+    is_internal_approval_guardian,
     logical_projection,
     provider_root_shadow_ids,
 )
@@ -36,7 +37,7 @@ def visible_logical_sessions(
     visible: list[VisibleLogicalSession] = []
     for row in rows:
         session_id = str(row["id"])
-        if session_id in root_shadows:
+        if session_id in root_shadows or is_internal_approval_guardian(row):
             continue
         projection = logical_projection(
             conn, session_id, str(row["harness"]), context=identity
