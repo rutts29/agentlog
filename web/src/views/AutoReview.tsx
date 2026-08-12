@@ -11,6 +11,7 @@ import {
 } from "recharts";
 import { fetchAutoReview } from "@/lib/api";
 import { EmptyState } from "@/components/EmptyState";
+import { LoadingOrb } from "@/components/LoadingOrb";
 import { Card, CardTitle, PanelCard } from "@/components/ui/card";
 import { Kpi } from "@/components/ui/kpi";
 import { HarnessTag, ModelBadge, StatusDot } from "@/components/ui/badges";
@@ -28,7 +29,7 @@ export function AutoReview() {
   });
 
   if (q.isLoading) {
-    return <div className="text-[13px] text-muted-foreground">Loading…</div>;
+    return <LoadingOrb label="Reading review signals" />;
   }
   if (q.isError || !q.data) {
     return (

@@ -8,6 +8,7 @@ import {
   type TreeNode,
 } from "@/lib/api";
 import { EmptyState } from "@/components/EmptyState";
+import { LoadingOrb } from "@/components/LoadingOrb";
 import { Card, CardTitle, PanelCard } from "@/components/ui/card";
 import { Kpi } from "@/components/ui/kpi";
 import { HarnessTag, ModelBadge, RuntimeHarnessLabel } from "@/components/ui/badges";
@@ -32,7 +33,7 @@ export function Orchestration() {
   });
 
   if (overview.isLoading) {
-    return <div className="text-[13px] text-muted-foreground">Loading…</div>;
+    return <LoadingOrb label="Mapping orchestration" />;
   }
   if (overview.isError || !overview.data) {
     return (

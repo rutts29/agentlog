@@ -2,6 +2,7 @@ import { useOutletContext } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { fetchSkills } from "@/lib/api";
 import { EmptyState } from "@/components/EmptyState";
+import { LoadingOrb } from "@/components/LoadingOrb";
 import { Card, CardTitle, PanelCard } from "@/components/ui/card";
 import { MicroBars } from "@/components/ui/spark";
 import { formatDay } from "@/lib/utils";
@@ -31,7 +32,7 @@ export function Skills() {
   });
 
   if (q.isLoading) {
-    return <div className="text-[13px] text-muted-foreground">Loading…</div>;
+    return <LoadingOrb label="Reading skills" />;
   }
   if (!q.data) {
     return (
