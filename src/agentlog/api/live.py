@@ -28,7 +28,9 @@ from agentlog.config import (
 )
 from agentlog.registry.harnesses import get_harness
 from agentlog.session_identity import (
+    build_identity_context,
     lineage_parent_ids,
+    logical_orchestrator_id,
 )
 from agentlog.watch.presence import external_id_for_path, read_presence_file, session_id_for
 from agentlog.watch.scan import (
@@ -116,11 +118,16 @@ def _load_db_meta(db_path: Path, ids: list[str]) -> dict[str, dict]:
     conn.row_factory = sqlite3.Row
     try:
         conn.execute("PRAGMA busy_timeout = 2000")
+        identity = build_identity_context(conn)
         placeholders = ",".join("?" for _ in ids)
         rows = conn.execute(
             f"""
-            SELECT id, repo, cwd, parent_session_id
-            FROM sessions WHERE id IN ({placeholders})
+            SELECT s.id, s.repo, s.cwd, s.parent_session_id,
+                   s.transcript_storage, s.source_sync_status,
+                   a.path AS artifact_path
+            FROM sessions s
+            LEFT JOIN artifacts a ON a.id = s.artifact_id
+            WHERE s.id IN ({placeholders})
             """,
             ids,
         ).fetchall()
@@ -128,12 +135,53 @@ def _load_db_meta(db_path: Path, ids: list[str]) -> dict[str, dict]:
         meta: dict[str, dict] = {
             str(row["id"]): {
                 "session_id": str(row["id"]),
+                "logical_session_id": logical_orchestrator_id(
+                    conn, str(row["id"]), context=identity
+                )
+                or str(row["id"]),
+                "logical_harness": (
+                    "t3code"
+                    if logical_orchestrator_id(
+                        conn, str(row["id"]), context=identity
+                    )
+                    else None
+                ),
                 "repo": row["repo"] or row["cwd"],
                 "parent_session_id": resolved_parents.get(str(row["id"])),
                 "title": None,
+                "transcript_storage": row["transcript_storage"],
+                "source_sync_status": row["source_sync_status"],
+                "artifact_path": row["artifact_path"],
             }
             for row in rows
         }
+        logical_ids = sorted(
+            {
+                str(item["logical_session_id"])
+                for item in meta.values()
+                if item.get("logical_session_id")
+            }
+        )
+        if logical_ids:
+            logical_spots = ",".join("?" for _ in logical_ids)
+            logical_rows = conn.execute(
+                f"""
+                SELECT s.id, s.transcript_storage, s.source_sync_status,
+                       a.path AS artifact_path
+                FROM sessions s
+                LEFT JOIN artifacts a ON a.id = s.artifact_id
+                WHERE s.id IN ({logical_spots})
+                """,
+                logical_ids,
+            ).fetchall()
+            readiness = {str(item["id"]): item for item in logical_rows}
+            for item in meta.values():
+                logical = readiness.get(str(item["logical_session_id"]))
+                if logical is None:
+                    continue
+                item["readiness_storage"] = logical["transcript_storage"]
+                item["readiness_sync_status"] = logical["source_sync_status"]
+                item["readiness_artifact_path"] = logical["artifact_path"]
         if meta:
             found = list(meta)
             spots = ",".join("?" for _ in found)
@@ -160,6 +208,34 @@ def _load_db_meta(db_path: Path, ids: list[str]) -> dict[str, dict]:
         return {}
     finally:
         conn.close()
+
+
+def _source_snapshot_status(
+    row: dict | None,
+) -> str:
+    """Expose whether a live source can be opened without serving a stale view."""
+    if row is None:
+        return "pending"
+    storage = row.get("readiness_storage", row.get("transcript_storage"))
+    if storage != "source_backed":
+        return "stable"
+    artifact_path = row.get("readiness_artifact_path", row.get("artifact_path"))
+    if not row.get("logical_session_id") or not artifact_path:
+        return "pending"
+    sync_status = str(
+        row.get("readiness_sync_status", row.get("source_sync_status")) or ""
+    )
+    if sync_status.startswith("frozen_") or sync_status in {"unavailable", "error"}:
+        return "pending"
+    try:
+        source = Path(str(artifact_path))
+        if not source.is_file():
+            return "pending"
+        with source.open("rb") as handle:
+            handle.read(1)
+    except OSError:
+        return "pending"
+    return "stable"
 
 
 def live_payload(
@@ -235,7 +311,7 @@ def live_payload(
         if age > PRESENCE_SCAN_WINDOW_SECONDS:
             continue
         file_path = Path(source_path) if source_path else None
-        if obs.size is None and file_path is not None:
+        if file_path is not None:
             try:
                 st = file_path.stat()
                 obs.size, obs.mtime = st.st_size, st.st_mtime
@@ -286,6 +362,8 @@ def live_payload(
             "harness_display": _harness_display(harness),
             "external_id": external_id,
             "session_id": row["session_id"] if row else None,
+            "logical_session_id": row["logical_session_id"] if row else None,
+            "logical_harness": row["logical_harness"] if row else None,
             "parent_session_id": row["parent_session_id"] if row else None,
             "parent_external_id": _parent_external_id(source_path),
             "source_path": source_path,
@@ -302,6 +380,7 @@ def live_payload(
             "last_activity_at": _utc_iso(seen_at),
             "age_seconds": round(age, 3),
             "pending_ingest": row is None,
+            "source_snapshot_status": _source_snapshot_status(row),
             "title": db_title or task or label,
             "repo": repo,
         }

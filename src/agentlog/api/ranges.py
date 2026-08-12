@@ -7,6 +7,12 @@ from typing import Any
 
 _INDEX_SCAN_MARGIN = timedelta(days=1)
 
+# These are the only windows exposed by the dashboard shell and public range
+# APIs. Longer values remain parseable for internal bounded calculations only.
+DEFAULT_RANGE_KEY = "24h"
+GLOBAL_RANGE_KEYS = ("24h", "7d", "30d", "all")
+INTERACTIVE_RANGE_KEYS = (*GLOBAL_RANGE_KEYS, "custom")
+
 
 def _utc(value: datetime) -> datetime:
     if value.tzinfo is None:
@@ -49,7 +55,7 @@ def parse_range(
     now: datetime | None = None,
 ) -> TimeRange:
     end = now.astimezone(timezone.utc) if now else datetime.now(timezone.utc)
-    key = (range_key or "30d").strip().lower()
+    key = (range_key or DEFAULT_RANGE_KEY).strip().lower()
 
     if key == "custom":
         if not custom_start or not custom_end:
@@ -70,7 +76,7 @@ def parse_range(
     if key == "all":
         return TimeRange(key="all", start=None, end=end, prev_start=None, prev_end=None)
 
-    days_map = {"7d": 7, "30d": 30, "90d": 90, "365d": 365}
+    days_map = {"24h": 1, "7d": 7, "30d": 30, "90d": 90, "365d": 365}
     if key not in days_map:
         raise ValueError(f"unsupported range: {range_key}")
     days = days_map[key]
@@ -84,6 +90,23 @@ def parse_range(
         prev_start=prev_start,
         prev_end=prev_end,
     )
+
+
+def parse_global_range(
+    range_key: str | None = None,
+    *,
+    custom_start: str | None = None,
+    custom_end: str | None = None,
+    now: datetime | None = None,
+) -> TimeRange:
+    """Parse a dashboard window while retaining the hidden custom API mode."""
+    key = (range_key or DEFAULT_RANGE_KEY).strip().lower()
+    if key not in INTERACTIVE_RANGE_KEYS:
+        raise ValueError(
+            f"unsupported dashboard range: {range_key}; "
+            f"choose one of {', '.join(INTERACTIVE_RANGE_KEYS)}"
+        )
+    return parse_range(key, custom_start=custom_start, custom_end=custom_end, now=now)
 
 
 def range_params(tr: TimeRange) -> dict[str, Any]:

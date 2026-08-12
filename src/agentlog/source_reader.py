@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
@@ -57,18 +58,33 @@ class _CachedSourceParse:
     revision: tuple[int, int]
     source_hash: str
     results: list[ParseResult]
+    verification_unit: str | None = None
 
 
 class CachedSourceTranscriptReader:
     def __init__(self) -> None:
-        self._artifacts: dict[tuple[str, str], _CachedSourceParse] = {}
+        self._artifacts: dict[tuple[str, ...], _CachedSourceParse] = {}
 
     def verify_current(self) -> bool:
         """Confirm every source used by this operation is still unchanged."""
         try:
-            for (harness, artifact_path), cached in self._artifacts.items():
+            for key, cached in self._artifacts.items():
+                artifact_path = key[1]
                 path = Path(artifact_path)
-                if not path.is_file() or file_stat(path) != cached.revision:
+                if not path.is_file():
+                    return False
+                if cached.verification_unit is not None:
+                    adapter_type = _ADAPTERS.get(key[0])
+                    if adapter_type is None:
+                        return False
+                    external_id = cached.verification_unit.split(":", 1)[1]
+                    parsed = _parse_t3_session(
+                        adapter_type(), path, external_id
+                    )
+                    if parsed is None or parsed[1] != cached.source_hash:
+                        return False
+                    continue
+                if file_stat(path) != cached.revision:
                     return False
                 if _current_hash(path) != cached.source_hash:
                     return False
@@ -172,6 +188,33 @@ def _parse_current(
     return None
 
 
+def _parse_t3_session(
+    adapter: T3CodeAdapter, path: Path, external_id: str
+) -> tuple[list[ParseResult], str] | None:
+    """Read one coherent T3 thread while unrelated threads continue writing."""
+    parse_with_hash = getattr(adapter, "parse_session_with_hash", None)
+    if callable(parse_with_hash):
+        result, source_hash = parse_with_hash(path, external_id)
+    else:
+        result = adapter.parse_session(path, external_id)
+        source_hash = _parse_result_hash(result) if result is not None else "missing"
+    if result is None:
+        return [], "missing"
+    return [result], source_hash
+
+
+def _parse_result_hash(result: ParseResult | None) -> str:
+    if result is None:
+        return "missing"
+    payload = result.model_dump(
+        mode="json", exclude={"bytes_consumed"}
+    )
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _message_dict(session_id: str, message: NormalizedMessage) -> dict[str, Any]:
     identity = resolve_model_identity(
         message.model,
@@ -225,7 +268,7 @@ def _read_source_transcript(
     conn: sqlite3.Connection,
     session_id: str,
     *,
-    artifact_cache: dict[tuple[str, str], _CachedSourceParse] | None,
+    artifact_cache: dict[tuple[str, ...], _CachedSourceParse] | None,
 ) -> SourceReadResult:
     """Return current normalized messages for a source-backed session.
 
@@ -261,11 +304,17 @@ def _read_source_transcript(
     adapter_type = _ADAPTERS.get(str(row["harness"]))
     if adapter_type is None:
         return SourceReadResult("source_unavailable", [], locator, locator.unit_id, warning="unsupported source harness")
-    cache_key = (locator.harness, locator.artifact_path)
+    cache_key: tuple[str, ...] = (locator.harness, locator.artifact_path)
+    if is_sqlite_path(path) and hasattr(adapter_type, "parse_session"):
+        cache_key += (locator.unit_id,)
     cached = artifact_cache.get(cache_key) if artifact_cache is not None else None
     try:
-        if cached is not None:
-            if file_stat(path) != cached.revision:
+        if cached is not None and file_stat(path) == cached.revision:
+            parsed = (cached.results, cached.source_hash)
+        else:
+            if cached is not None and not (
+                is_sqlite_path(path) and hasattr(adapter_type, "parse_session")
+            ):
                 return SourceReadResult(
                     "source_changed",
                     [],
@@ -273,9 +322,12 @@ def _read_source_transcript(
                     locator.unit_id,
                     warning="canonical source changed during this operation",
                 )
-            parsed = (cached.results, cached.source_hash)
-        else:
-            parsed = _parse_current(adapter_type(), path)
+            cached = None
+            adapter = adapter_type()
+            if is_sqlite_path(path) and hasattr(adapter, "parse_session"):
+                parsed = _parse_t3_session(adapter, path, str(row["external_id"]))
+            else:
+                parsed = _parse_current(adapter, path)
     except (OSError, sqlite3.Error, ValueError) as exc:
         return SourceReadResult("source_unavailable", [], locator, locator.unit_id, warning=f"could not read canonical source: {exc}")
     if parsed is None:
@@ -286,6 +338,7 @@ def _read_source_transcript(
             revision=file_stat(path),
             source_hash=source_hash,
             results=results,
+            verification_unit=(locator.unit_id if is_sqlite_path(path) else None),
         )
     external_id = str(row["external_id"])
     matches = [item for item in results if item.session.external_id == external_id]

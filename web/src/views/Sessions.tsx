@@ -1,12 +1,14 @@
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useOutletContext, useSearchParams } from "react-router-dom";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  combineAbortSignals,
   fetchFacets,
-  fetchSessionTree,
   fetchSessions,
   logicalHarness,
   runtimeHarness,
+  type LiveSession,
+  type PresenceEvent,
   type TreeNode,
 } from "@/lib/api";
 import { PanelCard } from "@/components/ui/card";
@@ -16,8 +18,22 @@ import { HarnessTag, ModelBadge, RuntimeHarnessLabel } from "@/components/ui/bad
 import { cn, formatDuration, formatFullTime, harnessColor } from "@/lib/utils";
 import { useViewShortcuts } from "@/lib/keyboard";
 import { projectBranchTree } from "@/lib/sessionTree";
+import { LiveOrb } from "@/components/LiveOrb";
+import { useIngestStream } from "@/lib/useIngestStream";
+import { useLivePresence } from "@/lib/useLivePresence";
+import {
+  canPrefetchSessionDetail,
+  createSessionRangeWarmer,
+  invalidateSessionDetailCache,
+  sessionDetailQueryOptions,
+  sessionTreeQueryOptions,
+} from "@/lib/sessionQueries";
 
 type Ctx = { range: string };
+
+const SESSION_WARM_RANGES = ["7d", "30d", "all", "24h"] as const;
+const SESSION_RANGE_STALE_TIME = 2 * 60_000;
+const SESSION_RANGE_GC_TIME = 15 * 60_000;
 
 function multi(params: URLSearchParams, key: string): string[] {
   return params.getAll(key).filter(Boolean);
@@ -35,6 +51,7 @@ const FILTER_KEYS = ["harness", "model", "effort", "project", "branch", "q"] as 
 
 export function Sessions() {
   const { range } = useOutletContext<Ctx>();
+  const queryClient = useQueryClient();
   const [params, setParams] = useSearchParams();
   const navigate = useNavigate();
   const harness = multi(params, "harness");
@@ -48,41 +65,174 @@ export function Sessions() {
   const cursor = Number(params.get("cursor") || "0");
   const [selected, setSelected] = useState(-1);
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
+  const presenceHandler = useRef<(data: PresenceEvent) => void>(() => {});
+  const ingestTimer = useRef<number | null>(null);
+  const rangeWarmer = useRef(createSessionRangeWarmer());
+
+  const { connected } = useIngestStream(
+    ({ events }) => {
+      if (!events.length) return;
+      rangeWarmer.current.notifyActivity();
+      if (ingestTimer.current) window.clearTimeout(ingestTimer.current);
+      ingestTimer.current = window.setTimeout(() => {
+        queryClient.invalidateQueries({ queryKey: ["sessions"], refetchType: "active" });
+        queryClient.invalidateQueries({ queryKey: ["facets", "roots"], refetchType: "active" });
+        void invalidateSessionDetailCache(queryClient);
+      }, 250);
+    },
+    (data) => presenceHandler.current(data),
+  );
+  const { presence, onPresenceEvent } = useLivePresence(connected);
+  useEffect(() => {
+    presenceHandler.current = onPresenceEvent;
+    return () => {
+      if (ingestTimer.current) window.clearTimeout(ingestTimer.current);
+      rangeWarmer.current.cancel();
+    };
+  }, [onPresenceEvent]);
+
+  const sessionQueryKey = (targetRange: string, targetCursor = cursor) => [
+    "sessions",
+    targetRange,
+    harness,
+    model,
+    effort,
+    branch,
+    project,
+    q,
+    sort,
+    order,
+    targetCursor,
+  ];
+  const sessionQueryFn = (
+    targetRange: string,
+    targetCursor = cursor,
+    requestSignal?: AbortSignal,
+  ) =>
+    async ({ signal }: { signal: AbortSignal }) => {
+      const combined = combineAbortSignals(requestSignal, signal);
+      try {
+        return await fetchSessions(
+          targetRange,
+          {
+            harness,
+            model,
+            effort,
+            branch,
+            project,
+            q: q || undefined,
+            sort,
+            order,
+            cursor: targetCursor,
+            limit: 50,
+          },
+          combined.signal,
+        );
+      } finally {
+        combined.cleanup();
+      }
+    };
+  const facetQueryKey = (targetRange: string) => ["facets", "roots", targetRange];
 
   const facets = useQuery({
-    queryKey: ["facets", "roots", range],
-    queryFn: () => fetchFacets(range, "roots"),
+    queryKey: facetQueryKey(range),
+    queryFn: ({ signal }) => fetchFacets(range, "roots", signal),
+    staleTime: SESSION_RANGE_STALE_TIME,
+    gcTime: SESSION_RANGE_GC_TIME,
   });
   const list = useQuery({
-    queryKey: [
-      "sessions",
-      range,
-      harness,
-      model,
-      effort,
-      branch,
-      project,
-      q,
-      sort,
-      order,
-      cursor,
-    ],
-    queryFn: () =>
-      fetchSessions(range, {
-        harness,
-        model,
-        effort,
-        branch,
-        project,
-        q: q || undefined,
-        sort,
-        order,
-        cursor,
-        limit: 50,
-      }),
+    queryKey: sessionQueryKey(range),
+    queryFn: sessionQueryFn(range),
+    staleTime: SESSION_RANGE_STALE_TIME,
+    gcTime: SESSION_RANGE_GC_TIME,
   });
 
   const items = list.data?.items ?? [];
+  const liveByRoot = useMemo(() => {
+    const result = new Map<string, LiveSession>();
+    for (const live of presence.conversations) {
+      const rootId = live.logical_session_id || live.session_id;
+      if (rootId) result.set(rootId, live);
+    }
+    return result;
+  }, [presence.conversations]);
+  const facetKey = [harness, model, effort, project, branch]
+    .map((values) => values.join("|"))
+    .join("~");
+
+  const warmReady = Boolean(
+    list.data && !list.isError && !list.isFetching && !facets.isFetching,
+  );
+  const warmKey = [
+    range,
+    cursor,
+    facetKey,
+    q,
+    sort,
+    order,
+    list.dataUpdatedAt,
+    facets.dataUpdatedAt,
+  ].join("|");
+
+  useEffect(() => {
+    if (!warmReady) {
+      rangeWarmer.current.pause();
+      return;
+    }
+    const targets = SESSION_WARM_RANGES.filter((targetRange) => targetRange !== range);
+    rangeWarmer.current.schedule(warmKey, async (signal) => {
+      for (const targetRange of targets) {
+        if (signal.aborted) return;
+        const listKey = sessionQueryKey(targetRange, 0);
+        if (!queryClient.getQueryState(listKey)?.data) {
+          try {
+            await queryClient.prefetchQuery({
+              queryKey: listKey,
+              queryFn: sessionQueryFn(targetRange, 0, signal),
+              staleTime: SESSION_RANGE_STALE_TIME,
+              gcTime: SESSION_RANGE_GC_TIME,
+            });
+          } catch {
+            if (signal.aborted) return;
+          }
+        }
+        if (signal.aborted) return;
+        const facetsKey = facetQueryKey(targetRange);
+        if (!queryClient.getQueryState(facetsKey)?.data) {
+          try {
+            await queryClient.prefetchQuery({
+              queryKey: facetsKey,
+              queryFn: async ({ signal: querySignal }) => {
+                const combined = combineAbortSignals(signal, querySignal);
+                try {
+                  return await fetchFacets(targetRange, "roots", combined.signal);
+                } finally {
+                  combined.cleanup();
+                }
+              },
+              staleTime: SESSION_RANGE_STALE_TIME,
+              gcTime: SESSION_RANGE_GC_TIME,
+            });
+          } catch {
+            if (signal.aborted) return;
+          }
+        }
+      }
+    });
+    return () => rangeWarmer.current.pause();
+  }, [
+    cursor,
+    facetKey,
+    facets.dataUpdatedAt,
+    list.dataUpdatedAt,
+    order,
+    q,
+    queryClient,
+    range,
+    sort,
+    warmKey,
+    warmReady,
+  ]);
 
   // j/k row navigation, Enter opens the selected session.
   useViewShortcuts((e) => {
@@ -99,6 +249,7 @@ export function Sessions() {
     }
     if (e.key === "Enter" && selected >= 0 && items[selected]) {
       const item = items[selected];
+      if (liveByRoot.get(item.id)?.source_snapshot_status === "pending") return true;
       navigate(detailHref(item.navigation_id ?? item.id, params));
       return true;
     }
@@ -107,9 +258,6 @@ export function Sessions() {
 
   /* Row selection is positional, so it must reset whenever the underlying rows
      can shift — facet changes included, or Enter opens whatever slid under it. */
-  const facetKey = [harness, model, effort, project, branch]
-    .map((values) => values.join("|"))
-    .join("~");
   useEffect(() => {
     setSelected(-1);
   }, [cursor, range, q, sort, order, facetKey]);
@@ -155,10 +303,10 @@ export function Sessions() {
     params.getAll(key).filter(Boolean).map((value) => ({ key, value })),
   );
 
-  if (list.isLoading || facets.isLoading) {
+  if (list.isLoading) {
     return <LoadingOrb label="Reading sessions" />;
   }
-  if (list.isError || !list.data || !facets.data) {
+  if (list.isError || !list.data) {
     return (
       <EmptyState
         title="Could not load sessions"
@@ -167,7 +315,14 @@ export function Sessions() {
     );
   }
 
-  const f = facets.data;
+  const f = facets.data ?? {
+    harness: [],
+    model: [],
+    effort: [],
+    branch: [],
+    project: [],
+  };
+  const facetsPending = !facets.data && facets.isFetching;
 
   return (
     <div className="space-y-3">
@@ -195,30 +350,35 @@ export function Sessions() {
             value={harness[0] ?? ""}
             options={f.harness}
             onChange={(v) => setFilter("harness", v)}
+            disabled={facetsPending}
           />
           <FacetSelect
             label="Model"
             value={model[0] ?? ""}
             options={f.model}
             onChange={(v) => setFilter("model", v)}
+            disabled={facetsPending}
           />
           <FacetSelect
             label="Effort"
             value={effort[0] ?? ""}
             options={f.effort}
             onChange={(v) => setFilter("effort", v)}
+            disabled={facetsPending}
           />
           <FacetSelect
             label="Project"
             value={project[0] ?? ""}
             options={f.project}
             onChange={(v) => setFilter("project", v)}
+            disabled={facetsPending}
           />
           <FacetSelect
             label="Branch"
             value={branch[0] ?? ""}
             options={f.branch}
             onChange={(v) => setFilter("branch", v)}
+            disabled={facetsPending}
           />
           <label className="microlabel block text-[10px] text-faint-foreground">
             Filter text
@@ -294,13 +454,28 @@ export function Sessions() {
                 {items.map((s, i) => {
                   const descendantCount = s.descendant_count ?? s.child_count ?? 0;
                   const isExpanded = expanded.has(s.id);
+                  const live = liveByRoot.get(s.id);
+                  const syncing = live?.source_snapshot_status === "pending";
+                  const navigationId = s.navigation_id ?? s.id;
+                  const prefetchDetail = () => {
+                    if (!canPrefetchSessionDetail(live?.source_snapshot_status)) return;
+                    void queryClient.prefetchQuery(
+                      sessionDetailQueryOptions(navigationId),
+                    );
+                  };
                   return (
                   <Fragment key={s.id}>
                   <tr
                     id={`session-row-${i}`}
-                    onClick={() => navigate(detailHref(s.navigation_id ?? s.id, params))}
+                    onClick={() => {
+                      if (syncing) return;
+                      navigate(detailHref(navigationId, params));
+                    }}
+                    onMouseEnter={prefetchDetail}
+                    aria-disabled={syncing || undefined}
                     className={cn(
-                      "cursor-pointer border-b border-border-faint last:border-0 hover:bg-muted/40",
+                      "border-b border-border-faint last:border-0 hover:bg-muted/40",
+                      syncing ? "cursor-wait opacity-65" : "cursor-pointer",
                       selected === i && "bg-muted/60",
                     )}
                     style={
@@ -334,12 +509,33 @@ export function Sessions() {
                           <span aria-hidden className="inline-block h-5 w-5 shrink-0" />
                         )}
                         <div className="flex min-w-0 flex-col items-start gap-0.5">
-                          <span className="inline-flex items-center rounded-[4px] border border-border px-1.5 py-[2px] text-[10px] leading-none text-muted-foreground">
-                            Main
-                          </span>
+                          <div className="flex items-center gap-1.5">
+                            <span className="inline-flex items-center rounded-[4px] border border-border px-1.5 py-[2px] text-[10px] leading-none text-muted-foreground">
+                              Main
+                            </span>
+                            {live ? (
+                              <span className="inline-flex items-center gap-1 text-[10px] text-accent-live">
+                                <LiveOrb
+                                  state={live.state}
+                                  harnessColor={harnessColor(live.logical_harness || live.harness)}
+                                  size={15}
+                                  worker={live.role === "worker"}
+                                  title={syncing ? "Transcript syncing" : live.activity || live.state}
+                                />
+                                {syncing ? "Syncing…" : "Live"}
+                              </span>
+                            ) : null}
+                          </div>
                         <Link
-                          to={detailHref(s.navigation_id ?? s.id, params)}
-                          onClick={(e) => e.stopPropagation()}
+                          to={detailHref(navigationId, params)}
+                          onFocus={prefetchDetail}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            if (syncing) e.preventDefault();
+                          }}
+                          aria-disabled={syncing || undefined}
+                          tabIndex={syncing ? -1 : undefined}
+                          title={syncing ? "Transcript is syncing; it will be available shortly" : undefined}
                           className="tabular whitespace-nowrap text-muted-foreground hover:text-foreground"
                         >
                           {formatFullTime(s.activity_at ?? s.started_at)}
@@ -455,11 +651,7 @@ function SessionTreeRows({
   rootId: string;
   params: URLSearchParams;
 }) {
-  const tree = useQuery({
-    queryKey: ["session-tree", rootId],
-    queryFn: () => fetchSessionTree(rootId),
-    enabled: Boolean(rootId),
-  });
+  const tree = useQuery(sessionTreeQueryOptions(rootId));
   const projection = useMemo(
     () => projectBranchTree(tree.data?.tree),
     [tree.data?.tree],
@@ -551,21 +743,24 @@ function FacetSelect({
   value,
   options,
   onChange,
+  disabled,
 }: {
   label: string;
   value: string;
   options: Array<{ value: string; count: number }>;
   onChange: (v: string) => void;
+  disabled?: boolean;
 }) {
   return (
     <label className="microlabel block text-[10px] text-faint-foreground">
       {label}
       <select
         value={value}
+        disabled={disabled}
         onChange={(e) => onChange(e.target.value)}
         className="mt-1 w-full rounded-control border border-border bg-background px-2 py-1.5 text-[12px] normal-case tracking-normal text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
       >
-        <option value="">All</option>
+        <option value="">{disabled ? "Loading…" : "All"}</option>
         {options.map((o) => (
           <option key={o.value} value={o.value}>
             {o.value} ({o.count})

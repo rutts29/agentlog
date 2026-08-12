@@ -155,6 +155,31 @@ class DescriptiveDashboardTests(unittest.TestCase):
         self.assertEqual(kinds["total"], 1)
         self.assertEqual(kinds["items"][0]["request_kind"], "substantive")
 
+    def test_global_dashboard_endpoints_default_to_24h(self) -> None:
+        endpoints = (
+            "/api/summary",
+            "/api/models",
+            "/api/sessions",
+            "/api/search",
+            "/api/insights",
+        )
+        for endpoint in endpoints:
+            with self.subTest(endpoint=endpoint):
+                response = self.client.get(endpoint)
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json()["range"], "24h")
+
+    def test_global_dashboard_rejects_internal_calendar_windows(self) -> None:
+        for endpoint in (
+            "/api/summary",
+            "/api/models",
+            "/api/sessions",
+            "/api/search",
+        ):
+            with self.subTest(endpoint=endpoint):
+                response = self.client.get(endpoint, params={"range": "90d"})
+                self.assertEqual(response.status_code, 400)
+
 
 if __name__ == "__main__":
     unittest.main()

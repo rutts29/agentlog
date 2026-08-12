@@ -10,7 +10,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from agentlog.api.app import create_app
-from agentlog.api.activity import _streaks, activity_calendar, activity_rollup
+from agentlog.api.activity import _day_list, _streaks, activity_calendar, activity_rollup
 from agentlog.api.ranges import TimeRange, parse_range
 from agentlog.api import tokens as tokens_api
 from agentlog.db.schema import connect, init_db
@@ -104,6 +104,24 @@ def _seed_minimal(conn) -> None:
     )
     backfill_model_identity(conn)
     conn.commit()
+
+
+class TimeRangeTests(unittest.TestCase):
+    def test_24h_range_has_exact_one_day_window(self) -> None:
+        now = datetime(2026, 8, 12, 12, 30, tzinfo=timezone.utc)
+        tr = parse_range("24h", now=now)
+
+        self.assertEqual(tr.key, "24h")
+        self.assertEqual(tr.start, datetime(2026, 8, 11, 12, 30, tzinfo=timezone.utc))
+        self.assertEqual(tr.end, now)
+        self.assertEqual(tr.prev_start, datetime(2026, 8, 10, 12, 30, tzinfo=timezone.utc))
+        self.assertEqual(tr.prev_end, tr.start)
+
+    def test_24h_calendar_uses_one_rolling_cell(self) -> None:
+        now = datetime(2026, 8, 12, 12, 30, tzinfo=timezone.utc)
+        tr = parse_range("24h", now=now)
+
+        self.assertEqual(_day_list(tr), ["2026-08-12"])
 
 
 class CodexCumulativeTrapTests(unittest.TestCase):
@@ -210,6 +228,20 @@ class ActivityCalendarTests(unittest.TestCase):
         self.assertGreaterEqual(out["max"]["sessions"], 1)
         self.assertIn("current_days", out["streaks"])
 
+    def test_24h_calendar_rolls_window_activity_into_one_cell(self) -> None:
+        tr = _tr(
+            key="24h",
+            start=datetime(2026, 8, 1, 9, tzinfo=timezone.utc),
+            end=datetime(2026, 8, 2, 9, tzinfo=timezone.utc),
+        )
+
+        out = activity_calendar(self.conn, tr)
+
+        self.assertEqual([cell["date"] for cell in out["days"]], ["2026-08-02"])
+        self.assertEqual(out["days"][0]["sessions"], 1)
+        self.assertEqual(out["days"][0]["messages"], 2)
+        self.assertEqual(out["days"][0]["total_tokens"], 275)
+
     def test_streak_computation(self) -> None:
         end = datetime(2026, 8, 6, tzinfo=timezone.utc)
         # Contiguous through 08-05; gap to end_day=08-06 is 1 → current kept
@@ -267,14 +299,29 @@ class EndpointSmokeTests(unittest.TestCase):
         r = self.client.get("/api/tokens/usage?range=all&group_by=harness")
         self.assertEqual(r.status_code, 200)
         self.assertIn("groups", r.json())
-        r = self.client.get("/api/activity/calendar?range=90d")
+        r = self.client.get("/api/activity/calendar")
         self.assertEqual(r.status_code, 200)
         self.assertIn("days", r.json())
+        self.assertEqual(r.json()["range"], "24h")
         r = self.client.get("/api/activity/rollup?range=30d")
         self.assertEqual(r.status_code, 200)
         self.assertIn("by_harness", r.json())
-        r = self.client.get("/api/activity/calendar?range=7d")
+        for range_key in ("7d", "30d", "all"):
+            r = self.client.get(f"/api/activity/calendar?range={range_key}")
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(r.json()["range"], range_key)
+        r = self.client.get("/api/activity/calendar?range=90d")
         self.assertEqual(r.status_code, 400)
+        r = self.client.get(
+            "/api/activity/calendar",
+            params={
+                "range": "custom",
+                "start": "2026-08-01T00:00:00+00:00",
+                "end": "2026-08-02T00:00:00+00:00",
+            },
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["range"], "custom")
 
 
 if __name__ == "__main__":

@@ -23,7 +23,12 @@ from agentlog.config import (
 )
 from agentlog.db.repository import Repository
 from agentlog.db.schema import connect, init_db
-from agentlog.ingest.pipeline import ingest_harness
+from agentlog.ingest.base import is_sqlite_path
+from agentlog.ingest.pipeline import (
+    _changed_artifact_paths,
+    adapter_for,
+    ingest_harness,
+)
 from agentlog.watch.debounce import Debouncer
 from agentlog.watch.events import record_ingest_event
 from agentlog.watch.presence import PresenceMap
@@ -32,6 +37,7 @@ from agentlog.watch.sources import WatchSource, existing_watch_roots
 log = logging.getLogger("agentlog.watch")
 
 _MAX_INGEST_RETRIES = 3
+_SQLITE_SIDECARS = ("-journal", "-wal", "-shm")
 _WRITE_STATEMENTS = {
     "ALTER",
     "BEGIN",
@@ -249,6 +255,79 @@ class WatchDaemon:
             paths = sorted(self._changed_paths.pop(harness, set()))
         return paths
 
+    def _canonical_changed_paths(
+        self, harness: str, paths: list[str]
+    ) -> list[str]:
+        """Keep filesystem events inside configured roots and normalize sidecars."""
+        if not paths:
+            return []
+        sources = [
+            src
+            for src in self.sources
+            if src.harness == harness
+        ]
+        roots = [
+            src.path.expanduser().resolve()
+            for src in sources
+        ]
+
+        def sidecar_base(path: Path) -> Path | None:
+            raw = str(path)
+            for suffix in _SQLITE_SIDECARS:
+                if raw.endswith(suffix):
+                    base = Path(raw[: -len(suffix)])
+                    if is_sqlite_path(base):
+                        return base
+            return None
+
+        configured_files = {
+            root
+            for root, src in zip(roots, sources)
+            if src.path.expanduser().is_file() and is_sqlite_path(root)
+        }
+        accepted: set[str] = set()
+        for raw_path in paths:
+            path = Path(raw_path).expanduser().resolve()
+            base = sidecar_base(path)
+            if base is not None and base in configured_files:
+                if base.is_file():
+                    accepted.add(str(base))
+                continue
+            if base is None and not path.is_file():
+                continue
+            for root in roots:
+                if root.is_file():
+                    allowed = path == root
+                else:
+                    try:
+                        path.relative_to(root)
+                    except ValueError:
+                        allowed = False
+                    else:
+                        allowed = True
+                if not allowed:
+                    continue
+                if base is not None:
+                    if not base.exists() or not base.is_file():
+                        break
+                    try:
+                        base.relative_to(root)
+                    except ValueError:
+                        break
+                    if not is_sqlite_path(base):
+                        break
+                    accepted.add(str(base))
+                else:
+                    accepted.add(str(path))
+                break
+        adapter = adapter_for(harness)
+        if adapter is None:
+            return []
+        return [
+            str(path)
+            for path in _changed_artifact_paths(adapter, sorted(accepted))
+        ]
+
     def _requeue_changed(
         self,
         harness: str,
@@ -317,7 +396,17 @@ class WatchDaemon:
                 self._ingest_reschedule.discard(harness)
 
     def _run_ingest(self, harness: str) -> bool:
-        changed = self._take_changed(harness)
+        raw_changed = self._take_changed(harness)
+        changed = self._canonical_changed_paths(harness, raw_changed)
+        if raw_changed and not changed:
+            self._clear_retry(harness)
+            _structured(
+                "ingest_ignored",
+                harness=harness,
+                changed=raw_changed,
+                reason="no accepted paths",
+            )
+            return False
         started = self._clock()
         conn: _WriteSerializedConnection | None = None
         try:
@@ -326,7 +415,14 @@ class WatchDaemon:
             conn = _WriteSerializedConnection(raw_conn, self._write_lock)
             conn.execute("PRAGMA busy_timeout = 30000")
             repo = Repository(conn)  # type: ignore[arg-type]
-            stats = ingest_harness(repo, harness)
+            if changed:
+                stats = ingest_harness(
+                    repo, harness, changed_paths=changed
+                )
+            else:
+                # An empty scope is reserved for startup catch-up and explicit
+                # retries; the normal event path always supplies exact files.
+                stats = ingest_harness(repo, harness)
             if stats.failed:
                 self._requeue_changed(
                     harness, changed, retry_empty=not changed

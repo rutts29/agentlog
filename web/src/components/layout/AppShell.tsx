@@ -39,13 +39,14 @@ const NAV_SECTIONS: Array<{
   },
 ];
 
-const RANGES: RangeKey[] = ["7d", "30d", "90d", "all"];
+const RANGES: RangeKey[] = ["24h", "7d", "30d", "all"];
 
 export function AppShell() {
   const [params, setParams] = useSearchParams();
   const location = useLocation();
   const navigate = useNavigate();
-  const range = (params.get("range") as RangeKey) || "all";
+  const requestedRange = params.get("range") as RangeKey | null;
+  const range = requestedRange && RANGES.includes(requestedRange) ? requestedRange : "24h";
   const [paletteOpen, setPaletteOpen] = useState(false);
   const meta = useQuery({ queryKey: ["meta"], queryFn: fetchMeta });
 

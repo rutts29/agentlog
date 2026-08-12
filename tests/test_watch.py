@@ -15,7 +15,12 @@ from agentlog.api.app import create_app
 from agentlog.db.repository import Repository
 from agentlog.db.schema import connect, init_db
 from agentlog.ingest.base import TranscriptAdapter
-from agentlog.ingest.pipeline import IngestStats, _ingest_one, ingest_harness
+from agentlog.ingest.pipeline import (
+    FrozenLegacyTranscriptError,
+    IngestStats,
+    _ingest_one,
+    ingest_harness,
+)
 from agentlog.normalize.models import (
     Harness,
     NormalizedMessage,
@@ -340,6 +345,272 @@ class WatchDaemonIngestTests(unittest.TestCase):
         self.assertEqual(second.appended, 0)
         self.assertGreaterEqual(second.skipped, 1)
 
+    def test_changed_path_ingest_does_not_discover_other_artifacts(self) -> None:
+        changed = self.sessions / "rollout-changed.jsonl"
+        untouched = self.sessions / "rollout-untouched.jsonl"
+        changed.write_text(_codex_jsonl("changed"), encoding="utf-8")
+        untouched.write_text(_codex_jsonl("untouched"), encoding="utf-8")
+        daemon = WatchDaemon(
+            db_path=self.db,
+            sources=[WatchSource("codex", self.sessions, poll=False)],
+            debounce_seconds=0,
+            use_watchdog=False,
+        )
+        daemon._note_change("codex", str(changed))
+        with mock.patch(
+            "agentlog.ingest.codex.CodexAdapter.discover",
+            side_effect=AssertionError("event ingest must not rediscover"),
+        ):
+            self.assertTrue(daemon._run_ingest("codex"))
+
+        conn = connect(self.db)
+        try:
+            ids = {
+                str(row["id"])
+                for row in conn.execute(
+                    "SELECT id FROM sessions WHERE harness = 'codex'"
+                )
+            }
+        finally:
+            conn.close()
+        self.assertIn("codex:changed", ids)
+        self.assertNotIn("codex:untouched", ids)
+
+    def test_out_of_root_change_is_ignored_without_full_discovery(self) -> None:
+        outside = self.root / "outside.jsonl"
+        outside.write_text(_codex_jsonl("outside"), encoding="utf-8")
+        daemon = WatchDaemon(
+            db_path=self.db,
+            sources=[WatchSource("codex", self.sessions, poll=False)],
+            debounce_seconds=0,
+            use_watchdog=False,
+        )
+        daemon._note_change("codex", str(outside))
+        with mock.patch(
+            "agentlog.watch.daemon.ingest_harness"
+        ) as ingest:
+            self.assertFalse(daemon._run_ingest("codex"))
+        ingest.assert_not_called()
+
+    def test_noise_inside_root_is_ignored_without_full_discovery(self) -> None:
+        noise = self.sessions / ".DS_Store"
+        noise.write_bytes(b"noise")
+        daemon = WatchDaemon(
+            db_path=self.db,
+            sources=[WatchSource("codex", self.sessions, poll=False)],
+            debounce_seconds=0,
+            use_watchdog=False,
+        )
+        daemon._note_change("codex", str(noise))
+        with mock.patch(
+            "agentlog.watch.daemon.ingest_harness"
+        ) as ingest:
+            self.assertFalse(daemon._run_ingest("codex"))
+        ingest.assert_not_called()
+
+    def test_deleted_jsonl_event_is_ignored_without_retry(self) -> None:
+        deleted = self.sessions / "rollout-deleted.jsonl"
+        daemon = WatchDaemon(
+            db_path=self.db,
+            sources=[WatchSource("codex", self.sessions, poll=False)],
+            debounce_seconds=0,
+            use_watchdog=False,
+        )
+        daemon._note_change("codex", str(deleted))
+        with mock.patch("agentlog.watch.daemon.ingest_harness") as ingest:
+            self.assertFalse(daemon._run_ingest("codex"))
+        ingest.assert_not_called()
+        self.assertNotIn("codex", daemon._retry_counts)
+        self.assertEqual(daemon._take_changed("codex"), [])
+
+    def test_deleted_sqlite_sidecar_is_ignored_when_base_is_missing(self) -> None:
+        deleted = self.root / "deleted.sqlite"
+        daemon = WatchDaemon(
+            db_path=self.db,
+            sources=[WatchSource("t3code", self.root, poll=False)],
+            debounce_seconds=0,
+            use_watchdog=False,
+        )
+        self.assertEqual(
+            daemon._canonical_changed_paths("t3code", [str(deleted) + "-wal"]),
+            [],
+        )
+
+    def test_sqlite_sidecar_maps_to_configured_database(self) -> None:
+        source = self.root / "state.sqlite"
+        source.write_bytes(b"sqlite placeholder")
+        daemon = WatchDaemon(
+            db_path=self.db,
+            sources=[WatchSource("t3code", source, poll=False)],
+            debounce_seconds=0,
+            use_watchdog=False,
+        )
+        self.assertEqual(
+            daemon._canonical_changed_paths(
+                "t3code", [str(source) + "-wal"]
+            ),
+            [str(source.resolve())],
+        )
+
+    def test_unknown_sqlite_sidecar_does_not_escape_directory_root(self) -> None:
+        source = self.sessions / "state.sqlite"
+        sidecar = self.sessions / "missing.sqlite-wal"
+        source.write_bytes(b"sqlite placeholder")
+        daemon = WatchDaemon(
+            db_path=self.db,
+            sources=[WatchSource("t3code", self.sessions, poll=False)],
+            debounce_seconds=0,
+            use_watchdog=False,
+        )
+        self.assertEqual(
+            daemon._canonical_changed_paths("t3code", [str(sidecar)]), []
+        )
+
+    def test_pipeline_sqlite_sidecar_stays_scoped_to_main_database(self) -> None:
+        source = self.root / "state.sqlite"
+        source.write_bytes(b"sqlite placeholder")
+        conn = connect(self.db)
+        try:
+            repo = Repository(conn)
+            with mock.patch(
+                "agentlog.ingest.pipeline._ingest_one"
+            ) as ingest_one:
+                stats = ingest_harness(
+                    repo,
+                    "t3code",
+                    changed_paths=[str(source) + "-shm"],
+                )
+        finally:
+            conn.close()
+        self.assertEqual(stats.failed, 0)
+        ingest_one.assert_called_once()
+        self.assertEqual(ingest_one.call_args.args[2], source)
+
+    def test_pipeline_missing_changed_artifacts_do_not_ingest(self) -> None:
+        missing_jsonl = self.sessions / "missing.jsonl"
+        missing_sqlite = self.root / "missing.sqlite"
+        conn = connect(self.db)
+        try:
+            repo = Repository(conn)
+            with mock.patch("agentlog.ingest.pipeline._ingest_one") as ingest_one:
+                jsonl_stats = ingest_harness(
+                    repo, "codex", changed_paths=[str(missing_jsonl)]
+                )
+                sqlite_stats = ingest_harness(
+                    repo,
+                    "t3code",
+                    changed_paths=[str(missing_sqlite) + "-wal"],
+                )
+        finally:
+            conn.close()
+        self.assertEqual(jsonl_stats.failed, 0)
+        self.assertEqual(sqlite_stats.failed, 0)
+        ingest_one.assert_not_called()
+
+    def test_cursor_state_change_refreshes_all_transcripts(self) -> None:
+        state = self.root / "state.vscdb"
+        transcript = self.sessions / "composer.jsonl"
+        state.write_bytes(b"state")
+        transcript.write_text("{}\n", encoding="utf-8")
+        conn = connect(self.db)
+        try:
+            repo = Repository(conn)
+            with mock.patch(
+                "agentlog.ingest.cursor.CursorAdapter.discover",
+                return_value=[transcript],
+            ) as discover, mock.patch(
+                "agentlog.ingest.pipeline._ingest_one"
+            ) as ingest_one:
+                stats = ingest_harness(
+                    repo, "cursor", changed_paths=[str(state)]
+                )
+        finally:
+            conn.close()
+        self.assertEqual(stats.failed, 0)
+        discover.assert_called_once_with()
+        ingest_one.assert_called_once()
+
+    def test_cursor_jsonl_change_stays_exactly_scoped(self) -> None:
+        transcript = self.sessions / "composer.jsonl"
+        transcript.write_text("{}\n", encoding="utf-8")
+        conn = connect(self.db)
+        try:
+            repo = Repository(conn)
+            with mock.patch(
+                "agentlog.ingest.cursor.CursorAdapter.discover",
+                side_effect=AssertionError("JSONL event must stay scoped"),
+            ), mock.patch(
+                "agentlog.ingest.pipeline._ingest_one"
+            ) as ingest_one:
+                stats = ingest_harness(
+                    repo, "cursor", changed_paths=[str(transcript)]
+                )
+        finally:
+            conn.close()
+        self.assertEqual(stats.failed, 0)
+        ingest_one.assert_called_once()
+
+    def test_startup_ingest_without_changed_paths_discovers_all(self) -> None:
+        path = self.sessions / "rollout-startup.jsonl"
+        path.write_text(_codex_jsonl("startup"), encoding="utf-8")
+        with mock.patch(
+            "agentlog.ingest.codex.CODEX_SESSIONS_DIR", self.sessions
+        ):
+            conn = connect(self.db)
+            try:
+                repo = Repository(conn)
+                with mock.patch.object(
+                    repo, "conn", conn
+                ), mock.patch(
+                    "agentlog.ingest.codex.CodexAdapter.discover",
+                    return_value=[path],
+                ) as discover:
+                    stats = ingest_harness(repo, "codex")
+            finally:
+                conn.close()
+        self.assertEqual(stats.failed, 0)
+        discover.assert_called_once_with()
+
+    def test_frozen_legacy_error_is_not_a_retry_failure(self) -> None:
+        path = self.sessions / "rollout-frozen.jsonl"
+        path.write_text(_codex_jsonl("frozen"), encoding="utf-8")
+        conn = connect(self.db)
+        try:
+            repo = Repository(conn)
+            with mock.patch(
+                "agentlog.ingest.codex.CodexAdapter.discover",
+                return_value=[path],
+            ), mock.patch(
+                "agentlog.ingest.pipeline._ingest_one",
+                side_effect=FrozenLegacyTranscriptError(
+                    "legacy session codex:frozen diverged in its canonical source"
+                ),
+            ):
+                stats = ingest_harness(repo, "codex")
+        finally:
+            conn.close()
+        self.assertEqual(stats.failed, 0)
+        self.assertEqual(stats.skipped, 1)
+        self.assertIn("identity frozen", stats.warnings[0])
+
+    def test_transient_changed_artifact_failure_remains_retryable(self) -> None:
+        path = self.sessions / "rollout-transient.jsonl"
+        path.write_text(_codex_jsonl("transient"), encoding="utf-8")
+        conn = connect(self.db)
+        try:
+            repo = Repository(conn)
+            with mock.patch(
+                "agentlog.ingest.pipeline._ingest_one",
+                side_effect=OSError("source still being written"),
+            ):
+                stats = ingest_harness(
+                    repo, "codex", changed_paths=[str(path)]
+                )
+        finally:
+            conn.close()
+        self.assertEqual(stats.failed, 1)
+        self.assertIn("source still being written", stats.warnings[0])
+
     def test_write_transactions_are_serialized(self) -> None:
         write_lock = threading.Lock()
         first = _WriteSerializedConnection(connect(self.db), write_lock)
@@ -446,6 +717,12 @@ class WatchDaemonIngestTests(unittest.TestCase):
             daemon._run_ingest("codex")
 
         self.assertEqual(ingest.call_count, 2)
+        self.assertEqual(
+            ingest.call_args_list[0].kwargs["changed_paths"], [str(path.resolve())]
+        )
+        self.assertEqual(
+            ingest.call_args_list[1].kwargs["changed_paths"], [str(path.resolve())]
+        )
         self.assertEqual(daemon._take_changed("codex"), [])
         self.assertNotIn("codex", daemon._retry_counts)
 

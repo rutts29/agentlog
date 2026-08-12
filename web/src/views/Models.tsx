@@ -451,12 +451,13 @@ export function Models() {
 
       <details className="rounded-card border border-border bg-card p-4">
         <summary className="microlabel cursor-pointer text-muted-foreground">
-          Interaction-style rates — gated, usually unavailable
+          Interaction-style rates — calibration required
         </summary>
         <p className="mt-2 max-w-2xl text-[12px] leading-relaxed text-faint-foreground">
-          Comparative redirect/brake rates stay behind precision gates and require
-          populated ux_observations. When shown, they describe steering frequency —
-          they do not rank models.
+          This section is intentionally unavailable until gold-label calibration and
+          populated ux_observations meet the precision gate. When available, these
+          rates describe steering frequency — they are not a quality score or model
+          ranking.
         </p>
         <div className="mt-3 grid grid-cols-2 gap-3">
           {data.items.slice(0, 4).map((item) => (

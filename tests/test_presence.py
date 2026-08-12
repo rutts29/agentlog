@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient
 
 from agentlog.api.app import create_app
 from agentlog.api.events import iter_event_sse
-from agentlog.api.live import live_payload
+from agentlog.api.live import _source_snapshot_status, live_payload
 from agentlog.db.schema import connect, init_db
 from agentlog.watch.presence import (
     PresenceMap,
@@ -387,6 +387,8 @@ class PresenceApiTests(unittest.TestCase):
         )
         self.assertEqual(body["counts"]["workers"], 1)
         self.assertEqual(body["sessions"][0]["parent_session_id"], "t3code:owner")
+        self.assertEqual(body["sessions"][0]["logical_session_id"], "t3code:owner")
+        self.assertEqual(body["sessions"][0]["logical_harness"], "t3code")
 
     def test_sse_emits_presence_on_change(self) -> None:
         data = json.loads(self.presence.read_text(encoding="utf-8"))
@@ -423,6 +425,52 @@ class PresenceApiTests(unittest.TestCase):
         self.assertIn("event: presence", joined)
         self.assertIn('"action":"active"', joined)
         self.assertIn("uuid-1", joined)
+
+
+class SourceSnapshotStatusTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.source = self.root / "source.jsonl"
+        self.source.write_text('{"type":"start"}\n', encoding="utf-8")
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _row(self, **overrides: object) -> dict:
+        row = {
+            "logical_session_id": "t3code:root",
+            "readiness_storage": "source_backed",
+            "readiness_artifact_path": str(self.source),
+            "readiness_sync_status": "current",
+            "readiness_artifact_size": 1,
+            "readiness_artifact_mtime_ns": 1,
+        }
+        row.update(overrides)
+        return row
+
+    def test_normal_append_remains_a_stable_readable_snapshot(self) -> None:
+        with self.source.open("a", encoding="utf-8") as handle:
+            handle.write('{"type":"append"}\n')
+
+        self.assertEqual(_source_snapshot_status(self._row()), "stable")
+
+    def test_missing_identity_path_or_frozen_state_is_pending(self) -> None:
+        self.assertEqual(
+            _source_snapshot_status(self._row(logical_session_id=None)), "pending"
+        )
+        self.assertEqual(
+            _source_snapshot_status(
+                self._row(readiness_artifact_path=str(self.root / "missing.jsonl"))
+            ),
+            "pending",
+        )
+        self.assertEqual(
+            _source_snapshot_status(
+                self._row(readiness_sync_status="frozen_diverged")
+            ),
+            "pending",
+        )
 
 
 class ExternalIdHelperTests(unittest.TestCase):
