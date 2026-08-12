@@ -12,6 +12,7 @@ and per-turn model selection.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -258,6 +259,132 @@ class T3CodeAdapter(TranscriptAdapter):
                 log.info("t3code: %s has no projection_threads; skipping", path)
                 return []
             return self._parse_state_db(conn, size)
+
+    def parse_session(
+        self, path: Path, external_id: str
+    ) -> ParseResult | None:
+        """Read one thread from a coherent read transaction.
+
+        ``parse_path`` is intentionally still the full-artifact ingest path.
+        Detail views only need one thread, so avoid traversing every thread in
+        the shared T3 projection while another thread is being written.
+        """
+        result, _source_hash = self.parse_session_with_hash(path, external_id)
+        return result
+
+    def parse_session_with_hash(
+        self, path: Path, external_id: str
+    ) -> tuple[ParseResult | None, str]:
+        """Read one thread and fingerprint only its source-backed content."""
+        size = path.stat().st_size if path.is_file() else 0
+        with open_sqlite_readonly(path) as conn:
+            conn.execute("BEGIN")
+            try:
+                result = self.parse_session_connection(
+                    conn, external_id, size=size
+                )
+                if result is None:
+                    return None, "missing"
+                payload = result.model_dump(
+                    mode="json", exclude={"bytes_consumed"}
+                )
+                encoded = json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+                return result, hashlib.sha256(encoded).hexdigest()
+            finally:
+                conn.rollback()
+
+    def parse_session_connection(
+        self,
+        conn: sqlite3.Connection,
+        external_id: str,
+        *,
+        size: int = 0,
+    ) -> ParseResult | None:
+        """Parse one thread using the caller-owned coherent SQLite snapshot."""
+        if not table_exists(conn, "projection_threads"):
+            return None
+        thread = conn.execute(
+            """
+            SELECT thread_id, project_id, title, branch, worktree_path,
+                   created_at, updated_at, deleted_at, model_selection_json,
+                   runtime_mode, interaction_mode
+            FROM projection_threads
+            WHERE thread_id = ?
+            """,
+            (external_id,),
+        ).fetchone()
+        if thread is None:
+            return None
+
+        project = None
+        if table_exists(conn, "projection_projects"):
+            project = conn.execute(
+                """
+                SELECT project_id, title, workspace_root,
+                       default_model_selection_json
+                FROM projection_projects
+                WHERE project_id = ?
+                """,
+                (thread["project_id"],),
+            ).fetchone()
+        projects = {str(project["project_id"]): project} if project else {}
+
+        provider_sessions: dict[str, sqlite3.Row] = {}
+        if table_exists(conn, "projection_thread_sessions"):
+            provider = conn.execute(
+                """
+                SELECT thread_id, provider_name, provider_instance_id,
+                       provider_session_id, provider_thread_id, status
+                FROM projection_thread_sessions
+                WHERE thread_id = ?
+                """,
+                (external_id,),
+            ).fetchone()
+            if provider is not None:
+                provider_sessions[external_id] = provider
+
+        plan_parents: dict[str, str] = {}
+        if table_exists(conn, "projection_thread_proposed_plans"):
+            plan = conn.execute(
+                """
+                SELECT thread_id, implementation_thread_id
+                FROM projection_thread_proposed_plans
+                WHERE implementation_thread_id = ?
+                LIMIT 1
+                """,
+                (external_id,),
+            ).fetchone()
+            if plan is not None and plan["thread_id"]:
+                plan_parents[external_id] = str(plan["thread_id"])
+        if table_exists(conn, "projection_turns"):
+            turn = conn.execute(
+                """
+                SELECT thread_id, source_proposed_plan_thread_id
+                FROM projection_turns
+                WHERE thread_id = ?
+                  AND source_proposed_plan_thread_id IS NOT NULL
+                LIMIT 1
+                """,
+                (external_id,),
+            ).fetchone()
+            if turn is not None and turn["source_proposed_plan_thread_id"]:
+                plan_parents.setdefault(
+                    external_id, str(turn["source_proposed_plan_thread_id"])
+                )
+
+        return self._parse_thread(
+            conn,
+            thread,
+            projects=projects,
+            provider_sessions=provider_sessions,
+            plan_parents=plan_parents,
+            size=size,
+        )
 
     def _parse_state_db(
         self, conn: sqlite3.Connection, size: int

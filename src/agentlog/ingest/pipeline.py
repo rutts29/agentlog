@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from collections.abc import Iterable
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from rich.console import Console
 from rich.progress import BarColumn, Progress, TextColumn, TimeElapsedColumn
@@ -39,6 +41,36 @@ from agentlog.normalize.models import ParseResult
 log = logging.getLogger("agentlog.ingest")
 
 _STABLE_SOURCE_ATTEMPTS = 3
+_SQLITE_SIDECARS = ("-journal", "-wal", "-shm")
+
+
+class FrozenLegacyTranscriptError(TranscriptStorageError):
+    """A legacy transcript cannot be promoted without rewriting its identity."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        session_id: str | None = None,
+        status: str | None = None,
+        harness: str | None = None,
+        path: Path | None = None,
+        size: int | None = None,
+        mtime_ns: int | None = None,
+        content_hash: str | None = None,
+        parsed_offset: int | None = None,
+        transcript_storage: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.session_id = session_id
+        self.status = status
+        self.harness = harness
+        self.path = path
+        self.size = size
+        self.mtime_ns = mtime_ns
+        self.content_hash = content_hash
+        self.parsed_offset = parsed_offset
+        self.transcript_storage = transcript_storage
 
 
 @dataclass
@@ -131,6 +163,11 @@ def ingest_all(repo: Repository, console: Console | None = None) -> IngestStats:
             try:
                 _ingest_one(repo, adapter, path, stats)
                 repo.conn.commit()
+            except FrozenLegacyTranscriptError as exc:
+                repo.conn.rollback()
+                _persist_frozen_legacy(repo, exc)
+                stats.skipped += 1
+                stats.warnings.append(f"{path}: {exc}; identity frozen")
             except Exception as exc:  # noqa: BLE001 - keep ingest going
                 repo.conn.rollback()
                 stats.failed += 1
@@ -142,17 +179,111 @@ def ingest_all(repo: Repository, console: Console | None = None) -> IngestStats:
     return stats
 
 
-def ingest_harness(repo: Repository, harness: str) -> IngestStats:
-    """Run incremental ingest for a single harness."""
+def _changed_artifact_paths(
+    adapter: TranscriptAdapter,
+    changed_paths: Iterable[str | Path],
+) -> list[Path]:
+    """Return changed files that can be canonical artifacts for an adapter."""
+    paths: set[Path] = set()
+    for raw_path in changed_paths:
+        path = Path(raw_path).expanduser()
+        raw = str(path)
+        for suffix in _SQLITE_SIDECARS:
+            if raw.endswith(suffix):
+                base = Path(raw[: -len(suffix)])
+                if is_sqlite_path(base) and base.exists() and base.is_file():
+                    path = base
+                break
+        try:
+            if not path.exists() or not path.is_file():
+                continue
+        except OSError:
+            continue
+        if adapter.supports_byte_append:
+            if path.suffix.lower() != ".jsonl" or path.name == "journal.jsonl":
+                continue
+        elif not is_sqlite_path(path):
+            continue
+        elif adapter.harness.value == "t3code" and path.name != "state.sqlite":
+            continue
+        elif adapter.harness.value == "warp" and path.name != "warp.sqlite":
+            continue
+        elif adapter.harness.value == "hermes" and path.name not in {
+            "state.db",
+            "kanban.db",
+        }:
+            continue
+        paths.add(path)
+    return sorted(paths)
+
+
+def _persist_frozen_legacy(
+    repo: Repository, error: FrozenLegacyTranscriptError
+) -> None:
+    if error.session_id and error.status:
+        repo.record_source_sync_diagnostic(
+            error.session_id,
+            status=f"frozen_{error.status}",
+            warning=str(error),
+        )
+    if (
+        error.path is not None
+        and error.harness
+        and error.size is not None
+        and error.mtime_ns is not None
+        and error.content_hash is not None
+        and error.parsed_offset is not None
+    ):
+        existing = repo.get_artifact_by_path(str(error.path))
+        if existing is not None:
+            repo.upsert_artifact(
+                harness=error.harness,
+                path=str(error.path),
+                size=error.size,
+                mtime_ns=error.mtime_ns,
+                content_hash=error.content_hash,
+                parsed_offset=error.parsed_offset,
+                parser_version=PARSER_VERSION,
+                transcript_storage=(
+                    error.transcript_storage or existing.transcript_storage
+                ),
+            )
+    repo.conn.commit()
+
+
+def ingest_harness(
+    repo: Repository,
+    harness: str,
+    changed_paths: Iterable[str | Path] | None = None,
+) -> IngestStats:
+    """Run incremental ingest for one harness, optionally scoped to changed files."""
     stats = IngestStats()
     adapter = adapter_for(harness)
     if adapter is None:
         stats.warnings.append(f"unknown harness: {harness}")
         return stats
-    for path in adapter.discover():
+    if changed_paths is None:
+        paths = adapter.discover()
+    else:
+        changed = [Path(path).expanduser() for path in changed_paths]
+        refresh_cursor_metadata = (
+            adapter.harness.value == "cursor"
+            and any(path.name == "state.vscdb" for path in changed)
+        )
+        paths = (
+            adapter.discover()
+            if refresh_cursor_metadata
+            else _changed_artifact_paths(adapter, changed)
+        )
+    for path in paths:
         try:
             _ingest_one(repo, adapter, path, stats)
             repo.conn.commit()
+        except FrozenLegacyTranscriptError as exc:
+            repo.conn.rollback()
+            _persist_frozen_legacy(repo, exc)
+            stats.skipped += 1
+            stats.warnings.append(f"{path}: {exc}; identity frozen")
         except Exception as exc:  # noqa: BLE001 - keep ingest going
             repo.conn.rollback()
             stats.failed += 1
@@ -485,7 +616,22 @@ def _ingest_one(
                     f"legacy session {session_key} {verb} in its canonical source"
                 )
                 if not sqlite_source or len(parsed_results_by_id) <= 1:
-                    raise TranscriptStorageError(warning)
+                    raise FrozenLegacyTranscriptError(
+                        warning,
+                        session_id=session_key,
+                        status=status,
+                        harness=adapter.harness.value,
+                        path=path,
+                        size=decision.size,
+                        mtime_ns=decision.mtime_ns,
+                        content_hash=content_hash,
+                        parsed_offset=parsed_offset,
+                        transcript_storage=(
+                            decision.artifact.transcript_storage
+                            if decision.artifact is not None
+                            else LEGACY_MATERIALIZED
+                        ),
+                    )
                 frozen_legacy_external_ids[external_id] = (status, warning)
                 stats.warnings.append(warning + "; identity frozen")
         for external_id in source_backed_external_ids | promotion_external_ids:

@@ -278,6 +278,34 @@ class T3CodeAdapterTests(unittest.TestCase):
                 [m.content_hash for m in self.results[key].messages],
             )
 
+    def test_targeted_source_hash_ignores_unrelated_thread_writes(self) -> None:
+        adapter = T3CodeAdapter()
+        first, first_hash = adapter.parse_session_with_hash(self.db, MAIN_THREAD)
+        self.assertIsNotNone(first)
+
+        writer = sqlite3.connect(self.db)
+        writer.execute(
+            "UPDATE projection_threads SET title = 'updated plan' WHERE thread_id = ?",
+            (PLAN_THREAD,),
+        )
+        writer.commit()
+        writer.close()
+
+        second, second_hash = adapter.parse_session_with_hash(self.db, MAIN_THREAD)
+        self.assertIsNotNone(second)
+        self.assertEqual(first_hash, second_hash)
+
+        writer = sqlite3.connect(self.db)
+        writer.execute(
+            "UPDATE projection_thread_messages SET text = 'rewritten' "
+            "WHERE message_id = 'm1'"
+        )
+        writer.commit()
+        writer.close()
+
+        _changed, changed_hash = adapter.parse_session_with_hash(self.db, MAIN_THREAD)
+        self.assertNotEqual(second_hash, changed_hash)
+
     def test_tool_only_turns_are_plumbing(self) -> None:
         by_text = {m.text: m for m in self.results[MAIN_THREAD].messages}
         self.assertTrue(by_text["context refreshed"].is_tool_plumbing)

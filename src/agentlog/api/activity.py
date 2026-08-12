@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -19,24 +19,22 @@ from agentlog.api.model_rollup import (
     SESSION_START_MODEL_SQL,
 )
 from agentlog.api.ranges import (
+    DEFAULT_RANGE_KEY,
     TimeRange,
-    parse_range,
+    parse_global_range,
     range_params,
     session_time_clause as _session_time_clause,
 )
 from agentlog.api import tokens as token_metrics
 router = APIRouter(tags=["activity"])
 
-_CALENDAR_RANGES = frozenset({"90d", "365d"})
-
-
 def _parse_range_dep(
-    range: str = Query("90d", alias="range"),
+    range: str = Query(DEFAULT_RANGE_KEY, alias="range"),
     start: str | None = None,
     end: str | None = None,
 ) -> TimeRange:
     try:
-        return parse_range(range, custom_start=start, custom_end=end)
+        return parse_global_range(range, custom_start=start, custom_end=end)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -57,16 +55,53 @@ def _duration_seconds_sql(alias: str = "s") -> str:
 
 
 def _day_list(tr: TimeRange) -> list[str]:
+    if tr.key == "24h":
+        return [tr.end.astimezone(timezone.utc).date().isoformat()]
     end = tr.end.astimezone(timezone.utc).date()
     if tr.start is None:
         return []
     start = tr.start.astimezone(timezone.utc).date()
+    if tr.end.astimezone(timezone.utc).time() == time.min:
+        end -= timedelta(days=1)
     days: list[str] = []
     cur = start
-    while cur < end:
+    while cur <= end:
         days.append(cur.isoformat())
         cur += timedelta(days=1)
     return days
+
+
+def _calendar_day(timestamp: str, tr: TimeRange) -> str:
+    if tr.key == "24h":
+        return tr.end.astimezone(timezone.utc).date().isoformat()
+    return timestamp[:10]
+
+
+def _rolling_token_day(
+    conn: sqlite3.Connection, tr: TimeRange
+) -> dict[str, dict[str, Any]]:
+    series = token_metrics.timeseries_daily(conn, tr)["series"]
+    if tr.key != "24h":
+        return {item["day"]: item for item in series}
+    totals: dict[str, int | None] = {}
+    for key in (
+        "input_tokens",
+        "output_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+        "total_tokens",
+    ):
+        values = [item["totals"].get(key) for item in series]
+        known = [int(value) for value in values if value is not None]
+        totals[key] = sum(known) if known else None
+    return {
+        tr.end.astimezone(timezone.utc).date().isoformat(): {
+            "sessions_with_usage": sum(
+                int(item["sessions_with_usage"]) for item in series
+            ),
+            "totals": totals,
+        }
+    }
 
 
 def _streaks(active_days: list[str], *, end: datetime) -> dict[str, int]:
@@ -119,7 +154,7 @@ def activity_calendar(conn: sqlite3.Connection, tr: TimeRange) -> dict[str, Any]
     by_metric = {session.metric_session_id: session for session in sessions}
     by_day: dict[str, dict[str, Any]] = {}
     for session in sessions:
-        day = str(session.row["started_at"])[:10]
+        day = _calendar_day(str(session.row["started_at"]), tr)
         entry = by_day.setdefault(
             day, {"sessions": 0, "messages": 0, "tool_events": 0, "harnesses": set()}
         )
@@ -136,11 +171,9 @@ def activity_calendar(conn: sqlite3.Connection, tr: TimeRange) -> dict[str, Any]
             ).fetchall()
             for row in rows:
                 session = by_metric[str(row["session_id"])]
-                day = str(session.row["started_at"])[:10]
+                day = _calendar_day(str(session.row["started_at"]), tr)
                 by_day[day][key] += int(row["c"])
-    token_days = {
-        item["day"]: item for item in token_metrics.timeseries_daily(conn, tr)["series"]
-    }
+    token_days = _rolling_token_day(conn, tr)
     days = _day_list(tr)
     if not days and by_day:
         days = sorted(by_day)
@@ -223,7 +256,8 @@ def activity_calendar(conn: sqlite3.Connection, tr: TimeRange) -> dict[str, Any]
         },
         "active_days": len(active_days),
         "note": (
-            "One cell per calendar day. Empty days included for the window. "
+            "One cell per calendar day. The 24h window is one rolling cell; "
+            "empty days are included for longer windows. "
             "total_tokens sums additive contributions only (Claude message "
             "usage + Codex final session_cumulative); null when unknown. "
             "Cursor/Warp contribute activity counts but not tokens."
@@ -592,11 +626,6 @@ def calendar_endpoint(
     conn: sqlite3.Connection = Depends(get_conn),
     tr: TimeRange = Depends(_parse_range_dep),
 ) -> dict:
-    if tr.key not in _CALENDAR_RANGES and tr.key != "custom":
-        raise HTTPException(
-            status_code=400,
-            detail="activity calendar supports range=90d, 365d, or custom",
-        )
     return {**range_params(tr), **activity_calendar(conn, tr)}
 
 

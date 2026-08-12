@@ -1,11 +1,9 @@
 import { Link, useOutletContext, useParams, useSearchParams } from "react-router-dom";
 import { useEffect, useMemo, useRef } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   displaySessionIdentity,
   authoritativeParentNavigationId,
-  fetchSessionDetail,
-  fetchSessionTree,
   logicalHarness,
   runtimeHarness,
   type InheritedContext,
@@ -31,6 +29,12 @@ import {
   type BranchTreeRow,
 } from "@/lib/sessionTree";
 import { formatDuration, formatDayTime, harnessColor } from "@/lib/utils";
+import {
+  refreshActiveSessionQueries,
+  sessionDetailQueryOptions,
+  sessionTreeQueryOptions,
+} from "@/lib/sessionQueries";
+import { useIngestStream } from "@/lib/useIngestStream";
 
 type Ctx = { range: string };
 
@@ -38,18 +42,15 @@ export function SessionDetail() {
   useOutletContext<Ctx>();
   const { sessionId = "" } = useParams();
   const [params] = useSearchParams();
+  const queryClient = useQueryClient();
   const focus = params.get("msg");
 
-  const q = useQuery({
-    queryKey: ["session", sessionId],
-    queryFn: () => fetchSessionDetail(sessionId),
-    enabled: Boolean(sessionId),
+  useIngestStream(({ events }) => {
+    if (!events.length || !sessionId) return;
+    void refreshActiveSessionQueries(queryClient, sessionId);
   });
-  const treeQuery = useQuery({
-    queryKey: ["session-tree", sessionId],
-    queryFn: () => fetchSessionTree(sessionId),
-    enabled: Boolean(sessionId),
-  });
+  const q = useQuery(sessionDetailQueryOptions(sessionId));
+  const treeQuery = useQuery(sessionTreeQueryOptions(sessionId));
   const isChildSession = Boolean(
     q.data?.session && authoritativeParentNavigationId(q.data.session),
   );

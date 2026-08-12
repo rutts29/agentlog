@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -11,6 +12,7 @@ from agentlog import source_reader
 from agentlog.api.descriptive import session_detail_v2
 from agentlog.db.schema import connect, init_db
 from agentlog.ingest.base import TranscriptAdapter, content_hash_text, hash_prefix
+from agentlog.ingest.sqlite_ro import open_sqlite_readonly
 from agentlog.normalize.models import (
     Harness,
     NormalizedMessage,
@@ -74,6 +76,52 @@ class _MultiSessionSqliteAdapter(TranscriptAdapter):
                 ("second", "second shared source message"),
             )
         ]
+
+
+class _TargetedSqliteAdapter(TranscriptAdapter):
+    harness = Harness.T3CODE
+    supports_byte_append = False
+    first_read: threading.Event | None = None
+    release_read: threading.Event | None = None
+
+    def discover(self) -> list[Path]:
+        return []
+
+    def parse_chunk(self, path, data, *, start_offset):
+        raise NotImplementedError
+
+    def parse_path(self, path, data, *, start_offset):
+        raise NotImplementedError
+
+    def parse_session(self, path: Path, external_id: str) -> ParseResult | None:
+        with open_sqlite_readonly(path) as conn:
+            conn.execute("BEGIN")
+            row = conn.execute(
+                "SELECT text FROM source_messages WHERE session_id = ?",
+                (external_id,),
+            ).fetchone()
+            conn.rollback()
+        if row is None:
+            return None
+        if self.first_read is not None and not self.first_read.is_set():
+            self.first_read.set()
+            if self.release_read is not None:
+                self.release_read.wait(timeout=2)
+        text = str(row["text"])
+        return ParseResult(
+            session=NormalizedSession(
+                harness=Harness.T3CODE,
+                external_id=external_id,
+            ),
+            messages=[
+                NormalizedMessage(
+                    seq=1,
+                    role="user",
+                    text=text,
+                    content_hash=content_hash_text(text),
+                )
+            ],
+        )
 
 
 class SourceTranscriptReaderTests(unittest.TestCase):
@@ -214,6 +262,209 @@ class SourceTranscriptReaderTests(unittest.TestCase):
         self.assertEqual(result.status, "source_changed")
         self.assertEqual(result.messages, [])
         self.assertEqual(result.warning, "ambiguous fork boundary")
+
+    def test_t3_unrelated_write_does_not_block_stable_session(self) -> None:
+        sqlite_path = Path(self._tmp.name) / "state.sqlite"
+        source = sqlite3.connect(sqlite_path)
+        source.execute(
+            "CREATE TABLE source_messages (session_id TEXT PRIMARY KEY, text TEXT)"
+        )
+        source.executemany(
+            "INSERT INTO source_messages VALUES (?, ?)",
+            [("changing", "old A"), ("stable", "unchanged B")],
+        )
+        source.commit()
+        source.close()
+        artifact_id = self.conn.execute(
+            """
+            INSERT INTO artifacts
+              (harness, path, size, mtime_ns, content_hash, parsed_offset,
+               parser_version, transcript_storage)
+            VALUES ('t3code', ?, ?, ?, 'sqlite-fixture', 0, 'source-test',
+                    'legacy_materialized')
+            RETURNING id
+            """,
+            (str(sqlite_path), sqlite_path.stat().st_size, sqlite_path.stat().st_mtime_ns),
+        ).fetchone()["id"]
+        for external_id, text in (("changing", "old A"), ("stable", "unchanged B")):
+            session_id = f"t3code:{external_id}"
+            self.conn.execute(
+                """
+                INSERT INTO sessions
+                  (id, harness, external_id, artifact_id, transcript_storage)
+                VALUES (?, 't3code', ?, ?, 'source_backed')
+                """,
+                (session_id, external_id, artifact_id),
+            )
+            self.conn.execute(
+                """
+                INSERT INTO messages (id, session_id, seq, role, text, content_hash)
+                VALUES (?, ?, 1, 'user', '', ?)
+                """,
+                (f"{session_id}:m:1", session_id, content_hash_text(text)),
+            )
+        self.conn.commit()
+
+        _TargetedSqliteAdapter.first_read = None
+        _TargetedSqliteAdapter.release_read = None
+        with patch.dict(
+            source_reader._ADAPTERS,
+            {Harness.T3CODE.value: _TargetedSqliteAdapter},
+        ):
+            cached_reader = CachedSourceTranscriptReader()
+            stable_cached = cached_reader(self.conn, "t3code:stable")
+            changing_cached = CachedSourceTranscriptReader()(
+                self.conn, "t3code:changing"
+            )
+        self.assertTrue(stable_cached.ready)
+        self.assertTrue(changing_cached.ready)
+        self.assertEqual([m["text"] for m in stable_cached.messages], ["unchanged B"])
+        self.assertEqual([m["text"] for m in changing_cached.messages], ["old A"])
+        with patch.dict(
+            source_reader._ADAPTERS,
+            {Harness.T3CODE.value: _TargetedSqliteAdapter},
+        ):
+            self.assertTrue(cached_reader.verify_current())
+
+        first_read = threading.Event()
+        release_read = threading.Event()
+        _TargetedSqliteAdapter.first_read = first_read
+        _TargetedSqliteAdapter.release_read = release_read
+        writer_done = threading.Event()
+
+        def writer() -> None:
+            self.assertTrue(first_read.wait(timeout=2))
+            writer_conn = sqlite3.connect(sqlite_path)
+            writer_conn.execute(
+                "UPDATE source_messages SET text = 'new A' WHERE session_id = 'changing'"
+            )
+            writer_conn.commit()
+            writer_conn.close()
+            writer_done.set()
+            release_read.set()
+
+        with patch.dict(
+            source_reader._ADAPTERS,
+            {Harness.T3CODE.value: _TargetedSqliteAdapter},
+        ):
+            thread = threading.Thread(target=writer)
+            thread.start()
+            result = read_source_transcript(self.conn, "t3code:stable")
+            thread.join(timeout=2)
+
+        self.assertTrue(writer_done.is_set())
+        self.assertTrue(result.ready)
+        self.assertEqual([m["text"] for m in result.messages], ["unchanged B"])
+        with patch.dict(
+            source_reader._ADAPTERS,
+            {Harness.T3CODE.value: _TargetedSqliteAdapter},
+        ):
+            self.assertTrue(cached_reader.verify_current())
+
+    def test_t3_requested_rewrite_still_fails_closed(self) -> None:
+        sqlite_path = Path(self._tmp.name) / "state.sqlite"
+        source = sqlite3.connect(sqlite_path)
+        source.execute(
+            "CREATE TABLE source_messages (session_id TEXT PRIMARY KEY, text TEXT)"
+        )
+        source.execute("INSERT INTO source_messages VALUES ('target', 'old')")
+        source.commit()
+        source.close()
+        artifact_id = self.conn.execute(
+            """
+            INSERT INTO artifacts
+              (harness, path, size, mtime_ns, content_hash, parsed_offset,
+               parser_version, transcript_storage)
+            VALUES ('t3code', ?, ?, ?, 'sqlite-fixture', 0, 'source-test',
+                    'legacy_materialized')
+            RETURNING id
+            """,
+            (str(sqlite_path), sqlite_path.stat().st_size, sqlite_path.stat().st_mtime_ns),
+        ).fetchone()["id"]
+        self.conn.execute(
+            """
+            INSERT INTO sessions
+              (id, harness, external_id, artifact_id, transcript_storage)
+            VALUES ('t3code:target', 't3code', 'target', ?, 'source_backed')
+            """,
+            (artifact_id,),
+        )
+        self.conn.execute(
+            """
+            INSERT INTO messages (id, session_id, seq, role, text, content_hash)
+            VALUES ('t3code:target:m:1', 't3code:target', 1, 'user', '', ?)
+            """,
+            (content_hash_text("old"),),
+        )
+        self.conn.commit()
+
+        writer_conn = sqlite3.connect(sqlite_path)
+        writer_conn.execute(
+            "UPDATE source_messages SET text = 'rewritten' WHERE session_id = 'target'"
+        )
+        writer_conn.commit()
+        writer_conn.close()
+
+        with patch.dict(
+            source_reader._ADAPTERS,
+            {Harness.T3CODE.value: _TargetedSqliteAdapter},
+        ):
+            result = read_source_transcript(self.conn, "t3code:target")
+
+        self.assertEqual(result.status, "source_changed")
+        self.assertEqual(result.messages, [])
+
+    def test_t3_cached_same_thread_rewrite_invalidates_verification(self) -> None:
+        sqlite_path = Path(self._tmp.name) / "state.sqlite"
+        source = sqlite3.connect(sqlite_path)
+        source.execute(
+            "CREATE TABLE source_messages (session_id TEXT PRIMARY KEY, text TEXT)"
+        )
+        source.execute("INSERT INTO source_messages VALUES ('target', 'old')")
+        source.commit()
+        source.close()
+        artifact_id = self.conn.execute(
+            """
+            INSERT INTO artifacts
+              (harness, path, size, mtime_ns, content_hash, parsed_offset,
+               parser_version, transcript_storage)
+            VALUES ('t3code', ?, ?, ?, 'sqlite-fixture', 0, 'source-test',
+                    'legacy_materialized')
+            RETURNING id
+            """,
+            (str(sqlite_path), sqlite_path.stat().st_size, sqlite_path.stat().st_mtime_ns),
+        ).fetchone()["id"]
+        self.conn.execute(
+            """
+            INSERT INTO sessions
+              (id, harness, external_id, artifact_id, transcript_storage)
+            VALUES ('t3code:target', 't3code', 'target', ?, 'source_backed')
+            """,
+            (artifact_id,),
+        )
+        self.conn.execute(
+            """
+            INSERT INTO messages (id, session_id, seq, role, text, content_hash)
+            VALUES ('t3code:target:m:1', 't3code:target', 1, 'user', '', ?)
+            """,
+            (content_hash_text("old"),),
+        )
+        self.conn.commit()
+
+        with patch.dict(
+            source_reader._ADAPTERS,
+            {Harness.T3CODE.value: _TargetedSqliteAdapter},
+        ):
+            reader = CachedSourceTranscriptReader()
+            self.assertTrue(reader(self.conn, "t3code:target").ready)
+            self.assertTrue(reader.verify_current())
+            writer_conn = sqlite3.connect(sqlite_path)
+            writer_conn.execute(
+                "UPDATE source_messages SET text = 'rewritten' WHERE session_id = 'target'"
+            )
+            writer_conn.commit()
+            writer_conn.close()
+            self.assertFalse(reader.verify_current())
 
     def test_operation_cache_parses_and_fingerprints_shared_sqlite_once(self) -> None:
         sqlite_path = Path(self._tmp.name) / "shared.sqlite"

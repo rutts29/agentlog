@@ -1,4 +1,4 @@
-export type RangeKey = "7d" | "30d" | "90d" | "all" | "custom";
+export type RangeKey = "24h" | "7d" | "30d" | "all" | "custom";
 
 declare global {
   interface Window {
@@ -20,6 +20,30 @@ export function withApiToken(path: string): string {
   const url = new URL(path, window.location.origin);
   url.searchParams.set("token", token);
   return `${url.pathname}${url.search}${url.hash}`;
+}
+
+export function combineAbortSignals(
+  ...signals: Array<AbortSignal | undefined>
+): { signal: AbortSignal | undefined; cleanup: () => void } {
+  const active = signals.filter((signal): signal is AbortSignal => Boolean(signal));
+  if (active.length === 0) return { signal: undefined, cleanup: () => undefined };
+  if (active.length === 1) return { signal: active[0], cleanup: () => undefined };
+
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  for (const signal of active) {
+    if (signal.aborted) {
+      controller.abort();
+      break;
+    }
+    signal.addEventListener("abort", abort, { once: true });
+  }
+  return {
+    signal: controller.signal,
+    cleanup: () => {
+      for (const signal of active) signal.removeEventListener("abort", abort);
+    },
+  };
 }
 
 export type AggregateCell = {
@@ -166,6 +190,7 @@ export type SessionRow = SessionIdentityFields & {
 async function getJson<T>(
   path: string,
   params?: Record<string, string | string[] | undefined>,
+  signal?: AbortSignal,
 ): Promise<T> {
   const url = new URL(path, window.location.origin);
   if (params) {
@@ -178,7 +203,7 @@ async function getJson<T>(
       }
     }
   }
-  const res = await fetch(url.toString(), { headers: apiAuthHeaders() });
+  const res = await fetch(url.toString(), { headers: apiAuthHeaders(), signal });
   if (!res.ok) {
     throw new Error(`${res.status} ${res.statusText}`);
   }
@@ -396,14 +421,14 @@ export function fetchRecent(range: string, limit?: number) {
   });
 }
 
-export function fetchFacets(range: string, view?: "roots") {
+export function fetchFacets(range: string, view?: "roots", signal?: AbortSignal) {
   return getJson<{
     harness: Array<{ value: string; count: number }>;
     model: Array<{ value: string; count: number }>;
     effort: Array<{ value: string; count: number }>;
     branch: Array<{ value: string; count: number }>;
     project: Array<{ value: string; count: number }>;
-  }>("/api/facets", { range, view });
+  }>("/api/facets", { range, view }, signal);
 }
 
 export function fetchSessions(
@@ -420,6 +445,7 @@ export function fetchSessions(
     cursor?: number;
     limit?: number;
   },
+  signal?: AbortSignal,
 ) {
   return getJson<{
     count_scope: "full_conversation";
@@ -442,7 +468,7 @@ export function fetchSessions(
     order: filters?.order,
     cursor: filters?.cursor != null ? String(filters.cursor) : undefined,
     limit: filters?.limit != null ? String(filters.limit) : undefined,
-  });
+  }, signal);
 }
 
 export type ToolEvent = {
@@ -500,7 +526,7 @@ export type ChildrenBounds = {
   omitted_child_count: number;
 };
 
-export function fetchSessionDetail(sessionId: string) {
+export function fetchSessionDetail(sessionId: string, signal?: AbortSignal) {
   return getJson<{
     session: SessionIdentityFields & {
       id: string;
@@ -550,7 +576,7 @@ export function fetchSessionDetail(sessionId: string) {
       window_count: number;
       child_count: number;
     };
-  }>(`/api/sessions/${encodeURIComponent(sessionId)}`);
+  }>(`/api/sessions/${encodeURIComponent(sessionId)}`, undefined, signal);
 }
 
 export function fetchSearch(
@@ -622,7 +648,7 @@ export function fetchOrchestration(range: string) {
   }>("/api/orchestration", { range });
 }
 
-export function fetchSessionTree(sessionId: string) {
+export function fetchSessionTree(sessionId: string, signal?: AbortSignal) {
   return getJson<{
     root_id: string;
     requested_id: string;
@@ -630,7 +656,7 @@ export function fetchSessionTree(sessionId: string) {
     tree: TreeNode;
     bounds?: TreeBounds;
     note: string;
-  }>(`/api/sessions/${encodeURIComponent(sessionId)}/tree`);
+  }>(`/api/sessions/${encodeURIComponent(sessionId)}/tree`, undefined, signal);
 }
 
 export type TreeBounds = {
@@ -771,11 +797,16 @@ export type LiveSession = {
   harness_display?: string;
   external_id: string;
   session_id: string | null;
+  /** Canonical root identity when this physical record belongs to T3. */
+  logical_session_id?: string | null;
+  logical_harness?: string | null;
   source_path: string;
   state: PresenceState | string;
   last_activity_at: string | null;
   age_seconds: number;
   pending_ingest: boolean;
+  /** Stable means opening the transcript cannot violate source freshness. */
+  source_snapshot_status?: "stable" | "pending" | string;
   title: string | null;
   repo: string | null;
   parent_session_id?: string | null;

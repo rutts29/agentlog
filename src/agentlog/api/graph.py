@@ -15,7 +15,13 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from agentlog.api.deps import get_conn
 from agentlog.api.identity_aggregates import visible_logical_sessions
 from agentlog.api.queries import _project_label
-from agentlog.api.ranges import TimeRange, parse_range, range_params, session_time_clause
+from agentlog.api.ranges import (
+    DEFAULT_RANGE_KEY,
+    TimeRange,
+    parse_global_range,
+    range_params,
+    session_time_clause,
+)
 from agentlog.session_identity import (
     build_identity_context,
     lineage_parent_ids,
@@ -59,12 +65,12 @@ FROM sessions s
 
 
 def _parse_range_dep(
-    range: str = Query("30d", alias="range"),
+    range: str = Query(DEFAULT_RANGE_KEY, alias="range"),
     start: str | None = None,
     end: str | None = None,
 ) -> TimeRange:
     try:
-        return parse_range(range, custom_start=start, custom_end=end)
+        return parse_global_range(range, custom_start=start, custom_end=end)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

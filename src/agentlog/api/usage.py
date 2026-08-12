@@ -8,18 +8,23 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 from agentlog.api import tokens
 from agentlog.api.deps import get_conn
-from agentlog.api.ranges import TimeRange, parse_range, range_params
+from agentlog.api.ranges import (
+    DEFAULT_RANGE_KEY,
+    TimeRange,
+    parse_global_range,
+    range_params,
+)
 
 router = APIRouter(tags=["tokens"])
 
 
 def _parse_range_dep(
-    range: str = Query("30d", alias="range"),
+    range: str = Query(DEFAULT_RANGE_KEY, alias="range"),
     start: str | None = None,
     end: str | None = None,
 ) -> TimeRange:
     try:
-        return parse_range(range, custom_start=start, custom_end=end)
+        return parse_global_range(range, custom_start=start, custom_end=end)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

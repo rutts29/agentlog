@@ -30,7 +30,12 @@ from agentlog.api import (
 )
 from agentlog.api.deps import WRITE_BUSY_TIMEOUT_MS, get_conn
 from agentlog.api.local_token import inject_spa_token
-from agentlog.api.ranges import TimeRange, parse_range, range_params
+from agentlog.api.ranges import (
+    DEFAULT_RANGE_KEY,
+    TimeRange,
+    parse_global_range,
+    range_params,
+)
 from agentlog.api.security import SecurityConfig, install_security
 from agentlog.config import DEFAULT_DB_PATH
 from agentlog.normalize.model_identity import repair_null_model_identity
@@ -40,12 +45,12 @@ log = logging.getLogger("agentlog.api")
 
 
 def _parse_range_dep(
-    range: str = Query("30d", alias="range"),
+    range: str = Query(DEFAULT_RANGE_KEY, alias="range"),
     start: str | None = None,
     end: str | None = None,
 ) -> TimeRange:
     try:
-        return parse_range(range, custom_start=start, custom_end=end)
+        return parse_global_range(range, custom_start=start, custom_end=end)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
