@@ -11,6 +11,7 @@ import {
 } from "@/lib/api";
 import { PanelCard } from "@/components/ui/card";
 import { EmptyState } from "@/components/EmptyState";
+import { LoadingOrb } from "@/components/LoadingOrb";
 import { HarnessTag, ModelBadge, RuntimeHarnessLabel } from "@/components/ui/badges";
 import { cn, formatDuration, formatFullTime, harnessColor } from "@/lib/utils";
 import { useViewShortcuts } from "@/lib/keyboard";
@@ -155,7 +156,7 @@ export function Sessions() {
   );
 
   if (list.isLoading || facets.isLoading) {
-    return <div className="text-[13px] text-muted-foreground">Loading…</div>;
+    return <LoadingOrb label="Reading sessions" />;
   }
   if (list.isError || !list.data || !facets.data) {
     return (

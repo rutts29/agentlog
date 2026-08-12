@@ -15,6 +15,7 @@ import {
 } from "@/lib/api";
 import { CopyPath } from "@/components/CopyPath";
 import { EmptyState } from "@/components/EmptyState";
+import { LoadingOrb } from "@/components/LoadingOrb";
 import { Transcript } from "@/components/Transcript";
 import { Card, CardTitle, PanelCard } from "@/components/ui/card";
 import {
@@ -127,7 +128,7 @@ export function SessionDetail() {
   }, [messages]);
 
   if (q.isLoading) {
-    return <div className="text-[13px] text-muted-foreground">Loading…</div>;
+    return <LoadingOrb label="Opening transcript" />;
   }
   if (q.isError || !q.data) {
     return (

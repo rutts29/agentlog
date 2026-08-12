@@ -3,6 +3,7 @@ import { Link, useOutletContext } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { fetchInsights, type InsightCard } from "@/lib/api";
 import { EmptyState } from "@/components/EmptyState";
+import { LoadingOrb } from "@/components/LoadingOrb";
 import { Card } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
 
@@ -265,7 +266,7 @@ export function Insights() {
   });
 
   if (q.isLoading) {
-    return <div className="text-[13px] text-muted-foreground">Loading…</div>;
+    return <LoadingOrb label="Reading insights" />;
   }
   if (!q.data) {
     return (

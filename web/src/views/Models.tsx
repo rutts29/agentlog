@@ -12,6 +12,7 @@ import {
 import { fetchModelMix, fetchModelMonthly, fetchTimeseries } from "@/lib/api";
 import { AggregatePanel } from "@/components/AggregatePanel";
 import { EmptyState } from "@/components/EmptyState";
+import { LoadingOrb } from "@/components/LoadingOrb";
 import { Card, CardTitle, PanelCard } from "@/components/ui/card";
 import { HarnessTag } from "@/components/ui/badges";
 import { Meter } from "@/components/ui/spark";
@@ -114,7 +115,7 @@ export function Models() {
   });
 
   if (mixQ.isLoading || monthlyQ.isLoading || byModelQ.isLoading) {
-    return <div className="text-[13px] text-muted-foreground">Loading…</div>;
+    return <LoadingOrb label="Reading model activity" />;
   }
   if (!mixQ.data || !monthlyQ.data || !byModelQ.data) {
     return (

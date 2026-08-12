@@ -10,6 +10,7 @@ import {
   type ProposalSupport,
 } from "@/lib/api";
 import { EmptyState } from "@/components/EmptyState";
+import { LoadingOrb } from "@/components/LoadingOrb";
 import { Card } from "@/components/ui/card";
 import { CopyPath } from "@/components/CopyPath";
 import { StatusDot } from "@/components/ui/badges";
@@ -484,7 +485,7 @@ export function Proposals() {
       ) : null}
 
       {q.isLoading ? (
-        <div className="text-[13px] text-muted-foreground">Loading…</div>
+        <LoadingOrb label="Reading proposals" compact />
       ) : !q.data ? (
         <EmptyState
           title="Could not load proposals"

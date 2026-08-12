@@ -14,6 +14,7 @@ import {
 import { classifySpeaker } from "@/lib/speaker";
 import { useViewShortcuts } from "@/lib/keyboard";
 import { EmptyState } from "@/components/EmptyState";
+import { LoadingOrb } from "@/components/LoadingOrb";
 import { Card, CardTitle, PanelCard } from "@/components/ui/card";
 import { HarnessTag, ModelBadge } from "@/components/ui/badges";
 import { cn } from "@/lib/utils";
@@ -501,7 +502,7 @@ export function Adjudicate() {
   });
 
   if (queue.isLoading) {
-    return <div className="text-[13px] text-muted-foreground">Loading…</div>;
+    return <LoadingOrb label="Checking escalations" />;
   }
   if (queue.isError || !queue.data) {
     return (
@@ -535,7 +536,7 @@ export function Adjudicate() {
     );
   }
   if (taxonomy.isLoading) {
-    return <div className="text-[13px] text-muted-foreground">Loading…</div>;
+    return <LoadingOrb label="Preparing review" />;
   }
   if (taxonomy.isError || !taxonomy.data) {
     return (

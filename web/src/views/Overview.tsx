@@ -26,6 +26,7 @@ import {
   runtimeHarness,
   type PresenceEvent,
 } from "@/lib/api";
+import { LoadingOrb } from "@/components/LoadingOrb";
 import { EmptyState } from "@/components/EmptyState";
 import { ConstellationGraph } from "@/components/ConstellationGraph";
 import { Card, CardTitle } from "@/components/ui/card";
@@ -287,7 +288,7 @@ export function Overview() {
 
   const queries = [summary, timeseries, models, heatmap, projects, recent, tools, kinds, dist, graph];
   if (queries.some((q) => q.isLoading)) {
-    return <div className="text-[13px] text-muted-foreground">Loading…</div>;
+    return <LoadingOrb label="Reading activity" />;
   }
   if (
     !summary.data ||

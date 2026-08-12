@@ -4,6 +4,7 @@ import { useQuery } from "@tanstack/react-query";
 import { fetchFacets, fetchSearch } from "@/lib/api";
 import { Snippet } from "@/components/Snippet";
 import { EmptyState } from "@/components/EmptyState";
+import { LoadingOrb } from "@/components/LoadingOrb";
 import { PanelCard } from "@/components/ui/card";
 import { HarnessTag, ModelBadge, TranscriptStorageBadge } from "@/components/ui/badges";
 import { formatDayTime } from "@/lib/utils";
@@ -110,7 +111,7 @@ export function Search() {
           missing={["legacy FTS + source scan"]}
         />
       ) : results.isLoading ? (
-        <div className="text-[13px] text-muted-foreground">Searching…</div>
+        <LoadingOrb label="Searching transcripts" compact />
       ) : results.isError ? (
         <EmptyState
           title="Search failed"
