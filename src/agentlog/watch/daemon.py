@@ -6,6 +6,7 @@ import sqlite3
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
@@ -54,6 +55,15 @@ _WRITE_STATEMENTS = {
 }
 
 
+@dataclass(frozen=True)
+class _IngestOutcome:
+    completed: bool
+    changed_window_ids: frozenset[str] = frozenset()
+
+    def __bool__(self) -> bool:
+        return self.completed
+
+
 def _structured(
     event: str,
     *,
@@ -73,15 +83,27 @@ class _HarnessHandler(FileSystemEventHandler):
         self.harness = harness
         self._on_change = on_change
 
+    def _note_path(self, path: str) -> None:
+        if not path:
+            return
+        name = Path(path).name
+        if name.endswith(("-journal", "-wal", "-shm")):
+            return
+        self._on_change(self.harness, path)
+
     def on_any_event(self, event: FileSystemEvent) -> None:
         if event.is_directory:
             return
-        src = getattr(event, "src_path", "") or ""
-        # Ignore SQLite journal noise for directory watches; poll handles DBs.
-        name = Path(str(src)).name
-        if name.endswith(("-journal", "-wal", "-shm")):
+        if getattr(event, "event_type", "") == "moved":
             return
-        self._on_change(self.harness, str(src))
+        src = getattr(event, "src_path", "") or ""
+        self._note_path(str(src))
+
+    def on_moved(self, event: FileSystemEvent) -> None:
+        if event.is_directory:
+            return
+        self._note_path(str(getattr(event, "src_path", "") or ""))
+        self._note_path(str(getattr(event, "dest_path", "") or ""))
 
 
 class _WriteSerializedConnection:
@@ -203,6 +225,7 @@ class WatchDaemon:
         self._derive_lock = threading.Lock()
         self._derive_thread: threading.Thread | None = None
         self._derive_pending: set[str] = set()
+        self._derive_pending_window_ids: dict[str, set[str] | None] = {}
         self._derive_retry_count = 0
         self._poll_state: dict[str, tuple[int, ...]] = {}
         self._observer: Observer | None = None
@@ -266,6 +289,9 @@ class WatchDaemon:
             for src in self.sources
             if src.harness == harness
         ]
+        adapter = adapter_for(harness)
+        if adapter is None:
+            return []
         roots = [
             src.path.expanduser().resolve()
             for src in sources
@@ -285,18 +311,39 @@ class WatchDaemon:
             for root, src in zip(roots, sources)
             if src.path.expanduser().is_file() and is_sqlite_path(root)
         }
+        cursor_metadata_controls = {
+            root
+            for root, src in zip(roots, sources)
+            if (
+                harness == "cursor"
+                and src.path.expanduser().is_file()
+                and root.name == "state.vscdb"
+            )
+        }
         accepted: set[str] = set()
+        controls: set[str] = set()
         for raw_path in paths:
             path = Path(raw_path).expanduser().resolve()
             base = sidecar_base(path)
-            if base is not None and base in configured_files:
-                if base.is_file():
+            if base is None and path in cursor_metadata_controls:
+                if path.is_file():
+                    controls.add(str(path))
+                continue
+            if (
+                base is not None
+                and harness != "cursor"
+                and base in configured_files
+            ):
+                if base.is_file() and adapter.accepts_watch_path(
+                    base, base.parent
+                ):
                     accepted.add(str(base))
                 continue
             if base is None and not path.is_file():
                 continue
-            for root in roots:
-                if root.is_file():
+            for root, src in zip(roots, sources):
+                source_is_file = src.path.expanduser().is_file()
+                if source_is_file:
                     allowed = path == root
                 else:
                     try:
@@ -306,6 +353,10 @@ class WatchDaemon:
                     else:
                         allowed = True
                 if not allowed:
+                    continue
+                candidate = base if base is not None else path
+                grammar_root = root.parent if source_is_file else root
+                if not adapter.accepts_watch_path(candidate, grammar_root):
                     continue
                 if base is not None:
                     if not base.exists() or not base.is_file():
@@ -320,13 +371,25 @@ class WatchDaemon:
                 else:
                     accepted.add(str(path))
                 break
-        adapter = adapter_for(harness)
-        if adapter is None:
-            return []
-        return [
+        artifacts = {
             str(path)
             for path in _changed_artifact_paths(adapter, sorted(accepted))
-        ]
+        }
+        return sorted(artifacts | controls)
+
+    def _cursor_metadata_control_path(
+        self, harness: str, paths: list[str]
+    ) -> Path | None:
+        if harness != "cursor":
+            return None
+        changed = {Path(path).expanduser().resolve() for path in paths}
+        for src in self.sources:
+            if src.harness != "cursor" or not src.path.expanduser().is_file():
+                continue
+            configured = src.path.expanduser().resolve()
+            if configured.name == "state.vscdb" and configured in changed:
+                return configured
+        return None
 
     def _requeue_changed(
         self,
@@ -348,7 +411,9 @@ class WatchDaemon:
         with self._changed_lock:
             self._retry_counts.pop(harness, None)
 
-    def _schedule_ingest(self, harness: str) -> threading.Thread | None:
+    def _schedule_ingest(
+        self, harness: str, *, catch_up_attention_tails: bool = False
+    ) -> threading.Thread | None:
         with self._worker_lock:
             if self._stop.is_set():
                 return None
@@ -359,7 +424,7 @@ class WatchDaemon:
                 return current
             worker = threading.Thread(
                 target=self._ingest_worker,
-                args=(harness,),
+                args=(harness, catch_up_attention_tails),
                 name=f"agentlog-ingest-{harness}",
                 daemon=True,
             )
@@ -368,12 +433,20 @@ class WatchDaemon:
         _structured("ingest_scheduled", harness=harness)
         return worker
 
-    def _ingest_worker(self, harness: str) -> None:
+    def _ingest_worker(
+        self, harness: str, catch_up_attention_tails: bool = False
+    ) -> None:
         try:
             while not self._stop.is_set():
-                completed = self._run_ingest(harness)
-                if completed:
-                    self._schedule_derive(harness)
+                outcome = (
+                    self._run_ingest(harness, catch_up_attention_tails=True)
+                    if catch_up_attention_tails
+                    else self._run_ingest(harness)
+                )
+                if outcome:
+                    changed_window_ids = getattr(outcome, "changed_window_ids", ())
+                    if changed_window_ids:
+                        self._schedule_derive(harness, changed_window_ids)
                 with self._worker_lock:
                     if self._stop.is_set():
                         self._ingest_threads.pop(harness, None)
@@ -395,7 +468,9 @@ class WatchDaemon:
                 self._ingest_threads.pop(harness, None)
                 self._ingest_reschedule.discard(harness)
 
-    def _run_ingest(self, harness: str) -> bool:
+    def _run_ingest(
+        self, harness: str, *, catch_up_attention_tails: bool = False
+    ) -> _IngestOutcome:
         raw_changed = self._take_changed(harness)
         changed = self._canonical_changed_paths(harness, raw_changed)
         if raw_changed and not changed:
@@ -406,7 +481,7 @@ class WatchDaemon:
                 changed=raw_changed,
                 reason="no accepted paths",
             )
-            return False
+            return _IngestOutcome(False)
         started = self._clock()
         conn: _WriteSerializedConnection | None = None
         try:
@@ -416,13 +491,33 @@ class WatchDaemon:
             conn.execute("PRAGMA busy_timeout = 30000")
             repo = Repository(conn)  # type: ignore[arg-type]
             if changed:
+                metadata_state = self._cursor_metadata_control_path(harness, changed)
+                ingest_paths = [
+                    path
+                    for path in changed
+                    if metadata_state is None or path != str(metadata_state)
+                ]
+                ingest_kwargs = (
+                    {"cursor_metadata_state_db": metadata_state}
+                    if metadata_state is not None
+                    else {}
+                )
                 stats = ingest_harness(
-                    repo, harness, changed_paths=changed
+                    repo,
+                    harness,
+                    changed_paths=ingest_paths,
+                    **ingest_kwargs,
                 )
             else:
                 # An empty scope is reserved for startup catch-up and explicit
                 # retries; the normal event path always supplies exact files.
-                stats = ingest_harness(repo, harness)
+                stats = (
+                    ingest_harness(
+                        repo, harness, catch_up_attention_tails=True
+                    )
+                    if catch_up_attention_tails
+                    else ingest_harness(repo, harness)
+                )
             if stats.failed:
                 self._requeue_changed(
                     harness, changed, retry_empty=not changed
@@ -456,7 +551,10 @@ class WatchDaemon:
                 event_id=event_id,
                 duration_ms=duration_ms,
             )
-            return completed
+            return _IngestOutcome(
+                completed,
+                frozenset(stats.changed_window_ids) if completed else frozenset(),
+            )
         except Exception as exc:  # noqa: BLE001 - keep daemon alive
             self._requeue_changed(
                 harness, changed, retry_empty=not changed
@@ -470,16 +568,35 @@ class WatchDaemon:
                 duration_ms=duration_ms,
             )
             log.exception("ingest cycle failed for %s", harness)
-            return False
+            return _IngestOutcome(False)
         finally:
             if conn is not None:
                 conn.close()
 
-    def _schedule_derive(self, harness: str) -> threading.Thread | None:
+    def _queue_derive(
+        self, harness: str, window_ids: set[str] | frozenset[str] | None
+    ) -> None:
+        if harness not in self._derive_pending_window_ids:
+            self._derive_pending_window_ids[harness] = (
+                None if window_ids is None else set(window_ids)
+            )
+        elif self._derive_pending_window_ids[harness] is None or window_ids is None:
+            self._derive_pending_window_ids[harness] = None
+        else:
+            self._derive_pending_window_ids[harness].update(window_ids)
+        self._derive_pending.add(harness)
+
+    def _schedule_derive(
+        self,
+        harness: str,
+        window_ids: set[str] | frozenset[str] | None = None,
+    ) -> threading.Thread | None:
+        if window_ids is not None and not window_ids:
+            return None
         with self._derive_lock:
             if self._stop.is_set():
                 return None
-            self._derive_pending.add(harness)
+            self._queue_derive(harness, window_ids)
             if self._derive_thread is not None:
                 return self._derive_thread
             worker = threading.Thread(
@@ -497,20 +614,37 @@ class WatchDaemon:
                 with self._derive_lock:
                     if self._stop.is_set():
                         self._derive_pending.clear()
+                        self._derive_pending_window_ids.clear()
                         self._derive_thread = None
                         return
                     if not self._derive_pending:
                         self._derive_thread = None
                         return
                     harnesses = tuple(sorted(self._derive_pending))
+                    pending_window_ids = {
+                        harness: self._derive_pending_window_ids.pop(harness, None)
+                        for harness in harnesses
+                    }
                     self._derive_pending.clear()
-                if self._run_derive(harnesses) is not False:
+                batch_window_ids: set[str] | None
+                if any(ids is None for ids in pending_window_ids.values()):
+                    batch_window_ids = None
+                else:
+                    batch_window_ids = set().union(
+                        *(ids or set() for ids in pending_window_ids.values())
+                    )
+                if self._run_derive(
+                    harnesses, window_ids=batch_window_ids
+                ) is not False:
                     self._derive_retry_count = 0
                     continue
                 self._derive_retry_count += 1
                 if self._derive_retry_count <= _MAX_INGEST_RETRIES:
                     with self._derive_lock:
-                        self._derive_pending.update(harnesses)
+                        for harness in harnesses:
+                            self._queue_derive(
+                                harness, pending_window_ids[harness]
+                            )
                 else:
                     _structured(
                         "derive_retry_exhausted",
@@ -524,8 +658,14 @@ class WatchDaemon:
                     self._derive_thread = None
                 if self._stop.is_set():
                     self._derive_pending.clear()
+                    self._derive_pending_window_ids.clear()
 
-    def _run_derive(self, harnesses: tuple[str, ...]) -> bool:
+    def _run_derive(
+        self,
+        harnesses: tuple[str, ...],
+        *,
+        window_ids: set[str] | None = None,
+    ) -> bool:
         from agentlog.analysis.derive import run_derive
 
         started = self._clock()
@@ -534,7 +674,9 @@ class WatchDaemon:
         try:
             raw_conn = connect(self.db_path)
             conn = _WriteSerializedConnection(raw_conn, self._write_lock)
-            result = run_derive(conn)  # type: ignore[arg-type]
+            result = run_derive(  # type: ignore[arg-type]
+                conn, window_ids=window_ids
+            )
             _structured(
                 "derive_cycle",
                 harness=harness,
@@ -542,6 +684,7 @@ class WatchDaemon:
                 windows_total=result.windows_total,
                 windows_classified=result.windows_classified,
                 windows_updated=result.windows_updated,
+                window_ids=len(window_ids) if window_ids is not None else None,
                 run_id=result.run_id,
                 duration_ms=int((self._clock() - started) * 1000),
             )
@@ -566,7 +709,7 @@ class WatchDaemon:
             return None
         return st.st_size, st.st_mtime_ns
 
-    def _poll_once(self) -> None:
+    def _poll_once(self, *, emit_changes: bool = True) -> None:
         for src in self.sources:
             if not src.poll:
                 continue
@@ -583,9 +726,16 @@ class WatchDaemon:
                     snap = self._snapshot(child)
                     if snap is None:
                         continue
+                    wal_snap = self._snapshot(Path(f"{child}-wal"))
+                    composite = (
+                        snap[0],
+                        snap[1],
+                        wal_snap[0] if wal_snap else 0,
+                        wal_snap[1] if wal_snap else 0,
+                    )
                     prev = self._poll_state.get(key)
-                    self._poll_state[key] = snap
-                    if prev is not None and prev != snap:
+                    self._poll_state[key] = composite
+                    if emit_changes and prev is not None and prev != composite:
                         self._note_change(src.harness, str(child))
                 continue
             key = f"{src.harness}:{path}"
@@ -603,14 +753,10 @@ class WatchDaemon:
             )
             prev_c = self._poll_state.get(key)
             self._poll_state[key] = composite
-            if prev_c is not None and prev_c != composite:
+            if emit_changes and prev_c is not None and prev_c != composite:
                 self._note_change(src.harness, str(path))
 
     def _poll_loop(self) -> None:
-        # Seed snapshots so the first pass does not fake a change storm.
-        self._poll_once()
-        with self._changed_lock:
-            self._changed_paths.clear()
         while not self._stop.wait(self.poll_seconds):
             try:
                 self._poll_once()
@@ -679,6 +825,11 @@ class WatchDaemon:
             self.presence.write_state_file()
         except Exception:  # noqa: BLE001
             log.exception("initial presence write failed")
+        if any(source.poll for source in self.sources):
+            try:
+                self._poll_once(emit_changes=False)
+            except Exception:  # noqa: BLE001
+                log.exception("initial poll snapshot failed")
         if self.use_watchdog:
             try:
                 self._start_watchdog()

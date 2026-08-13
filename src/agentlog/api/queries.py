@@ -21,7 +21,11 @@ from agentlog.api.model_rollup import (
     unknown_breakdown,
 )
 from agentlog.api.ranges import TimeRange, session_time_clause as _session_time_clause
-from agentlog.api.semantic import redirect_cell
+from agentlog.api.semantic import (
+    _published_run_or_reason,
+    _recent_root_ids,
+    redirect_cell,
+)
 from agentlog.normalize.model_identity import (
     UNKNOWN_MODEL_LABEL,
     display_model,
@@ -165,13 +169,18 @@ def sessions_by_harness_daily(
     return out
 
 
-def model_mix(conn: sqlite3.Connection, tr: TimeRange) -> list[dict[str, Any]]:
+def model_mix(
+    conn: sqlite3.Connection,
+    tr: TimeRange,
+    *,
+    sessions: list[VisibleLogicalSession] | None = None,
+) -> list[dict[str, Any]]:
     """Descriptive assistant-message model shares — not a quality ranking.
 
     One row per model identity. The harness split rides along as a
     breakdown so the rendered label stays the grouping key.
     """
-    sessions = _aggregate_sessions(conn, tr)
+    sessions = sessions if sessions is not None else _aggregate_sessions(conn, tr)
     by_metric = {session.metric_session_id: session for session in sessions}
     metric_ids = sorted(by_metric)
     if not metric_ids:
@@ -228,10 +237,13 @@ def model_mix(conn: sqlite3.Connection, tr: TimeRange) -> list[dict[str, Any]]:
 
 
 def unknown_model_detail(
-    conn: sqlite3.Connection, tr: TimeRange
+    conn: sqlite3.Connection,
+    tr: TimeRange,
+    *,
+    sessions: list[VisibleLogicalSession] | None = None,
 ) -> dict[str, Any]:
     """Assistant messages whose model could not be resolved, with the reason."""
-    sessions = _aggregate_sessions(conn, tr)
+    sessions = sessions if sessions is not None else _aggregate_sessions(conn, tr)
     by_metric = {session.metric_session_id: session for session in sessions}
     metric_ids = sorted(by_metric)
     if not metric_ids:
@@ -276,10 +288,13 @@ def unknown_model_detail(
 
 
 def agent_profile_mix(
-    conn: sqlite3.Connection, tr: TimeRange
+    conn: sqlite3.Connection,
+    tr: TimeRange,
+    *,
+    sessions: list[VisibleLogicalSession] | None = None,
 ) -> list[dict[str, Any]]:
     """Session counts by agent/profile identity (not a model ranking)."""
-    sessions = _aggregate_sessions(conn, tr)
+    sessions = sessions if sessions is not None else _aggregate_sessions(conn, tr)
     metrics = _metric_rows(conn, sessions)
     counts: dict[tuple[str, str], int] = defaultdict(int)
     for session in sessions:
@@ -1441,10 +1456,17 @@ def insights_feed(conn: sqlite3.Connection, tr: TimeRange) -> dict[str, Any]:
 
 
 def models_profile(conn: sqlite3.Connection, tr: TimeRange) -> dict[str, Any]:
-    mix = model_mix(conn, tr)
-    profiles = agent_profile_mix(conn, tr)
+    sessions = _aggregate_sessions(conn, tr)
+    mix = model_mix(conn, tr, sessions=sessions)
+    profiles = agent_profile_mix(conn, tr, sessions=sessions)
     # Interaction-style cells per model — abstain without semantic data.
     ux_n = count_ux_observations(conn, tr)
+    published_state = _published_run_or_reason(conn) if ux_n else None
+    unavailable_session_ids = (
+        _recent_root_ids(conn, tr)
+        if published_state is not None and published_state[0] is None
+        else None
+    )
     cells = []
     for row in mix[:20]:
         if row["model"] == UNKNOWN_MODEL_LABEL:
@@ -1470,7 +1492,13 @@ def models_profile(conn: sqlite3.Connection, tr: TimeRange) -> dict[str, Any]:
             )
         else:
             # Path for when data exists: still must pass gates (tested separately).
-            cell = _model_redirect_cell(conn, tr, row["model"])
+            cell = _model_redirect_cell(
+                conn,
+                tr,
+                row["model"],
+                published_state=published_state,
+                unavailable_session_ids=unavailable_session_ids,
+            )
         cells.append(
             {
                 "model": row["model"],
@@ -1497,7 +1525,7 @@ def models_profile(conn: sqlite3.Connection, tr: TimeRange) -> dict[str, Any]:
             ),
         },
         "items": cells,
-        "unknown": unknown_model_detail(conn, tr),
+        "unknown": unknown_model_detail(conn, tr, sessions=sessions),
         "unknown_note": (
             "(unknown) is a declared category, not a fallback bucket: every "
             "assistant message in it has a stated reason its model could not be "
@@ -1523,11 +1551,21 @@ def _model_confounder_flags(row: dict[str, Any]) -> list[str]:
 
 
 def _model_redirect_cell(
-    conn: sqlite3.Connection, tr: TimeRange, model: str
+    conn: sqlite3.Connection,
+    tr: TimeRange,
+    model: str,
+    *,
+    published_state: tuple[str | None, str] | None = None,
+    unavailable_session_ids: list[str] | None = None,
 ) -> AggregateCell:
     """Model-conditioned redirect/brake cell. Descendant windows roll up to roots."""
     return redirect_cell(
-        conn, tr, model=model, extra_flags=["structural_nestedness"]
+        conn,
+        tr,
+        model=model,
+        extra_flags=["structural_nestedness"],
+        published_state=published_state,
+        unavailable_session_ids=unavailable_session_ids,
     )
 
 

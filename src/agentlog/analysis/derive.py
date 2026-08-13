@@ -142,10 +142,14 @@ def write_watermark(
 
 def derived_freshness(conn: sqlite3.Connection) -> dict[str, Any]:
     """Snapshot for /api/health — explain empty Request Kinds panels."""
-    windows_total = _windows_total(conn)
-    windows_classified = _classified_count(conn)
-    wm = read_watermark(conn, DERIVE_KIND_DETERMINISTIC)
-    window_fps = iter_window_input_rows(conn)
+    conn.execute("SAVEPOINT derived_freshness_snapshot")
+    try:
+        windows_total = _windows_total(conn)
+        windows_classified = _classified_count(conn)
+        wm = read_watermark(conn, DERIVE_KIND_DETERMINISTIC)
+        window_fps = iter_window_input_rows(conn)
+    finally:
+        conn.execute("RELEASE SAVEPOINT derived_freshness_snapshot")
     current_fp = corpus_fingerprint(window_fps)
     stored_fp = str(wm["input_fingerprint"]) if wm else None
     fingerprint_match = bool(stored_fp and stored_fp == current_fp)
@@ -172,6 +176,7 @@ def run_derive(
     *,
     force: bool = False,
     index_skill_inventory: bool = True,
+    window_ids: set[str] | None = None,
 ) -> DeriveResult:
     """Idempotent derive pass for deterministic window classifications.
 
@@ -210,8 +215,11 @@ def run_derive(
         )
 
     # Stale already includes missing windows (no matching input_fp).
-    # Only --force reclassifies the full corpus.
+    # Only --force reclassifies the full corpus. Watchers pass the exact
+    # windows changed by an ingest so an old, cold corpus is never hydrated.
     targets: list[str] | None = None if force else stale
+    if targets is not None and window_ids is not None:
+        targets = [wid for wid in targets if wid in window_ids]
 
     if targets is not None and len(targets) == 0 and coverage_ok:
         write_watermark(

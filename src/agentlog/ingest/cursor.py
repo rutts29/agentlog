@@ -377,6 +377,45 @@ def lookup_composer_meta(
     return _composer_meta_cached(str(db), composer_id, _state_db_revision(db))
 
 
+def lookup_composer_metas(
+    composer_ids: list[str] | set[str],
+    *,
+    state_db: Path,
+) -> dict[str, ComposerMeta]:
+    """Read trusted session metadata for known composers from one state DB."""
+    path = state_db.expanduser()
+    ids = sorted({composer_id for composer_id in composer_ids if composer_id})
+    if not ids or not path.is_file():
+        return {}
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    except sqlite3.Error as exc:
+        log.warning("cannot open Cursor state.vscdb read-only: %s", exc)
+        return {}
+    try:
+        out: dict[str, ComposerMeta] = {}
+        for composer_id in ids:
+            row = conn.execute(
+                "SELECT value FROM cursorDiskKV WHERE key = ?",
+                (f"composerData:{composer_id}",),
+            ).fetchone()
+            if row is None:
+                continue
+            try:
+                raw = row[0] if isinstance(row[0], str) else row[0].decode("utf-8")
+                obj = json.loads(raw)
+            except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+                continue
+            if isinstance(obj, dict):
+                out[composer_id] = _meta_from_composer_obj(obj, {})
+        return out
+    except sqlite3.Error as exc:
+        log.warning("failed reading Cursor composerData: %s", exc)
+        return {}
+    finally:
+        conn.close()
+
+
 def lookup_composer_model_effort(
     composer_id: str | None,
     *,
@@ -516,6 +555,17 @@ def _clear_flag_if_copied_parent_history(
 class CursorAdapter(TranscriptAdapter):
     harness = Harness.CURSOR
 
+    def accepts_watch_path(self, path: Path, source_root: Path) -> bool:
+        try:
+            parts = path.relative_to(source_root).parts
+        except ValueError:
+            return False
+        return (
+            len(parts) >= 3
+            and parts[1] == "agent-transcripts"
+            and path.suffix.lower() == ".jsonl"
+        )
+
     def discover(self) -> list[Path]:
         root = CURSOR_PROJECTS_DIR
         if not root.is_dir():
@@ -524,7 +574,11 @@ class CursorAdapter(TranscriptAdapter):
         for transcript_root in root.glob("*/agent-transcripts"):
             if not transcript_root.is_dir():
                 continue
-            out.extend(p for p in transcript_root.rglob("*.jsonl") if p.is_file())
+            out.extend(
+                p
+                for p in transcript_root.rglob("*.jsonl")
+                if p.is_file() and self.accepts_watch_path(p.resolve(), root.resolve())
+            )
         return sorted(out)
 
     def parse_chunk(

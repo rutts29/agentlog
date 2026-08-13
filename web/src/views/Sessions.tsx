@@ -23,6 +23,7 @@ import { useIngestStream } from "@/lib/useIngestStream";
 import { useLivePresence } from "@/lib/useLivePresence";
 import {
   canPrefetchSessionDetail,
+  createPresenceVersionGate,
   createSessionRangeWarmer,
   invalidateSessionDetailCache,
   sessionDetailQueryOptions,
@@ -68,6 +69,7 @@ export function Sessions() {
   const presenceHandler = useRef<(data: PresenceEvent) => void>(() => {});
   const ingestTimer = useRef<number | null>(null);
   const rangeWarmer = useRef(createSessionRangeWarmer());
+  const presenceCacheGate = useRef(createPresenceVersionGate());
 
   const { connected } = useIngestStream(
     ({ events }) => {
@@ -80,7 +82,12 @@ export function Sessions() {
         void invalidateSessionDetailCache(queryClient);
       }, 250);
     },
-    (data) => presenceHandler.current(data),
+    (data) => {
+      presenceHandler.current(data);
+      if (presenceCacheGate.current.accept(data)) {
+        void invalidateSessionDetailCache(queryClient);
+      }
+    },
   );
   const { presence, onPresenceEvent } = useLivePresence(connected);
   useEffect(() => {
@@ -185,37 +192,29 @@ export function Sessions() {
         if (signal.aborted) return;
         const listKey = sessionQueryKey(targetRange, 0);
         if (!queryClient.getQueryState(listKey)?.data) {
-          try {
-            await queryClient.prefetchQuery({
-              queryKey: listKey,
-              queryFn: sessionQueryFn(targetRange, 0, signal),
-              staleTime: SESSION_RANGE_STALE_TIME,
-              gcTime: SESSION_RANGE_GC_TIME,
-            });
-          } catch {
-            if (signal.aborted) return;
-          }
+          await queryClient.fetchQuery({
+            queryKey: listKey,
+            queryFn: sessionQueryFn(targetRange, 0, signal),
+            staleTime: SESSION_RANGE_STALE_TIME,
+            gcTime: SESSION_RANGE_GC_TIME,
+          });
         }
         if (signal.aborted) return;
         const facetsKey = facetQueryKey(targetRange);
         if (!queryClient.getQueryState(facetsKey)?.data) {
-          try {
-            await queryClient.prefetchQuery({
-              queryKey: facetsKey,
-              queryFn: async ({ signal: querySignal }) => {
-                const combined = combineAbortSignals(signal, querySignal);
-                try {
-                  return await fetchFacets(targetRange, "roots", combined.signal);
-                } finally {
-                  combined.cleanup();
-                }
-              },
-              staleTime: SESSION_RANGE_STALE_TIME,
-              gcTime: SESSION_RANGE_GC_TIME,
-            });
-          } catch {
-            if (signal.aborted) return;
-          }
+          await queryClient.fetchQuery({
+            queryKey: facetsKey,
+            queryFn: async ({ signal: querySignal }) => {
+              const combined = combineAbortSignals(signal, querySignal);
+              try {
+                return await fetchFacets(targetRange, "roots", combined.signal);
+              } finally {
+                combined.cleanup();
+              }
+            },
+            staleTime: SESSION_RANGE_STALE_TIME,
+            gcTime: SESSION_RANGE_GC_TIME,
+          });
         }
       }
     });
@@ -458,7 +457,7 @@ export function Sessions() {
                   const syncing = live?.source_snapshot_status === "pending";
                   const navigationId = s.navigation_id ?? s.id;
                   const prefetchDetail = () => {
-                    if (!canPrefetchSessionDetail(live?.source_snapshot_status)) return;
+                    if (!canPrefetchSessionDetail(live?.source_snapshot_status, s)) return;
                     void queryClient.prefetchQuery(
                       sessionDetailQueryOptions(navigationId),
                     );

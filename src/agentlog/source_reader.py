@@ -5,13 +5,17 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-from dataclasses import dataclass
+from collections import OrderedDict
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import Event, RLock
 from typing import Any, Literal
 
 from agentlog.ingest.base import (
     TranscriptAdapter,
     file_stat,
+    hash_bytes,
     hash_prefix,
     is_sqlite_path,
     sqlite_fingerprint,
@@ -55,20 +59,273 @@ class SourceReadResult:
 
 @dataclass(frozen=True)
 class _CachedSourceParse:
-    revision: tuple[int, int]
+    revision: tuple[int, int] | str
     source_hash: str
     results: list[ParseResult]
+    text_bytes: int
     verification_unit: str | None = None
+    artifact_observation: _SqliteRevisionObservation | None = None
+
+
+@dataclass(frozen=True)
+class _SourceVerificationEvidence:
+    revision: tuple[int, int] | str
+    source_hash: str
+    verification_unit: str | None = None
+    artifact_observation: _SqliteRevisionObservation | None = None
+
+
+@dataclass
+class _SourceReadFlight:
+    done: Event
+    parsed: _CachedSourceParse | None = None
+
+
+@dataclass(frozen=True)
+class _SqliteRevisionObservation:
+    identity: tuple[int, int]
+    data_version: int
+
+
+class _SqliteRevisionMonitor:
+    """Observe commits from a stable read-only connection to one SQLite file."""
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._conn: sqlite3.Connection | None = None
+        self._identity: tuple[int, int] | None = None
+        self._lock = RLock()
+
+    def close(self) -> None:
+        with self._lock:
+            conn, self._conn = self._conn, None
+            self._identity = None
+        if conn is not None:
+            conn.close()
+
+    def observe(self) -> _SqliteRevisionObservation:
+        """Return a data-version observation for the current file identity."""
+        with self._lock:
+            identity = self._file_identity()
+            replaced = identity != self._identity
+            if self._conn is None or replaced:
+                self._replace_connection(identity)
+            assert self._conn is not None
+            data_version = self._read_data_version()
+            observation = _SqliteRevisionObservation(identity, data_version)
+            return observation
+
+    def confirm(self, observation: _SqliteRevisionObservation) -> bool:
+        """Record an observation only when no later commit or replacement occurred."""
+        with self._lock:
+            if self._conn is None or self._file_identity() != observation.identity:
+                return False
+            if self._read_data_version() != observation.data_version:
+                return False
+            self._identity = observation.identity
+            return True
+
+    def _replace_connection(self, identity: tuple[int, int]) -> None:
+        old, self._conn = self._conn, None
+        if old is not None:
+            old.close()
+        uri = f"{self._path.resolve().as_uri()}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
+        conn.execute("PRAGMA busy_timeout = 30000")
+        self._conn = conn
+        self._identity = identity
+
+    def _read_data_version(self) -> int:
+        assert self._conn is not None
+        return int(self._conn.execute("PRAGMA data_version").fetchone()[0])
+
+    def _file_identity(self) -> tuple[int, int]:
+        stat = self._path.stat()
+        return stat.st_dev, stat.st_ino
 
 
 class CachedSourceTranscriptReader:
-    def __init__(self) -> None:
-        self._artifacts: dict[tuple[str, ...], _CachedSourceParse] = {}
+    """Bounded read-through cache for normalized source transcripts.
+
+    This is process-local only: SQLite remains metadata-only and source files
+    stay authoritative. T3 entries are scoped to one thread, never its shared
+    state database as a whole.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_entries: int = 32,
+        max_text_bytes: int = 16 * 1024 * 1024,
+    ) -> None:
+        if max_entries < 1:
+            raise ValueError("max_entries must be at least 1")
+        if max_text_bytes < 1:
+            raise ValueError("max_text_bytes must be at least 1")
+        self.max_entries = max_entries
+        self.max_text_bytes = max_text_bytes
+        self._artifacts: OrderedDict[tuple[str, ...], _CachedSourceParse] = OrderedDict()
+        self._invalid_artifacts: OrderedDict[tuple[str, ...], None] = OrderedDict()
+        self._verification_evidence: OrderedDict[
+            tuple[str, ...], _SourceVerificationEvidence
+        ] = OrderedDict()
+        self._verification_capacity = max(1024, max_entries)
+        self._verification_overflow = False
+        self._text_bytes = 0
+        self._flights: dict[tuple[str, ...], _SourceReadFlight] = {}
+        self._revision_monitors: OrderedDict[str, _SqliteRevisionMonitor] = OrderedDict()
+        self._lock = RLock()
+
+    @property
+    def size(self) -> int:
+        with self._lock:
+            return len(self._artifacts)
+
+    @property
+    def text_bytes(self) -> int:
+        with self._lock:
+            return self._text_bytes
+
+    def prewarm_recent(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        now: datetime | None = None,
+        limit: int = 16,
+    ) -> list[str]:
+        """Warm only source-backed sessions active in the preceding week."""
+        now = now or datetime.now(timezone.utc)
+        cutoff = (now - timedelta(days=7)).isoformat()
+        rows = conn.execute(
+            """
+            SELECT id
+            FROM sessions
+            WHERE transcript_storage = 'source_backed'
+              AND COALESCE(ended_at, started_at) >= ?
+            ORDER BY COALESCE(ended_at, started_at) DESC, id
+            LIMIT ?
+            """,
+            (cutoff, max(1, limit)),
+        ).fetchall()
+        warmed: list[str] = []
+        for row in rows:
+            session_id = str(row["id"])
+            if self(conn, session_id).ready:
+                warmed.append(session_id)
+        return warmed
+
+    def _get_artifact(self, key: tuple[str, ...]) -> _CachedSourceParse | None:
+        with self._lock:
+            if key in self._invalid_artifacts:
+                return None
+            cached = self._artifacts.get(key)
+            if cached is not None:
+                self._artifacts.move_to_end(key)
+            return cached
+
+    def _put_artifact(self, key: tuple[str, ...], value: _CachedSourceParse) -> None:
+        with self._lock:
+            if value.text_bytes > self.max_text_bytes:
+                return
+            old = self._artifacts.pop(key, None)
+            if old is not None:
+                self._text_bytes -= old.text_bytes
+            self._artifacts[key] = value
+            self._invalid_artifacts.pop(key, None)
+            self._artifacts.move_to_end(key)
+            self._text_bytes += value.text_bytes
+            while (
+                len(self._artifacts) > self.max_entries
+                or self._text_bytes > self.max_text_bytes
+            ):
+                _, evicted = self._artifacts.popitem(last=False)
+                self._text_bytes -= evicted.text_bytes
+
+    def _drop_artifact(self, key: tuple[str, ...]) -> None:
+        with self._lock:
+            self._invalid_artifacts[key] = None
+            self._invalid_artifacts.move_to_end(key)
+            while len(self._invalid_artifacts) > self.max_entries:
+                self._invalid_artifacts.popitem(last=False)
+            cached = self._artifacts.pop(key, None)
+            if cached is not None:
+                self._text_bytes -= cached.text_bytes
+
+    def _record_verification(
+        self, key: tuple[str, ...], value: _CachedSourceParse
+    ) -> None:
+        evidence = _SourceVerificationEvidence(
+            revision=value.revision,
+            source_hash=value.source_hash,
+            verification_unit=value.verification_unit,
+            artifact_observation=value.artifact_observation,
+        )
+        with self._lock:
+            if key not in self._verification_evidence and (
+                len(self._verification_evidence) >= self._verification_capacity
+            ):
+                self._verification_evidence.popitem(last=False)
+                self._verification_overflow = True
+            self._verification_evidence[key] = evidence
+            self._verification_evidence.move_to_end(key)
+
+    def _refresh_verification(
+        self, key: tuple[str, ...], value: _SourceVerificationEvidence
+    ) -> None:
+        with self._lock:
+            if key in self._verification_evidence:
+                self._verification_evidence[key] = value
+                self._verification_evidence.move_to_end(key)
+
+    def _claim_flight(self, key: tuple[str, ...]) -> tuple[bool, _SourceReadFlight]:
+        with self._lock:
+            existing = self._flights.get(key)
+            if existing is not None:
+                return False, existing
+            flight = _SourceReadFlight(done=Event())
+            self._flights[key] = flight
+            return True, flight
+
+    def _finish_flight(self, key: tuple[str, ...], flight: _SourceReadFlight) -> None:
+        with self._lock:
+            self._flights.pop(key, None)
+            flight.done.set()
+
+    def _sqlite_monitor(self, path: Path) -> _SqliteRevisionMonitor:
+        key = str(path.resolve(strict=False))
+        with self._lock:
+            monitor = self._revision_monitors.get(key)
+            if monitor is None:
+                monitor = _SqliteRevisionMonitor(path)
+                self._revision_monitors[key] = monitor
+            self._revision_monitors.move_to_end(key)
+            while len(self._revision_monitors) > self.max_entries:
+                _, evicted = self._revision_monitors.popitem(last=False)
+                evicted.close()
+            return monitor
+
+    def close(self) -> None:
+        with self._lock:
+            monitors = tuple(self._revision_monitors.values())
+            self._revision_monitors.clear()
+            self._artifacts.clear()
+            self._invalid_artifacts.clear()
+            self._verification_evidence.clear()
+            self._verification_overflow = False
+            self._text_bytes = 0
+        for monitor in monitors:
+            monitor.close()
 
     def verify_current(self) -> bool:
         """Confirm every source used by this operation is still unchanged."""
         try:
-            for key, cached in self._artifacts.items():
+            with self._lock:
+                evidence = tuple(self._verification_evidence.items())
+                invalid = bool(self._invalid_artifacts)
+                overflowed = self._verification_overflow
+            if invalid or overflowed:
+                return False
+            for key, cached in evidence:
                 artifact_path = key[1]
                 path = Path(artifact_path)
                 if not path.is_file():
@@ -78,11 +335,37 @@ class CachedSourceTranscriptReader:
                     if adapter_type is None:
                         return False
                     external_id = cached.verification_unit.split(":", 1)[1]
-                    parsed = _parse_t3_session(
-                        adapter_type(), path, external_id
-                    )
-                    if parsed is None or parsed[1] != cached.source_hash:
+                    adapter = adapter_type()
+                    monitor = self._sqlite_monitor(path)
+                    observation = monitor.observe()
+                    if cached.artifact_observation == observation:
+                        continue
+                    revision = _t3_revision(adapter, path, external_id)
+                    if (
+                        revision is not None
+                        and revision == cached.revision
+                        and monitor.confirm(observation)
+                    ):
+                        self._refresh_verification(
+                            key,
+                            replace(cached, artifact_observation=observation),
+                        )
+                        continue
+                    parsed = _parse_t3_session(adapter, path, external_id)
+                    if (
+                        parsed is None
+                        or parsed[1] != cached.source_hash
+                        or not monitor.confirm(observation)
+                    ):
                         return False
+                    self._refresh_verification(
+                        key,
+                        replace(
+                            cached,
+                            revision=revision or parsed[1],
+                            artifact_observation=observation,
+                        ),
+                    )
                     continue
                 if file_stat(path) != cached.revision:
                     return False
@@ -96,7 +379,9 @@ class CachedSourceTranscriptReader:
         self, conn: sqlite3.Connection, session_id: str
     ) -> SourceReadResult:
         return _read_source_transcript(
-            conn, session_id, artifact_cache=self._artifacts
+            conn,
+            session_id,
+            reader=self,
         )
 
     def read_source_transcript(
@@ -176,14 +461,18 @@ def _parse_current(
 ) -> tuple[list[ParseResult], str] | None:
     for _attempt in range(3):
         before = file_stat(path)
-        data = b"" if is_sqlite_path(path) else path.read_bytes()
+        sqlite_source = is_sqlite_path(path)
+        data = b"" if sqlite_source else path.read_bytes()
+        captured_hash = None if sqlite_source else hash_bytes(data)
         results = adapter.parse_path(path, data, start_offset=0)
         after_parse = file_stat(path)
         if before != after_parse:
             continue
         source_hash = _current_hash(path)
         after_hash = file_stat(path)
-        if before == after_hash:
+        if before == after_hash and (
+            sqlite_source or captured_hash == source_hash
+        ):
             return results, source_hash
     return None
 
@@ -261,14 +550,94 @@ def _metadata_is_prefix(
 def read_source_transcript(
     conn: sqlite3.Connection, session_id: str
 ) -> SourceReadResult:
-    return _read_source_transcript(conn, session_id, artifact_cache=None)
+    return _read_source_transcript(
+        conn, session_id, reader=None
+    )
+
+
+def _parsed_text_bytes(results: list[ParseResult]) -> int:
+    return sum(
+        len(message.text.encode("utf-8"))
+        for result in results
+        for message in result.messages
+    )
+
+
+def _t3_revision(
+    adapter: TranscriptAdapter, path: Path, external_id: str
+) -> str | None:
+    probe = getattr(adapter, "session_revision", None)
+    if not callable(probe):
+        return None
+    return probe(path, external_id)
+
+
+def _read_targeted_t3(
+    adapter: TranscriptAdapter,
+    path: Path,
+    external_id: str,
+    cached: _CachedSourceParse | None,
+    reader: CachedSourceTranscriptReader | None,
+) -> tuple[
+    tuple[list[ParseResult], str],
+    tuple[int, int] | str,
+    _SqliteRevisionObservation | None,
+] | None:
+    """Reuse a target cache until the shared SQLite artifact commits again."""
+    monitor = reader._sqlite_monitor(path) if reader is not None else None
+    for _attempt in range(3):
+        observation: _SqliteRevisionObservation | None = None
+        if monitor is not None:
+            observation = monitor.observe()
+            if (
+                cached is not None
+                and cached.artifact_observation == observation
+            ):
+                return (cached.results, cached.source_hash), cached.revision, observation
+
+        before = _t3_revision(adapter, path, external_id)
+        if cached is not None and before is not None and before == cached.revision:
+            if monitor is None or monitor.confirm(observation):
+                return (cached.results, cached.source_hash), before, observation
+            continue
+
+        parsed = _parse_t3_session(adapter, path, external_id)
+        after = _t3_revision(adapter, path, external_id)
+        if before is not None and after != before:
+            return None
+        revision: tuple[int, int] | str = after or (
+            parsed[1] if parsed is not None else "missing"
+        )
+        if monitor is None or monitor.confirm(observation):
+            return parsed, revision, observation
+    return None
+
+
+def _artifact_cache_key(
+    row: sqlite3.Row,
+    locator: SourceLocator,
+    *,
+    targeted: bool,
+) -> tuple[str, ...]:
+    key = (
+        locator.harness,
+        locator.artifact_path,
+        str(row["artifact_id"] or ""),
+        str(row["parser_version"] or ""),
+        str(row["parsed_offset"] or 0),
+        str(row["artifact_content_hash"] or ""),
+    )
+    return key + ((locator.unit_id,) if targeted else ())
 
 
 def _read_source_transcript(
     conn: sqlite3.Connection,
     session_id: str,
     *,
-    artifact_cache: dict[tuple[str, ...], _CachedSourceParse] | None,
+    reader: CachedSourceTranscriptReader | None,
+    flight_owned: bool = False,
+    flight: _SourceReadFlight | None = None,
+    shared_parse: _CachedSourceParse | None = None,
 ) -> SourceReadResult:
     """Return current normalized messages for a source-backed session.
 
@@ -278,7 +647,8 @@ def _read_source_transcript(
     row = conn.execute(
         """
         SELECT s.*, a.path AS artifact_path, a.harness AS artifact_harness,
-               a.content_hash AS artifact_content_hash, a.parsed_offset
+               a.content_hash AS artifact_content_hash, a.parsed_offset,
+               a.parser_version
         FROM sessions s
         LEFT JOIN artifacts a ON a.id = s.artifact_id
         WHERE s.id = ?
@@ -304,45 +674,102 @@ def _read_source_transcript(
     adapter_type = _ADAPTERS.get(str(row["harness"]))
     if adapter_type is None:
         return SourceReadResult("source_unavailable", [], locator, locator.unit_id, warning="unsupported source harness")
-    cache_key: tuple[str, ...] = (locator.harness, locator.artifact_path)
-    if is_sqlite_path(path) and hasattr(adapter_type, "parse_session"):
-        cache_key += (locator.unit_id,)
-    cached = artifact_cache.get(cache_key) if artifact_cache is not None else None
+    targeted = is_sqlite_path(path) and hasattr(adapter_type, "parse_session")
+    cache_key = _artifact_cache_key(row, locator, targeted=targeted)
+    if reader is not None and not flight_owned:
+        owns_flight, claimed_flight = reader._claim_flight(cache_key)
+        if not owns_flight:
+            claimed_flight.done.wait()
+            return _read_source_transcript(
+                conn,
+                session_id,
+                reader=reader,
+                flight_owned=True,
+                shared_parse=claimed_flight.parsed,
+            )
+        try:
+            return _read_source_transcript(
+                conn,
+                session_id,
+                reader=reader,
+                flight_owned=True,
+                flight=claimed_flight,
+            )
+        finally:
+            reader._finish_flight(cache_key, claimed_flight)
+    stored_cached = reader._get_artifact(cache_key) if reader is not None else None
+    cached = stored_cached or shared_parse
     try:
-        if cached is not None and file_stat(path) == cached.revision:
-            parsed = (cached.results, cached.source_hash)
-        else:
-            if cached is not None and not (
-                is_sqlite_path(path) and hasattr(adapter_type, "parse_session")
-            ):
+        if targeted:
+            adapter = adapter_type()
+            external_id = str(row["external_id"])
+            targeted_read = _read_targeted_t3(
+                adapter, path, external_id, cached, reader
+            )
+            if targeted_read is None:
                 return SourceReadResult(
                     "source_changed",
                     [],
                     locator,
                     locator.unit_id,
-                    warning="canonical source changed during this operation",
+                    warning="canonical source changed while being read",
                 )
-            cached = None
-            adapter = adapter_type()
-            if is_sqlite_path(path) and hasattr(adapter, "parse_session"):
-                parsed = _parse_t3_session(adapter, path, str(row["external_id"]))
+            parsed, revision, artifact_observation = targeted_read
+        else:
+            artifact_observation = None
+            revision = file_stat(path)
+            if cached is not None and revision == cached.revision:
+                if _current_hash(path) == cached.source_hash:
+                    parsed = (cached.results, cached.source_hash)
+                else:
+                    cached = None
+                    parsed = _parse_current(adapter_type(), path)
+                    revision = file_stat(path)
             else:
-                parsed = _parse_current(adapter, path)
+                cached = None
+                parsed = _parse_current(adapter_type(), path)
+                revision = file_stat(path)
     except (OSError, sqlite3.Error, ValueError) as exc:
         return SourceReadResult("source_unavailable", [], locator, locator.unit_id, warning=f"could not read canonical source: {exc}")
     if parsed is None:
         return SourceReadResult("source_changed", [], locator, locator.unit_id, warning="canonical source changed while being read")
     results, source_hash = parsed
-    if artifact_cache is not None and cached is None:
-        artifact_cache[cache_key] = _CachedSourceParse(
-            revision=file_stat(path),
-            source_hash=source_hash,
-            results=results,
-            verification_unit=(locator.unit_id if is_sqlite_path(path) else None),
+    parsed_cache = _CachedSourceParse(
+        revision=revision,
+        source_hash=source_hash,
+        results=results,
+        text_bytes=_parsed_text_bytes(results),
+        verification_unit=(locator.unit_id if targeted else None),
+        artifact_observation=artifact_observation,
+    )
+    if not _checkpoint_is_current(row, path):
+        if reader is not None:
+            reader._drop_artifact(cache_key)
+        return SourceReadResult(
+            "source_changed",
+            [],
+            locator,
+            locator.unit_id,
+            warning="canonical source changed during transcript read",
         )
+    if flight is not None:
+        flight.parsed = parsed_cache
+    cache_candidate = (
+        parsed_cache
+        if reader is not None
+        and (
+            stored_cached is None
+            or stored_cached.source_hash != source_hash
+            or stored_cached.revision != revision
+            or stored_cached.artifact_observation != artifact_observation
+        )
+        else None
+    )
     external_id = str(row["external_id"])
     matches = [item for item in results if item.session.external_id == external_id]
     if len(matches) != 1:
+        if reader is not None:
+            reader._drop_artifact(cache_key)
         return SourceReadResult(
             "source_changed",
             [],
@@ -351,6 +778,8 @@ def _read_source_transcript(
             warning="canonical source no longer contains this session identity",
         )
     if matches[0].extras.get("checkpoint_blocked") is True:
+        if reader is not None:
+            reader._drop_artifact(cache_key)
         reason = str(
             matches[0].extras.get("checkpoint_blocked_reason")
             or "canonical source is unsafe to checkpoint"
@@ -363,6 +792,8 @@ def _read_source_transcript(
             warning=reason,
         )
     if not _metadata_is_prefix(conn, session_id, matches[0]):
+        if reader is not None:
+            reader._drop_artifact(cache_key)
         return SourceReadResult(
             "source_changed",
             [],
@@ -370,7 +801,11 @@ def _read_source_transcript(
             locator.unit_id,
             warning="canonical source diverges from persisted message metadata",
         )
-    return SourceReadResult(
+    if reader is not None and cache_candidate is not None:
+        reader._put_artifact(cache_key, cache_candidate)
+    if reader is not None:
+        reader._record_verification(cache_key, parsed_cache)
+    fresh = SourceReadResult(
         "ready",
         [_message_dict(session_id, message) for message in matches[0].messages],
         locator=locator,
@@ -378,3 +813,4 @@ def _read_source_transcript(
         source_identity=_source_identity(locator),
         source_hash=source_hash,
     )
+    return fresh

@@ -16,7 +16,11 @@ from typing import Any, Literal
 
 from agentlog.config import DEFAULT_DB_PATH, presence_path_for_db
 from agentlog.watch.presence import read_presence_file
-from agentlog.source_reader import CachedSourceTranscriptReader
+from agentlog.analysis.attention_signals import (
+    assistant_asks_question,
+    final_paragraph,
+    incomplete_todo_in_text,
+)
 
 AttentionState = Literal[
     "live_waiting",
@@ -40,15 +44,10 @@ _STATE_RANK = {
     "resumable": 6,
 }
 _SEVERITY_RANK = {"warn": 0, "info": 1}
-_INCOMPLETE_TODO_RE = re.compile(
-    r"(?:"
-    r"^\s*[-*]\s+\[\s\]\s+\S"  # markdown unchecked checkbox
-    r'|"status"\s*:\s*"(?:pending|in_progress)"'
-    r"|'status'\s*:\s*'(?:pending|in_progress)'"
-    r")",
-    re.MULTILINE | re.IGNORECASE,
-)
 _PLAN_TOOLS = frozenset({"TodoWrite", "update_plan"})
+_UNVERIFIED_SOURCE_STATUSES = frozenset(
+    {"source_changed", "source_unavailable", "frozen_diverged", "frozen_shrunk"}
+)
 # Cursor/Codex path slugs that are not a real project identity for supersession.
 _AMBIGUOUS_REPOS = frozenset({"empty-window", "unknown", ""})
 _UUID_LEAF_RE = re.compile(
@@ -154,20 +153,6 @@ def _parse_ts(value: str | None) -> datetime | None:
     return dt
 
 
-def _final_paragraph(text: str) -> str:
-    parts = [p.strip() for p in re.split(r"\n\s*\n", text.strip()) if p.strip()]
-    return parts[-1] if parts else ""
-
-
-def _assistant_asks_question(text: str) -> bool:
-    paragraph = _final_paragraph(text)
-    return "?" in paragraph
-
-
-def _incomplete_todo_in_text(text: str) -> bool:
-    return bool(_INCOMPLETE_TODO_RE.search(text or ""))
-
-
 def _clip(text: str, limit: int = 100) -> str:
     """Clip to a readable excerpt; break on a word boundary when possible."""
     cleaned = " ".join((text or "").split())
@@ -228,6 +213,11 @@ def _session_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
                 s.repo AS repo,
                 s.branch AS branch,
                 s.transcript_storage AS transcript_storage,
+                s.source_sync_status AS source_sync_status,
+                s.attention_final_question AS attention_final_question,
+                s.attention_incomplete_todo AS attention_incomplete_todo,
+                s.attention_last_plan_open AS attention_last_plan_open,
+                s.attention_tail_revision AS attention_tail_revision,
                 (
                     SELECT m.role FROM messages m
                     WHERE m.session_id = s.id
@@ -307,33 +297,6 @@ def _logical_attention_rows(
     )
 
 
-def _hydrate_attention_rows(
-    conn: sqlite3.Connection,
-    rows: list[sqlite3.Row],
-    reader: CachedSourceTranscriptReader,
-) -> list[dict[str, Any]]:
-    hydrated: list[dict[str, Any]] = []
-    for row in rows:
-        copied = dict(row)
-        if copied.get("transcript_storage") == "source_backed":
-            source = reader(conn, str(copied["id"]))
-            if not source.ready:
-                raise RuntimeError(
-                    f"canonical source unavailable for {copied['id']}: "
-                    f"{source.warning or source.status}"
-                )
-            messages = [
-                message for message in source.messages
-                if not bool(message.get("is_tool_plumbing"))
-            ]
-            if messages:
-                last = max(messages, key=lambda message: int(message["seq"]))
-                copied["last_role"] = last["role"]
-                copied["last_text"] = last["text"]
-        hydrated.append(copied)
-    return hydrated
-
-
 def _trailing_known_error_streak(
     conn: sqlite3.Connection, session_id: str
 ) -> list[str]:
@@ -402,6 +365,48 @@ def _last_activity(row: sqlite3.Row) -> datetime | None:
     ]
     present = [c for c in candidates if c is not None]
     return max(present) if present else None
+
+
+def _source_tail_is_unverified(row: dict[str, Any]) -> bool:
+    return (
+        row.get("transcript_storage") == "source_backed"
+        and row.get("source_sync_status") in _UNVERIFIED_SOURCE_STATUSES
+    )
+
+
+def _tail_signal_coverage(
+    conn: sqlite3.Connection,
+    *,
+    now: datetime,
+    thresholds: AttentionThresholds,
+) -> dict[str, int | bool]:
+    physical_rows = _session_rows(conn)
+    rows, *_ = _logical_attention_rows(conn, physical_rows)
+    resumable_max = timedelta(days=thresholds.resumable_max_days)
+    eligible_sessions = 0
+    covered_sessions = 0
+    ignored_sessions = 0
+
+    for row in rows:
+        if row.get("transcript_storage") != "source_backed":
+            continue
+        last_at = _last_activity(row)
+        if last_at is None or now - last_at > resumable_max:
+            continue
+        if _source_tail_is_unverified(row):
+            ignored_sessions += 1
+            continue
+        eligible_sessions += 1
+        if row.get("attention_tail_revision") == 1:
+            covered_sessions += 1
+
+    return {
+        "eligible_sessions": eligible_sessions,
+        "covered_sessions": covered_sessions,
+        "missing_sessions": eligible_sessions - covered_sessions,
+        "ignored_sessions": ignored_sessions,
+        "complete": covered_sessions == eligible_sessions,
+    }
 
 
 def _has_open_plan(row: sqlite3.Row) -> bool:
@@ -585,10 +590,7 @@ def derive_attention(
     resumable_max = timedelta(days=thresholds.resumable_max_days)
     recent_error_delta = timedelta(minutes=thresholds.recent_error_minutes)
 
-    source_reader = CachedSourceTranscriptReader()
-    physical_rows = _hydrate_attention_rows(
-        conn, _session_rows(conn), source_reader
-    )
+    physical_rows = _session_rows(conn)
     (
         rows,
         display_by_physical,
@@ -682,11 +684,33 @@ def derive_attention(
         idle_h = _idle_hours(now, last_at)
         last_role = row["last_role"]
         last_text = row["last_text"] or ""
-        asks = last_role == "assistant" and _assistant_asks_question(last_text)
-        incomplete_todo = last_role == "assistant" and _incomplete_todo_in_text(
-            last_text
-        )
-        open_plan = _has_open_plan(row) and last_role != "user"
+        source_unverified = _source_tail_is_unverified(row)
+        source_tail_current = row.get("attention_tail_revision") == 1
+        if (
+            row.get("transcript_storage") == "source_backed"
+            and source_tail_current
+            and not source_unverified
+        ):
+            asks = bool(row.get("attention_final_question"))
+            incomplete_todo = bool(row.get("attention_incomplete_todo"))
+        elif row.get("transcript_storage") == "source_backed":
+            # Source-backed text stays at its canonical source. Without a
+            # trusted compact signal, skip text-derived states for this row.
+            asks = False
+            incomplete_todo = False
+        else:
+            asks = last_role == "assistant" and assistant_asks_question(last_text)
+            incomplete_todo = last_role == "assistant" and incomplete_todo_in_text(
+                last_text
+            )
+        if row.get("transcript_storage") == "source_backed":
+            open_plan = (
+                source_tail_current
+                and not source_unverified
+                and bool(row.get("attention_last_plan_open"))
+            )
+        else:
+            open_plan = _has_open_plan(row) and last_role != "user"
         open_task = incomplete_todo or open_plan
         resolved_by_reply = last_role == "user"
         superseded = _is_superseded(
@@ -706,8 +730,12 @@ def derive_attention(
             elif idle >= actionable:
                 # Dormant: abandoned, not urgent.
                 if asks:
-                    excerpt = _clip(_final_paragraph(last_text))
-                    evidence = f"last turn still asks: {excerpt!r}"
+                    excerpt = _clip(final_paragraph(last_text))
+                    evidence = (
+                        f"last turn still asks: {excerpt!r}"
+                        if last_text
+                        else "last turn still asks a question"
+                    )
                 elif incomplete_todo:
                     evidence = "last message still lists incomplete todos"
                 else:
@@ -733,16 +761,19 @@ def derive_attention(
             else:
                 # Within actionable horizon.
                 if asks and idle >= waiting_delta:
-                    excerpt = _clip(_final_paragraph(last_text))
+                    excerpt = _clip(final_paragraph(last_text))
+                    waiting_reason = (
+                        f"Assistant is waiting on your answer "
+                        f"({idle_h:.1f}h idle): {excerpt!r}"
+                        if excerpt
+                        else f"Assistant is waiting on your answer ({idle_h:.1f}h idle)."
+                    )
                     add(
                         _Candidate(
                             session_id=session_id,
                             state="waiting_on_user",
                             severity=_severity_for_idle(idle_h, thresholds),
-                            reason=(
-                                f"Assistant is waiting on your answer "
-                                f"({idle_h:.1f}h idle): {excerpt!r}"
-                            ),
+                            reason=waiting_reason,
                             last_activity_at=last_at,
                             harness=harness,
                             runtime_harness=runtime_harness,
@@ -888,8 +919,6 @@ def derive_attention(
     if state is not None:
         out = [i for i in out if i.state == state]
 
-    if not source_reader.verify_current():
-        raise RuntimeError("canonical source changed during attention derivation")
     if return_stats:
         return out, stats
     return out
@@ -906,6 +935,9 @@ def attention_payload(
 ) -> dict[str, Any]:
     now = now or datetime.now(timezone.utc)
     thresholds = thresholds or AttentionThresholds()
+    tail_signal_coverage = _tail_signal_coverage(
+        conn, now=now, thresholds=thresholds
+    )
     result = derive_attention(
         conn,
         now=now,
@@ -926,6 +958,7 @@ def attention_payload(
             "resumable_count": stats.kept_resumable,
             "resumable": [],
             "stats": stats.to_dict(),
+            "tail_signal_coverage": tail_signal_coverage,
             "thresholds": {
                 "actionable_hours": thresholds.actionable_hours,
                 "waiting_hours": thresholds.waiting_hours,
@@ -946,6 +979,7 @@ def attention_payload(
         "resumable_count": len(resumable_all),
         "resumable": [i.to_dict() for i in resumable],
         "stats": stats.to_dict(),
+        "tail_signal_coverage": tail_signal_coverage,
         "thresholds": {
             "actionable_hours": thresholds.actionable_hours,
             "waiting_hours": thresholds.waiting_hours,

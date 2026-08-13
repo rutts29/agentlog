@@ -17,16 +17,17 @@ import { Kpi } from "@/components/ui/kpi";
 import { HarnessTag, ModelBadge, StatusDot } from "@/components/ui/badges";
 import { CHART_TOOLTIP } from "@/components/ui/chartdefs";
 import { dayTickFormatter, formatDayTime, harnessColor } from "@/lib/utils";
+import { rangeViewQueryOptions } from "@/lib/viewQueries";
 
 type Ctx = { range: string };
 
 export function AutoReview() {
   const { range } = useOutletContext<Ctx>();
   const [params] = useSearchParams();
-  const q = useQuery({
+  const q = useQuery(rangeViewQueryOptions({
     queryKey: ["auto-review", range],
-    queryFn: () => fetchAutoReview(range),
-  });
+    queryFn: (signal) => fetchAutoReview(range, signal),
+  }));
 
   if (q.isLoading) {
     return <LoadingOrb label="Reading review signals" />;

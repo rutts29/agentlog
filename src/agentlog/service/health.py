@@ -67,6 +67,7 @@ def build_health(
     conn: sqlite3.Connection | None = None,
     now: datetime | None = None,
     presence_stale_seconds: float | None = None,
+    include_derived: bool = True,
 ) -> dict[str, Any]:
     """Return API health payload with watcher liveness and ingest freshness."""
     path = Path(db_path or DEFAULT_DB_PATH).expanduser()
@@ -119,9 +120,10 @@ def build_health(
             times = [t for t in times if t is not None]
             if times:
                 last_ingest_at = max(times).isoformat()
-            from agentlog.analysis.derive import derived_freshness
+            if include_derived:
+                from agentlog.analysis.derive import derived_freshness
 
-            derived = derived_freshness(conn)
+                derived = derived_freshness(conn)
         except sqlite3.Error:
             db_ok = False
         finally:

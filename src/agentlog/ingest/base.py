@@ -363,6 +363,11 @@ class TranscriptAdapter(ABC):
     ) -> ParseResult:
         raise NotImplementedError
 
+    def accepts_watch_path(self, path: Path, source_root: Path) -> bool:
+        """Whether a changed path matches this adapter's directory grammar."""
+        del path, source_root
+        return True
+
     def parse_path(
         self, path: Path, data: bytes, *, start_offset: int
     ) -> list[ParseResult]:

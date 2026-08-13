@@ -227,17 +227,17 @@ export function Adjudicate() {
   const qc = useQueryClient();
   const queue = useQuery({
     queryKey: ["adjudication-queue"],
-    queryFn: () => fetchAdjudicationQueue(false),
+    queryFn: ({ signal }) => fetchAdjudicationQueue(false, signal),
   });
   const items = queue.data?.items ?? [];
   const taxonomy = useQuery({
     queryKey: ["adjudication-taxonomy"],
-    queryFn: fetchAdjudicationTaxonomy,
+    queryFn: ({ signal }) => fetchAdjudicationTaxonomy(signal),
     enabled: items.length > 0,
   });
   const report = useQuery({
     queryKey: ["adjudication-report"],
-    queryFn: fetchAdjudicationReport,
+    queryFn: ({ signal }) => fetchAdjudicationReport(signal),
     enabled: items.length > 0,
   });
 

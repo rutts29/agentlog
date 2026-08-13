@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { useOutletContext, Link, useSearchParams } from "react-router-dom";
-import { useQueries, useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Bar,
   BarChart,
@@ -12,23 +12,12 @@ import {
 } from "recharts";
 import {
   fetchAttention,
-  fetchDistributions,
-  fetchGraph,
-  fetchHeatmap,
-  fetchModelMix,
-  fetchProjects,
-  fetchRecent,
-  fetchRequestKinds,
-  fetchSummary,
-  fetchTimeseries,
-  fetchTools,
   logicalHarness,
   runtimeHarness,
   type PresenceEvent,
 } from "@/lib/api";
 import { LoadingOrb } from "@/components/LoadingOrb";
 import { EmptyState } from "@/components/EmptyState";
-import { ConstellationGraph } from "@/components/ConstellationGraph";
 import { Card, CardTitle } from "@/components/ui/card";
 import { KpiPartial, KpiTile, KpiUnavailable } from "@/components/ui/kpi";
 import {
@@ -51,10 +40,70 @@ import {
 } from "@/lib/utils";
 import { LiveOrb } from "@/components/LiveOrb";
 import type { AttentionItem, LiveSession } from "@/lib/api";
+import { attentionCoverageNote } from "@/lib/attentionCoverage";
+import {
+  overviewGraphQueryOptions,
+  overviewQueryOptions,
+  queryContentState,
+} from "@/lib/overviewQueries";
 
 type Ctx = { range: string };
 
 const HARNESSES = ["codex", "claude", "cursor", "warp"] as const;
+
+const ConstellationGraph = lazy(() =>
+  import("@/components/ConstellationGraph").then(({ ConstellationGraph: Graph }) => ({
+    default: Graph,
+  })),
+);
+
+function PanelLoading({ label, compact = false }: { label: string; compact?: boolean }) {
+  return (
+    <Card className={compact ? "flex min-h-[86px] items-center justify-center" : "flex min-h-[180px] items-center justify-center"}>
+      <LoadingOrb label={label} compact={compact} />
+    </Card>
+  );
+}
+
+function PanelError({
+  title,
+  body,
+  retry,
+  compact = false,
+}: {
+  title: string;
+  body: string;
+  retry: () => void;
+  compact?: boolean;
+}) {
+  return (
+    <Card className={compact ? "min-h-[86px]" : "min-h-[180px]"}>
+      <div className="flex h-full flex-col justify-center" role="alert">
+        <div className="microlabel font-mono text-faint-foreground">unavailable</div>
+        <div className="mt-1 text-[13px] font-medium text-foreground">{title}</div>
+        <p className="mt-1 text-[11px] leading-relaxed text-muted-foreground">{body}</p>
+        <button
+          type="button"
+          onClick={retry}
+          className="mt-2 w-fit font-mono text-[10px] text-faint-foreground hover:text-foreground"
+        >
+          retry →
+        </button>
+      </div>
+    </Card>
+  );
+}
+
+function OverviewProgressiveShell() {
+  return (
+    <div className="space-y-3" aria-busy="true">
+      <div className="microlabel border-b border-border-faint pb-1.5 font-mono text-[10px] text-faint-foreground">
+        Telemetry
+      </div>
+      <PanelLoading label="Reading activity" />
+    </div>
+  );
+}
 
 /* Cool density ramp: stage → teal → accent-live (readable on true black). */
 function heatColor(t: number): string {
@@ -201,7 +250,7 @@ export function Overview() {
   const { connected } = useIngestStream(
     ({ events }) => {
       if (events.length === 0) return;
-      for (const key of ["graph", "recent", "summary", "meta", "timeseries"]) {
+      for (const key of ["overview", "graph", "meta"]) {
         queryClient.invalidateQueries({ queryKey: [key] });
       }
       scheduleAttentionRefresh();
@@ -223,22 +272,18 @@ export function Overview() {
     };
   }, []);
 
-  const [summary, timeseries, models, heatmap, projects, recent, tools, kinds, dist, graph, attention] =
-    useQueries({
-      queries: [
-        { queryKey: ["summary", range], queryFn: () => fetchSummary(range) },
-        { queryKey: ["timeseries", range], queryFn: () => fetchTimeseries(range) },
-        { queryKey: ["models", range], queryFn: () => fetchModelMix(range) },
-        { queryKey: ["heatmap", range], queryFn: () => fetchHeatmap(range) },
-        { queryKey: ["projects", range], queryFn: () => fetchProjects(range) },
-        { queryKey: ["recent", range], queryFn: () => fetchRecent(range) },
-        { queryKey: ["tools", range], queryFn: () => fetchTools(range, 12) },
-        { queryKey: ["kinds", range], queryFn: () => fetchRequestKinds(range) },
-        { queryKey: ["dist", range], queryFn: () => fetchDistributions(range) },
-        { queryKey: ["graph", range], queryFn: () => fetchGraph(range) },
-        { queryKey: ["attention"], queryFn: fetchAttention },
-      ],
-    });
+  const overview = useQuery(overviewQueryOptions(range));
+  const graph = useQuery(overviewGraphQueryOptions(range, overview.isSuccess));
+  const attention = useQuery({ queryKey: ["attention"], queryFn: fetchAttention });
+  const summary = { data: overview.data?.summary };
+  const timeseries = { data: overview.data?.timeseries };
+  const models = { data: overview.data?.models };
+  const heatmap = { data: overview.data?.heatmap };
+  const projects = { data: overview.data?.projects };
+  const recent = { data: overview.data?.recent };
+  const tools = { data: overview.data?.tools };
+  const kinds = { data: overview.data?.kinds };
+  const dist = { data: overview.data?.distributions };
 
   /* Live-feed glow: the newest row lights up when it first appears. */
   const prevTopRef = useRef<string | null>(null);
@@ -286,49 +331,39 @@ export function Overview() {
     return () => window.clearTimeout(t);
   }, [attention.data]);
 
-  const queries = [summary, timeseries, models, heatmap, projects, recent, tools, kinds, dist, graph];
-  if (queries.some((q) => q.isLoading)) {
-    return <LoadingOrb label="Reading activity" />;
-  }
-  if (
-    !summary.data ||
-    !timeseries.data ||
-    !models.data ||
-    !heatmap.data ||
-    !projects.data ||
-    !recent.data ||
-    !tools.data ||
-    !kinds.data ||
-    !dist.data ||
-    !graph.data
-  ) {
+  const overviewState = queryContentState(overview);
+  const graphState = queryContentState(graph);
+  const attentionState = queryContentState(attention);
+  if (overviewState === "error") {
     return (
-      <EmptyState
+      <PanelError
         title="Could not load overview"
-        body="One or more descriptive endpoints failed. Refresh, or confirm agentlog serve is running against the ledger."
+        body="The descriptive ledger summary could not be read."
+        retry={() => void overview.refetch()}
       />
     );
   }
+  if (overviewState === "pending" || !summary.data) return <OverviewProgressiveShell />;
 
   const kpis = summary.data.kpis;
   const tokenCoverage = kpis.tokens_est.coverage;
   const tokensIn = kpis.tokens_est.totals.input_tokens ?? 0;
   const tokensOut = kpis.tokens_est.totals.output_tokens ?? 0;
-  const mix = models.data.items.slice(0, 6);
+  const mix = (models.data?.items ?? []).slice(0, 6);
   const maxShare = Math.max(...mix.map((m) => m.share), 0.001);
-  const heat = heatmap.data;
+  const heat = heatmap.data ?? { hours: [], weekdays: [], counts: [] };
   const maxHeat = Math.max(...heat.counts.flat(), 1);
-  const toolItems = tools.data.items;
+  const toolItems = tools.data?.items ?? [];
   const maxTool = Math.max(...toolItems.map((t) => t.count), 1);
-  const kindItems = kinds.data.items.slice(0, 8);
+  const kindItems = (kinds.data?.items ?? []).slice(0, 8);
   const maxKind = Math.max(...kindItems.map((k) => k.count), 1);
-  const durationBuckets = dist.data.duration_buckets;
+  const durationBuckets = dist.data?.duration_buckets ?? [];
   const maxDurBucket = Math.max(...durationBuckets.map((b) => b.count), 1);
 
   /* Daily totals for the hero sparkline + harness mix from the same series.
      `total` is a server-provided sibling of the per-harness keys, so summing
      every numeric key would count each day twice. */
-  const series = timeseries.data.series;
+  const series = timeseries.data?.series ?? [];
   const dailyTotals = series.map((row) =>
     typeof row.total === "number" ? row.total : 0,
   );
@@ -393,6 +428,9 @@ export function Overview() {
   const resumableHidden = resumableAll.length - resumableItems.length;
   const attentionQuiet =
     urgentItems.length === 0 && resumableItems.length === 0;
+  const attentionCoverage = attentionCoverageNote(
+    attention.data?.tail_signal_coverage,
+  );
 
   return (
     <div className="space-y-3">
@@ -418,7 +456,7 @@ export function Overview() {
             title="Tool calls"
             value={kpis.tool_events.value}
             delta={kpis.tool_events.delta_ratio}
-            sub={`${tools.data.distinct_tools} distinct tools`}
+            sub={tools.data ? `${tools.data.distinct_tools} distinct tools` : "loading tool mix"}
           />
           <KpiTile
             title="Windows"
@@ -466,26 +504,30 @@ export function Overview() {
 
           <div>
             <ColumnLabel>Harness mix</ColumnLabel>
-            <div className="mt-2 space-y-1.5">
-              {harnessTotals.map((h) => (
-                <Link
-                  key={h.harness}
-                  to={linkWith({ harness: h.harness })}
-                  className="flex items-center gap-2 text-[11px]"
-                >
-                  <HarnessTag harness={h.harness} className="w-16 shrink-0" />
-                  <Meter ratio={h.count / maxHarness} color={harnessColor(h.harness)} />
-                  <span className="tabular w-10 shrink-0 text-right font-mono text-faint-foreground">
-                    {h.count.toLocaleString()}
-                  </span>
-                </Link>
-              ))}
-            </div>
+            {timeseries.data ? (
+              <div className="mt-2 space-y-1.5">
+                {harnessTotals.map((h) => (
+                  <Link
+                    key={h.harness}
+                    to={linkWith({ harness: h.harness })}
+                    className="flex items-center gap-2 text-[11px]"
+                  >
+                    <HarnessTag harness={h.harness} className="w-16 shrink-0" />
+                    <Meter ratio={h.count / maxHarness} color={harnessColor(h.harness)} />
+                    <span className="tabular w-10 shrink-0 text-right font-mono text-faint-foreground">
+                      {h.count.toLocaleString()}
+                    </span>
+                  </Link>
+                ))}
+              </div>
+            ) : <PanelLoading label="Loading harness mix" compact />}
           </div>
 
           <div>
             <ColumnLabel>Request kinds</ColumnLabel>
-            {kindItems.length === 0 ? (
+            {!kinds.data ? (
+              <PanelLoading label="Loading request kinds" compact />
+            ) : kindItems.length === 0 ? (
               <div className="mt-2">
                 <EmptyState
                   title="Classifications pending"
@@ -514,15 +556,17 @@ export function Overview() {
 
         {/* ── GRAPH STAGE (the view's one glow center) ── */}
         <section className="min-h-[560px] min-w-0">
-          {wideEnoughForGraph ? (
+          {graphState === "ready" && graph.data ? wideEnoughForGraph ? (
             <div className="h-[560px]">
-              <ConstellationGraph
-                data={graph.data}
-                range={range}
-                streamConnected={connected}
-                focusId={focusId}
-                presence={presence}
-              />
+              <Suspense fallback={<PanelLoading label="Mapping constellation" />}>
+                <ConstellationGraph
+                  data={graph.data}
+                  range={range}
+                  streamConnected={connected}
+                  focusId={focusId}
+                  presence={presence}
+                />
+              </Suspense>
             </div>
           ) : (
             <Card className="flex h-[240px] flex-col items-center justify-center gap-2">
@@ -537,21 +581,36 @@ export function Overview() {
                 {graph.data.counts.repos} repos
               </div>
             </Card>
-          )}
+          ) : graphState === "error" ? (
+            <PanelError
+              title="Graph unavailable"
+              body="The constellation could not be loaded. Core telemetry remains available."
+              retry={() => void graph.refetch()}
+            />
+          ) : <PanelLoading label="Loading graph data" />}
         </section>
 
         {/* ── RIGHT TELEMETRY ── */}
         <aside className="min-w-0 space-y-4 min-[900px]:col-span-2 min-[1200px]:col-span-1">
           <div>
             <ColumnLabel>Attention</ColumnLabel>
-            {attentionQuiet ? (
+            {attentionState === "error" ? (
+              <PanelError
+                title="Attention unavailable"
+                body="The review queue could not be checked."
+                retry={() => void attention.refetch()}
+                compact
+              />
+            ) : attentionState === "pending" || !attention.data ? (
+              <PanelLoading label="Checking attention" compact />
+            ) : attentionQuiet ? (
               <div
                 className={
                   "mt-2 font-mono text-[11px] text-faint-foreground " +
                   (attnFlash.has("__cleared__") ? "live-glow" : "")
                 }
               >
-                nothing needs you
+                nothing detected
               </div>
             ) : (
               <div className="mt-2 space-y-2.5">
@@ -607,6 +666,11 @@ export function Overview() {
                 ) : null}
               </div>
             )}
+            {attentionCoverage ? (
+              <div className="mt-1 font-mono text-[10px] text-faint-foreground">
+                {attentionCoverage}
+              </div>
+            ) : null}
           </div>
 
           <div>
@@ -621,7 +685,7 @@ export function Overview() {
                 all models →
               </Link>
             </div>
-            <div className="mt-2 space-y-2">
+            {models.data ? <div className="mt-2 space-y-2">
               {mix.map((m) => {
                 const lead = m.harnesses[0]?.harness ?? "other";
                 return (
@@ -657,7 +721,7 @@ export function Overview() {
                   </Link>
                 );
               })}
-            </div>
+            </div> : <PanelLoading label="Loading model mix" compact />}
           </div>
 
           <div>
@@ -672,7 +736,7 @@ export function Overview() {
                 all sessions →
               </Link>
             </div>
-            <div className="mt-1.5">
+            {recent.data ? <div className="mt-1.5">
               {recent.data.items.slice(0, 8).map((s) => {
                 const live = liveFor(s.id);
                 return (
@@ -724,7 +788,7 @@ export function Overview() {
                 </Link>
                 );
               })}
-            </div>
+            </div> : <PanelLoading label="Loading recent sessions" compact />}
           </div>
         </aside>
       </div>
@@ -743,14 +807,16 @@ export function Overview() {
             </div>
           </div>
           <div className="mt-3 h-[210px]">
-            {timeseries.data.series.length === 0 ? (
+            {!timeseries.data ? (
+              <PanelLoading label="Loading activity series" compact />
+            ) : timeseries.data.series.length === 0 ? (
               <EmptyState
                 title="No sessions in range"
                 body="Widen the time range or run an ingest; daily stacked bars appear per harness."
               />
             ) : (
               <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={timeseries.data.series} barCategoryGap={2}>
+                <BarChart data={series} barCategoryGap={2}>
                   <ChartDefs />
                   <CartesianGrid stroke="var(--border-faint)" vertical={false} />
                   <XAxis
@@ -792,43 +858,45 @@ export function Overview() {
             </span>
           </div>
           <div className="mt-3 overflow-x-auto">
-            <div
-              className="grid gap-[3px]"
-              style={{ gridTemplateColumns: `34px repeat(24, 13px)` }}
-            >
-              <div />
-              {heat.hours.map((h) => (
-                <div key={h} className="tabular text-center text-[9px] text-faint-foreground">
-                  {h % 4 === 0 ? h.toString().padStart(2, "0") : ""}
-                </div>
-              ))}
-              {heat.weekdays.map((day, di) => (
-                <div key={day} className="contents">
-                  <div className="pr-1 text-right text-[10px] leading-[13px] text-muted-foreground">
-                    {day}
+            {!heatmap.data ? <PanelLoading label="Loading activity heatmap" compact /> : <>
+              <div
+                className="grid gap-[3px]"
+                style={{ gridTemplateColumns: `34px repeat(24, 13px)` }}
+              >
+                <div />
+                {heat.hours.map((h) => (
+                  <div key={h} className="tabular text-center text-[9px] text-faint-foreground">
+                    {h % 4 === 0 ? h.toString().padStart(2, "0") : ""}
                   </div>
-                  {heat.counts[di].map((c, hi) => (
-                    <div
-                      key={`${day}-${hi}`}
-                      title={`${day} ${hi.toString().padStart(2, "0")}:00 — ${c} session${c === 1 ? "" : "s"}`}
-                      className="h-[13px] w-[13px] rounded-[2px]"
-                      style={{ background: heatColor(c / maxHeat) }}
-                    />
-                  ))}
-                </div>
-              ))}
-            </div>
-            <div className="mt-2 flex items-center gap-1.5 text-[9px] text-faint-foreground">
-              less
-              {[0, 0.25, 0.5, 0.75, 1].map((t) => (
-                <span
-                  key={t}
-                  className="inline-block h-[9px] w-[9px] rounded-[2px]"
-                  style={{ background: heatColor(t) }}
-                />
-              ))}
-              more
-            </div>
+                ))}
+                {heat.weekdays.map((day, di) => (
+                  <div key={day} className="contents">
+                    <div className="pr-1 text-right text-[10px] leading-[13px] text-muted-foreground">
+                      {day}
+                    </div>
+                    {heat.counts[di].map((c, hi) => (
+                      <div
+                        key={`${day}-${hi}`}
+                        title={`${day} ${hi.toString().padStart(2, "0")}:00 — ${c} session${c === 1 ? "" : "s"}`}
+                        className="h-[13px] w-[13px] rounded-[2px]"
+                        style={{ background: heatColor(c / maxHeat) }}
+                      />
+                    ))}
+                  </div>
+                ))}
+              </div>
+              <div className="mt-2 flex items-center gap-1.5 text-[9px] text-faint-foreground">
+                less
+                {[0, 0.25, 0.5, 0.75, 1].map((t) => (
+                  <span
+                    key={t}
+                    className="inline-block h-[9px] w-[9px] rounded-[2px]"
+                    style={{ background: heatColor(t) }}
+                  />
+                ))}
+                more
+              </div>
+            </>}
           </div>
         </Card>
       </div>
@@ -836,7 +904,7 @@ export function Overview() {
       <div className="grid grid-cols-5 gap-3">
         <Card className="col-span-2">
           <CardTitle>Top projects</CardTitle>
-          <div className="mt-2.5 space-y-1.5">
+          {projects.data ? <div className="mt-2.5 space-y-1.5">
             {projects.data.items.map((p) => (
               <Link
                 key={p.project}
@@ -851,16 +919,16 @@ export function Overview() {
                 />
               </Link>
             ))}
-          </div>
+          </div> : <PanelLoading label="Loading projects" compact />}
           <div className="mt-4 border-t border-border-faint pt-3">
             <div className="flex items-baseline justify-between">
               <CardTitle>Duration</CardTitle>
               <span className="tabular text-[10px] text-faint-foreground">
-                p50 {formatDuration(dist.data.duration_seconds.p50)} · p90{" "}
-                {formatDuration(dist.data.duration_seconds.p90)}
+                p50 {formatDuration(dist.data?.duration_seconds.p50 ?? null)} · p90{" "}
+                {formatDuration(dist.data?.duration_seconds.p90 ?? null)}
               </span>
             </div>
-            <div className="mt-2 space-y-1">
+            {dist.data ? <div className="mt-2 space-y-1">
               {durationBuckets.map((b) => (
                 <div key={b.bucket} className="flex items-center gap-2 text-[11px]">
                   <div className="tabular w-12 shrink-0 text-muted-foreground">
@@ -875,7 +943,7 @@ export function Overview() {
                   </div>
                 </div>
               ))}
-            </div>
+            </div> : <PanelLoading label="Loading duration" compact />}
           </div>
         </Card>
 
@@ -883,10 +951,10 @@ export function Overview() {
           <div className="flex items-baseline justify-between">
             <CardTitle>Tool usage</CardTitle>
             <span className="tabular text-[11px] text-muted-foreground">
-              {formatCount(tools.data.total)} calls
+              {tools.data ? `${formatCount(tools.data.total)} calls` : "loading calls"}
             </span>
           </div>
-          <div className="mt-3 grid grid-cols-2 gap-x-6 gap-y-1.5">
+          {tools.data ? <div className="mt-3 grid grid-cols-2 gap-x-6 gap-y-1.5">
             {toolItems.map((t) => (
               <div key={t.tool} className="flex items-center gap-2 text-[11px]">
                 <div className="w-28 shrink-0 truncate font-mono text-muted-foreground">
@@ -901,12 +969,12 @@ export function Overview() {
                 </div>
               </div>
             ))}
-          </div>
+          </div> : <PanelLoading label="Loading tool usage" compact />}
         </Card>
       </div>
 
       <div className="text-[11px] text-faint-foreground">
-        Last event {formatDayTime(recent.data.items[0]?.started_at)} · range{" "}
+        Last event {formatDayTime(recent.data?.items[0]?.started_at)} · range{" "}
         {range}
       </div>
     </div>

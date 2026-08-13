@@ -183,6 +183,29 @@ class HealthTests(unittest.TestCase):
         self.assertIn("watcher", body)
         self.assertIn("last_ingest_by_harness", body)
 
+    def test_lightweight_health_skips_derived_freshness(self) -> None:
+        client = TestClient(create_app(self.db))
+        with mock.patch(
+            "agentlog.analysis.derive.derived_freshness",
+            side_effect=AssertionError("derived freshness should be skipped"),
+        ):
+            res = client.get("/api/health?derived=false")
+        self.assertEqual(res.status_code, 200)
+        body = res.json()
+        self.assertIn("watcher", body)
+        self.assertIsNone(body["derived"])
+
+    def test_full_health_includes_derived_freshness(self) -> None:
+        client = TestClient(create_app(self.db))
+        with mock.patch(
+            "agentlog.analysis.derive.derived_freshness",
+            return_value={"stale": False},
+        ) as freshness:
+            res = client.get("/api/health")
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.json()["derived"], {"stale": False})
+        freshness.assert_called_once()
+
 
 class CatchupTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -223,6 +246,59 @@ class CatchupTests(unittest.TestCase):
             self.assertGreaterEqual(int(count["c"]), 1)
         finally:
             conn.close()
+
+    def test_catchup_skips_unchanged_source_backed_missing_tail(self) -> None:
+        path = self.sessions / "rollout-catchup-tail.jsonl"
+        path.write_text(_codex_jsonl("catchup-tail"), encoding="utf-8")
+        with mock.patch("agentlog.ingest.codex.CODEX_SESSIONS_DIR", self.sessions):
+            daemon = WatchDaemon(
+                db_path=self.db,
+                sources=[WatchSource("codex", self.sessions, poll=False)],
+                debounce_seconds=30.0,
+                use_watchdog=False,
+            )
+            daemon._catchup_ingest()
+            conn = connect(self.db)
+            try:
+                conn.execute(
+                    """
+                    UPDATE sessions SET
+                        attention_final_question = NULL,
+                        attention_tail_revision = NULL
+                    WHERE id = 'codex:catchup-tail'
+                    """
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            with mock.patch.object(
+                WatchDaemon,
+                "_schedule_derive",
+            ), mock.patch(
+                "agentlog.ingest.base.TranscriptAdapter.parse_path",
+                side_effect=AssertionError("unchanged source must not be parsed"),
+            ):
+                daemon._catchup_ingest()
+
+        conn = connect(self.db)
+        try:
+            row = conn.execute(
+                """
+                SELECT attention_final_question, attention_tail_revision
+                FROM sessions WHERE id = 'codex:catchup-tail'
+                """
+            ).fetchone()
+            text = conn.execute(
+                "SELECT text FROM messages WHERE session_id = 'codex:catchup-tail'"
+            ).fetchone()
+        finally:
+            conn.close()
+
+        assert row is not None
+        assert text is not None
+        self.assertIsNone(row["attention_final_question"])
+        self.assertIsNone(row["attention_tail_revision"])
+        self.assertEqual(text["text"], "")
 
 
 class LoggingSetupTests(unittest.TestCase):

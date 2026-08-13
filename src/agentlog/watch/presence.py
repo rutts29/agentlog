@@ -12,6 +12,7 @@ import sqlite3
 import tempfile
 import threading
 import time
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -272,6 +273,7 @@ class PresenceMap:
     _entries: dict[str, PresenceEntry] = field(default_factory=dict)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _generation: int = 0
+    _epoch: str = field(default_factory=lambda: uuid.uuid4().hex)
 
     def note_activity(self, harness: str, path: str | Path) -> PresenceEntry | None:
         """Update presence for a changed source path. Snappy (no ingest debounce)."""
@@ -338,6 +340,7 @@ class PresenceMap:
             gen = self._generation
         return {
             "ts": _utc_iso(clock),
+            "epoch": self._epoch,
             "generation": gen,
             "active_seconds": self.active_seconds,
             "sessions": sessions,
@@ -436,6 +439,7 @@ def read_presence_file(path: Path) -> dict[str, Any]:
     except (OSError, json.JSONDecodeError, UnicodeDecodeError):
         return {
             "ts": _utc_iso(),
+            "epoch": None,
             "generation": 0,
             "active_seconds": PRESENCE_ACTIVE_SECONDS,
             "sessions": [],
@@ -443,6 +447,7 @@ def read_presence_file(path: Path) -> dict[str, Any]:
     if not isinstance(data, dict):
         return {
             "ts": _utc_iso(),
+            "epoch": None,
             "generation": 0,
             "active_seconds": PRESENCE_ACTIVE_SECONDS,
             "sessions": [],

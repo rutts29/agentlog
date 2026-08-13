@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from asyncio import create_task, sleep, to_thread
 from collections.abc import Iterable
 from contextlib import asynccontextmanager
 from pathlib import Path
+from threading import Event
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,6 +24,7 @@ from agentlog.api import (
     graph as graph_api,
     harnesses,
     live as live_api,
+    overview as overview_api,
     proposals as proposals_api,
     queries,
     skills as skills_api,
@@ -30,6 +33,7 @@ from agentlog.api import (
 )
 from agentlog.api.deps import WRITE_BUSY_TIMEOUT_MS, get_conn
 from agentlog.api.local_token import inject_spa_token
+from agentlog.api.overview_cache import OverviewResponseCache
 from agentlog.api.ranges import (
     DEFAULT_RANGE_KEY,
     TimeRange,
@@ -37,9 +41,10 @@ from agentlog.api.ranges import (
     range_params,
 )
 from agentlog.api.security import SecurityConfig, install_security
+from agentlog.api.search import DEFAULT_SOURCE_SCAN_LIMIT
 from agentlog.config import DEFAULT_DB_PATH
 from agentlog.normalize.model_identity import repair_null_model_identity
-from agentlog.source_reader import read_source_transcript
+from agentlog.source_reader import CachedSourceTranscriptReader
 
 log = logging.getLogger("agentlog.api")
 
@@ -85,16 +90,30 @@ def create_app(
     security: SecurityConfig | None = None,
     dist_dir: Path | None = None,
     adjudication_window_ids: Iterable[str] | None = None,
+    source_cache_size: int = DEFAULT_SOURCE_SCAN_LIMIT,
+    source_cache_text_bytes: int = 16 * 1024 * 1024,
+    overview_cache_size: int = 6,
 ) -> FastAPI:
     path = Path(db_path or DEFAULT_DB_PATH)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         _startup_repair_model_identity(Path(app.state.db_path))
-        yield
+        try:
+            yield
+        finally:
+            app.state.source_transcript_reader.close()
+            app.state.overview_cache.close()
 
     app = FastAPI(title="agentlog", version="0.1.0", lifespan=lifespan)
     app.state.db_path = path
+    app.state.source_transcript_reader = CachedSourceTranscriptReader(
+        max_entries=source_cache_size,
+        max_text_bytes=source_cache_text_bytes,
+    )
+    app.state.overview_cache = OverviewResponseCache(
+        path, max_entries=overview_cache_size
+    )
     configured_adjudications = (
         (adjudication_window_ids,)
         if isinstance(adjudication_window_ids, str)
@@ -122,10 +141,10 @@ def create_app(
     )
 
     @app.get("/api/health")
-    def health() -> dict:
+    def health(derived: bool = Query(True)) -> dict:
         from agentlog.service.health import build_health
 
-        return build_health(app.state.db_path)
+        return build_health(app.state.db_path, include_derived=derived)
 
     @app.get("/api/harnesses")
     def harness_registry(
@@ -178,70 +197,24 @@ def create_app(
         conn: sqlite3.Connection = Depends(get_conn),
         tr: TimeRange = Depends(_parse_range_dep),
     ) -> dict:
-        current = queries.count_sessions(conn, tr)
-        prev = None
-        delta = None
-        prev_ledger: dict | None = None
-        if tr.prev_start is not None and tr.prev_end is not None:
-            prev_tr = TimeRange(
-                key="prev",
-                start=tr.prev_start,
-                end=tr.prev_end,
-                prev_start=None,
-                prev_end=None,
-            )
-            prev = queries.count_sessions(conn, prev_tr)
-            if prev > 0:
-                delta = (current - prev) / prev
-            prev_ledger = descriptive.ledger_counts(conn, prev_tr)
+        return overview_api.summary_payload(conn, tr)
 
-        lead = queries.semantic_lead_metric(conn, tr)
-        streak = queries.streak_days(conn, tr)
-        ledger = descriptive.ledger_counts(conn, tr)
-        token_totals = tokens.corpus_totals(conn, tr)
+    @app.get("/api/overview")
+    def overview(
+        range_key: str = Query(DEFAULT_RANGE_KEY, alias="range"),
+        custom_start: str | None = Query(None, alias="start"),
+        custom_end: str | None = Query(None, alias="end"),
+        conn: sqlite3.Connection = Depends(get_conn),
+        tr: TimeRange = Depends(_parse_range_dep),
+    ) -> dict:
+        key = overview_api.request_cache_key(
+            range_key, custom_start, custom_end
+        )
 
-        def _count_kpi(key: str, label: str) -> dict:
-            value = ledger[key]
-            previous = prev_ledger[key] if prev_ledger is not None else None
-            ratio = (
-                (value - previous) / previous
-                if previous is not None and previous > 0
-                else None
-            )
-            return {
-                "value": value,
-                "previous": previous,
-                "delta_ratio": ratio,
-                "kind": "count",
-                "label": label,
-            }
-        return {
-            **range_params(tr),
-            "kpis": {
-                "sessions": {
-                    "value": current,
-                    "previous": prev,
-                    "delta_ratio": delta,
-                    "kind": "count",
-                    "label": "Sessions",
-                },
-                "messages": _count_kpi("messages", "Messages"),
-                "tool_events": _count_kpi("tool_events", "Tool calls"),
-                "windows": _count_kpi("windows", "Exchange windows"),
-                "auto_reviews": _count_kpi("auto_reviews", "Auto-reviews"),
-                "tokens_est": token_totals,
-                "cost_est": token_totals.get("cost"),
-                "interaction_style": lead.to_dict(),
-                "streak": {
-                    "current_days": streak["current"],
-                    "longest_days": streak["longest"],
-                    "label": "Active days in range",
-                    "note": "Calendar days with at least one session start.",
-                },
-            },
-            "ledger": ledger,
-            "flags": lead.flags,
-        }
+        def build() -> dict:
+            return overview_api.overview_payload(conn, tr)
+
+        return app.state.overview_cache.get_or_compute(key, build)
 
     @app.get("/api/timeseries/sessions")
     def timeseries_sessions(
@@ -334,7 +307,8 @@ def create_app(
         }
 
     @app.get("/api/search")
-    def search(
+    async def search(
+        request: Request,
         conn: sqlite3.Connection = Depends(get_conn),
         tr: TimeRange = Depends(_parse_range_dep),
         q: str = Query("", min_length=0),
@@ -344,7 +318,9 @@ def create_app(
         cursor: int = 0,
         limit: int = Query(40, ge=1, le=100),
     ) -> dict:
-        data = descriptive.search_messages(
+        cancelled = Event()
+        work = create_task(to_thread(
+            descriptive.search_messages,
             conn,
             tr,
             q=q,
@@ -353,8 +329,17 @@ def create_app(
             project=project,
             cursor=cursor,
             limit=limit,
-            source_reader=read_source_transcript,
-        )
+            source_reader=request.app.state.source_transcript_reader,
+            cancelled=cancelled,
+        ))
+        while not work.done():
+            if await request.is_disconnected():
+                cancelled.set()
+                break
+            await sleep(0.05)
+        data = await work
+        if data.get("cancelled"):
+            raise HTTPException(status_code=499, detail="search cancelled")
         return {**range_params(tr), **data}
 
     @app.get("/api/sessions")
@@ -412,9 +397,14 @@ def create_app(
     @app.get("/api/sessions/{session_id}")
     def session(
         session_id: str,
+        request: Request,
         conn: sqlite3.Connection = Depends(get_conn),
     ) -> dict:
-        detail = descriptive.session_detail_v2(conn, session_id)
+        detail = descriptive.session_detail_v2(
+            conn,
+            session_id,
+            source_reader=request.app.state.source_transcript_reader,
+        )
         if detail is None:
             raise HTTPException(status_code=404, detail="session not found")
         return detail
@@ -522,9 +512,14 @@ def create_app(
     @app.get("/api/sessions/{session_id:path}")
     def session_path(
         session_id: str,
+        request: Request,
         conn: sqlite3.Connection = Depends(get_conn),
     ) -> dict:
-        detail = descriptive.session_detail_v2(conn, session_id)
+        detail = descriptive.session_detail_v2(
+            conn,
+            session_id,
+            source_reader=request.app.state.source_transcript_reader,
+        )
         if detail is None:
             raise HTTPException(status_code=404, detail="session not found")
         return detail

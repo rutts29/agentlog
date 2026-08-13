@@ -306,6 +306,87 @@ class T3CodeAdapterTests(unittest.TestCase):
         _changed, changed_hash = adapter.parse_session_with_hash(self.db, MAIN_THREAD)
         self.assertNotEqual(second_hash, changed_hash)
 
+    def test_thread_revision_ignores_other_threads_and_tracks_target(self) -> None:
+        adapter = T3CodeAdapter()
+        first = adapter.session_revision(self.db, MAIN_THREAD)
+        self.assertIsNotNone(first)
+
+        writer = sqlite3.connect(self.db)
+        writer.execute(
+            "UPDATE projection_threads SET title = 'updated plan' WHERE thread_id = ?",
+            (PLAN_THREAD,),
+        )
+        writer.commit()
+        writer.close()
+        self.assertEqual(first, adapter.session_revision(self.db, MAIN_THREAD))
+
+        writer = sqlite3.connect(self.db)
+        writer.execute(
+            "UPDATE projection_thread_messages SET text = 'rewritten' WHERE message_id = 'm1'"
+        )
+        writer.commit()
+        writer.close()
+        self.assertNotEqual(first, adapter.session_revision(self.db, MAIN_THREAD))
+
+    def test_thread_revision_detects_same_length_target_rewrite(self) -> None:
+        adapter = T3CodeAdapter()
+        first = adapter.session_revision(self.db, MAIN_THREAD)
+        self.assertIsNotNone(first)
+
+        writer = sqlite3.connect(self.db)
+        writer.execute(
+            "UPDATE projection_thread_messages SET text = 'add x retry' "
+            "WHERE message_id = 'm1'"
+        )
+        writer.commit()
+        writer.close()
+
+        self.assertNotEqual(first, adapter.session_revision(self.db, MAIN_THREAD))
+
+    def test_thread_revision_tracks_global_known_thread_ids_for_provider_backings(self) -> None:
+        provider_id = "019febdf-eb13-7ee0-8110-26c0bb81a177"
+        adapter = T3CodeAdapter()
+        writer = sqlite3.connect(self.db)
+        writer.execute(
+            "UPDATE projection_thread_sessions SET provider_name = 'codex', "
+            "provider_instance_id = 'codex' WHERE thread_id = ?",
+            (MAIN_THREAD,),
+        )
+        writer.execute(
+            """INSERT INTO projection_thread_activities
+               (activity_id, thread_id, turn_id, tone, kind, summary,
+                payload_json, created_at, sequence)
+               VALUES ('provider-task-global', ?, NULL, 'info', 'task.started',
+                       'worker', ?, '2026-08-09T10:06:11.000Z', 7)""",
+            (MAIN_THREAD, json.dumps({"taskId": provider_id})),
+        )
+        writer.commit()
+        writer.close()
+        before = adapter.session_revision(self.db, MAIN_THREAD)
+        first, first_hash = adapter.parse_session_with_hash(self.db, MAIN_THREAD)
+        self.assertIsNotNone(first)
+        self.assertEqual(
+            [link["target_external_id"] for link in first.extras["session_links"]],
+            [provider_id],
+        )
+
+        writer = sqlite3.connect(self.db)
+        writer.execute(
+            """INSERT INTO projection_threads
+               (thread_id, project_id, title, created_at, updated_at)
+               VALUES (?, ?, 'provider task', '2026-08-09T10:00:00.000Z',
+                       '2026-08-09T10:00:00.000Z')""",
+            (provider_id, PROJECT_ID),
+        )
+        writer.commit()
+        writer.close()
+        second, second_hash = adapter.parse_session_with_hash(self.db, MAIN_THREAD)
+
+        self.assertNotEqual(before, adapter.session_revision(self.db, MAIN_THREAD))
+        self.assertNotEqual(first_hash, second_hash)
+        self.assertIsNotNone(second)
+        self.assertEqual(second.extras["session_links"], [])
+
     def test_tool_only_turns_are_plumbing(self) -> None:
         by_text = {m.text: m for m in self.results[MAIN_THREAD].messages}
         self.assertTrue(by_text["context refreshed"].is_tool_plumbing)

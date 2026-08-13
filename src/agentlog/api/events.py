@@ -15,7 +15,7 @@ from fastapi.responses import StreamingResponse
 from agentlog.api.deps import get_conn, get_db_path
 from agentlog.api.live import live_payload
 from agentlog.config import presence_path_for_db
-from agentlog.watch.events import list_ingest_events
+from agentlog.watch.events import IngestEvent, list_ingest_events
 
 router = APIRouter(tags=["events"])
 
@@ -64,17 +64,38 @@ def _presence_keys(sessions: list[dict]) -> set[str]:
     return keys
 
 
+def _bootstrap_ingest_events(
+    conn: sqlite3.Connection,
+    *,
+    since: str,
+    limit: int,
+) -> tuple[list[IngestEvent], int]:
+    conn.execute("BEGIN")
+    try:
+        events = list_ingest_events(conn, since=since, limit=limit)
+        row = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) AS tail_id FROM ingest_events"
+        ).fetchone()
+        tail_id = int(row["tail_id"] if row is not None else 0)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return events, tail_id
+
+
 def iter_event_sse(
     db_path: Path,
     *,
     since: str | None = None,
+    after_id: int | None = None,
     poll_seconds: float = 1.0,
     max_cycles: int | None = None,
     presence_path: Path | None = None,
 ) -> Iterator[str]:
     """Yield SSE frames for new ingest_events rows and presence transitions."""
-    last_id = 0
-    bootstrap = since is not None
+    last_id = after_id or 0
+    bootstrap = since is not None and after_id is None
     cycles = 0
     pres_path = presence_path or presence_path_for_db(db_path)
     last_pres = _presence_fingerprint(pres_path)
@@ -91,7 +112,13 @@ def iter_event_sse(
             conn = _open_ro(db_path)
             try:
                 if bootstrap:
-                    rows = list_ingest_events(conn, since=since, limit=200)
+                    rows, tail_id = _bootstrap_ingest_events(
+                        conn,
+                        since=since or "",
+                        limit=200,
+                    )
+                    if not rows:
+                        last_id = tail_id
                     bootstrap = False
                 else:
                     rows = list_ingest_events(conn, after_id=last_id, limit=200)
@@ -103,7 +130,7 @@ def iter_event_sse(
         for event in rows:
             last_id = max(last_id, event.id)
             payload = json.dumps(event.to_dict(), separators=(",", ":"))
-            yield f"event: ingest\ndata: {payload}\n\n"
+            yield f"id:{event.id}\nevent: ingest\ndata: {payload}\n\n"
 
         fp = _presence_fingerprint(pres_path)
         if fp != last_pres:
@@ -120,6 +147,7 @@ def iter_event_sse(
                 prev_keys = keys
                 body = {
                     "ts": live.get("ts"),
+                    "epoch": live.get("epoch"),
                     "generation": live.get("generation", 0),
                     "sessions": sessions,
                     "transitions": transitions,
@@ -157,9 +185,16 @@ def events_stream(
     since: str | None = Query(None),
 ) -> StreamingResponse:
     since_iso = _parse_since(since)
+    last_event_id = request.headers.get("last-event-id")
+    after_id: int | None = None
+    if last_event_id:
+        try:
+            after_id = max(0, int(last_event_id))
+        except ValueError:
+            after_id = None
     db_path = get_db_path(request)
     return StreamingResponse(
-        iter_event_sse(db_path, since=since_iso),
+        iter_event_sse(db_path, since=since_iso, after_id=after_id),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

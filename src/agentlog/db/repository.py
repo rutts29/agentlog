@@ -236,6 +236,79 @@ class Repository:
             return None
         return int(row["artifact_id"])
 
+    def cursor_metadata_targets(self) -> list[sqlite3.Row]:
+        return list(
+            self.conn.execute(
+                "SELECT id, external_id FROM sessions WHERE harness = 'cursor'"
+            )
+        )
+
+    def reconcile_cursor_metadata(
+        self,
+        session_id: str,
+        *,
+        model: str | None,
+        effort: str | None,
+        effort_source: str | None,
+        branch: str | None,
+    ) -> bool:
+        row = self.conn.execute(
+            """
+            SELECT model, model_canonical, provider, agent_profile,
+                   effort, effort_source, branch
+            FROM sessions
+            WHERE id = ? AND harness = 'cursor'
+            """,
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        updates: dict[str, object] = {}
+        if model is not None:
+            ident = _identity_for(model)
+            for column, value in {
+                "model": model,
+                "model_canonical": ident.canonical,
+                "provider": ident.provider,
+                "agent_profile": ident.agent_profile,
+            }.items():
+                if row[column] != value:
+                    updates[column] = value
+        if effort is not None:
+            if row["effort"] != effort:
+                updates["effort"] = effort
+            if row["effort_source"] != effort_source:
+                updates["effort_source"] = effort_source
+        if branch is not None and row["branch"] != branch:
+            updates["branch"] = branch
+        if not updates:
+            return False
+        assignments = ", ".join(f"{column} = ?" for column in updates)
+        self.conn.execute(
+            f"UPDATE sessions SET {assignments} WHERE id = ?",
+            [*updates.values(), session_id],
+        )
+        return True
+
+    def source_backed_artifacts_missing_attention_tail(
+        self, harness: str, *, limit: int
+    ) -> set[int]:
+        rows = self.conn.execute(
+            """
+            SELECT DISTINCT s.artifact_id
+            FROM sessions s
+            JOIN artifacts a ON a.id = s.artifact_id
+            WHERE s.harness = ?
+              AND s.transcript_storage = ?
+              AND s.attention_tail_revision IS NULL
+              AND s.artifact_id IS NOT NULL
+            ORDER BY s.artifact_id
+            LIMIT ?
+            """,
+            (harness, SOURCE_BACKED, limit),
+        ).fetchall()
+        return {int(row["artifact_id"]) for row in rows}
+
     def upsert_artifact(
         self,
         *,
@@ -1044,6 +1117,66 @@ class Repository:
                     json.dumps(tu.extras, separators=(",", ":"), default=str),
                 ),
             )
+
+        tail = next(
+            (
+                message
+                for message in reversed(result.messages)
+                if not message.is_tool_plumbing
+            ),
+            None,
+        )
+        if tail is not None:
+            from agentlog.analysis.attention_signals import last_attention_signal
+
+            signal = last_attention_signal(result.messages)
+            self.conn.execute(
+                """
+                UPDATE sessions SET
+                    attention_last_substantive_seq = ?,
+                    attention_last_substantive_role = ?,
+                    attention_last_substantive_at = ?,
+                    attention_final_question = ?,
+                    attention_incomplete_todo = ?,
+                    attention_tail_revision = 1
+                WHERE id = ?
+                """,
+                (
+                    base_seq + tail.seq,
+                    tail.role,
+                    _iso(tail.timestamp),
+                    int(signal == "question"),
+                    int(signal == "incomplete_todo"),
+                    session_id,
+                ),
+            )
+        last_tool = self.conn.execute(
+            """
+            SELECT tool_name FROM tool_events
+            WHERE session_id = ? ORDER BY seq DESC LIMIT 1
+            """,
+            (session_id,),
+        ).fetchone()
+        last_role = self.conn.execute(
+            """
+            SELECT role FROM messages
+            WHERE session_id = ? AND COALESCE(is_tool_plumbing, 0) = 0
+            ORDER BY seq DESC LIMIT 1
+            """,
+            (session_id,),
+        ).fetchone()
+        self.conn.execute(
+            "UPDATE sessions SET attention_last_plan_open = ? WHERE id = ?",
+            (
+                int(
+                    last_tool is not None
+                    and str(last_tool["tool_name"]) in {"TodoWrite", "update_plan"}
+                    and last_role is not None
+                    and str(last_role["role"]) != "user"
+                ),
+                session_id,
+            ),
+        )
 
         return session_id
 

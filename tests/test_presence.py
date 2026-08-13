@@ -12,9 +12,10 @@ from unittest import mock
 from fastapi.testclient import TestClient
 
 from agentlog.api.app import create_app
-from agentlog.api.events import iter_event_sse
+from agentlog.api.events import _bootstrap_ingest_events, iter_event_sse
 from agentlog.api.live import _source_snapshot_status, live_payload
 from agentlog.db.schema import connect, init_db
+from agentlog.watch.events import list_ingest_events, record_ingest_event
 from agentlog.watch.presence import (
     PresenceMap,
     atomic_write_json,
@@ -146,6 +147,16 @@ class PresenceMapTests(unittest.TestCase):
         removed = self.pmap.expire()
         self.assertEqual(removed, ["cursor:proj/abc"])
         self.assertEqual(self.pmap.active(), [])
+
+    def test_each_daemon_instance_has_a_distinct_epoch(self) -> None:
+        first = self.pmap.snapshot()["epoch"]
+        second = PresenceMap(
+            active_seconds=90.0,
+            state_path=self.state,
+            clock=lambda: self.clock["t"],
+        ).snapshot()["epoch"]
+        self.assertIsInstance(first, str)
+        self.assertNotEqual(first, second)
 
     def test_pending_ingest_then_linked(self) -> None:
         db = self.root / "agentlog.db"
@@ -287,6 +298,7 @@ class PresenceApiTests(unittest.TestCase):
             self.presence,
             {
                 "ts": self.ts,
+                "epoch": "daemon-a",
                 "generation": 1,
                 "active_seconds": 90.0,
                 "sessions": [
@@ -335,6 +347,7 @@ class PresenceApiTests(unittest.TestCase):
         self.assertEqual(len(body["sessions"]), 1)
         self.assertTrue(body["sessions"][0]["pending_ingest"])
         self.assertEqual(body["sessions"][0]["state"], "streaming")
+        self.assertEqual(body["epoch"], "daemon-a")
         self.assertIn("presence.json", body["path"])
 
     def test_foreign_parent_reference_does_not_promote_or_count_worker(self) -> None:
@@ -423,8 +436,151 @@ class PresenceApiTests(unittest.TestCase):
         joined = "".join(out)
         self.assertIn(": connected", joined)
         self.assertIn("event: presence", joined)
+        self.assertIn('"epoch":"daemon-a"', joined)
         self.assertIn('"action":"active"', joined)
         self.assertIn("uuid-1", joined)
+
+    def test_sse_future_since_starts_at_current_event_tail(self) -> None:
+        conn = connect(self.db)
+        try:
+            record_ingest_event(
+                conn,
+                harness="codex",
+                sessions_added=1,
+                sessions_updated=0,
+                messages_added=1,
+                ts="2026-08-12T10:00:00+00:00",
+            )
+        finally:
+            conn.close()
+
+        data = json.loads(self.presence.read_text(encoding="utf-8"))
+        gen = iter_event_sse(
+            self.db,
+            since="2099-01-01T00:00:00+00:00",
+            poll_seconds=0,
+            max_cycles=2,
+            presence_path=self.presence,
+        )
+        self.assertEqual(next(gen), ": connected\n\n")
+        data["generation"] = 2
+        atomic_write_json(self.presence, data)
+        self.assertIn("event: presence", next(gen))
+
+        conn = connect(self.db)
+        try:
+            record_ingest_event(
+                conn,
+                harness="cursor",
+                sessions_added=2,
+                sessions_updated=0,
+                messages_added=3,
+                ts="2026-08-12T11:00:00+00:00",
+            )
+        finally:
+            conn.close()
+        joined = "".join(gen)
+        self.assertIn('"harness":"cursor"', joined)
+        self.assertIn("id:2", joined)
+        self.assertNotIn('"harness":"codex"', joined)
+
+    def test_sse_bootstrap_cannot_skip_an_interleaved_commit(self) -> None:
+        reader = connect(self.db)
+        inserted: list[int] = []
+
+        def list_then_commit(*args: object, **kwargs: object):
+            events = list_ingest_events(*args, **kwargs)
+            writer = connect(self.db)
+            try:
+                event = record_ingest_event(
+                    writer,
+                    harness="codex",
+                    sessions_added=1,
+                    sessions_updated=0,
+                    messages_added=1,
+                    ts="2026-08-12T12:00:00+00:00",
+                )
+                inserted.append(event.id)
+            finally:
+                writer.close()
+            return events
+
+        try:
+            with mock.patch(
+                "agentlog.api.events.list_ingest_events",
+                side_effect=list_then_commit,
+            ):
+                events, tail_id = _bootstrap_ingest_events(
+                    reader,
+                    since="2099-01-01T00:00:00+00:00",
+                    limit=200,
+                )
+        finally:
+            reader.close()
+
+        self.assertGreater(inserted[0], 0)
+        selected = {event.id for event in events}
+        self.assertTrue(inserted[0] in selected or tail_id < inserted[0])
+
+    def test_sse_reconnect_resumes_after_last_event_id(self) -> None:
+        conn = connect(self.db)
+        try:
+            first = record_ingest_event(
+                conn,
+                harness="codex",
+                sessions_added=1,
+                sessions_updated=0,
+                messages_added=1,
+                ts="2026-08-12T10:00:00+00:00",
+            )
+            second = record_ingest_event(
+                conn,
+                harness="cursor",
+                sessions_added=1,
+                sessions_updated=0,
+                messages_added=2,
+                ts="2026-08-12T10:01:00+00:00",
+            )
+        finally:
+            conn.close()
+
+        initial = "".join(
+            iter_event_sse(
+                self.db,
+                since="2026-08-12T09:00:00+00:00",
+                poll_seconds=0,
+                max_cycles=1,
+                presence_path=self.presence,
+            )
+        )
+        self.assertIn(f"id:{first.id}\n", initial)
+        self.assertIn(f"id:{second.id}\n", initial)
+
+        conn = connect(self.db)
+        try:
+            third = record_ingest_event(
+                conn,
+                harness="claude",
+                sessions_added=1,
+                sessions_updated=0,
+                messages_added=3,
+                ts="2026-08-12T10:02:00+00:00",
+            )
+        finally:
+            conn.close()
+        resumed = "".join(
+            iter_event_sse(
+                self.db,
+                since="2026-08-12T09:00:00+00:00",
+                after_id=second.id,
+                poll_seconds=0,
+                max_cycles=1,
+                presence_path=self.presence,
+            )
+        )
+        self.assertIn(f"id:{third.id}\n", resumed)
+        self.assertNotIn(f"id:{first.id}\n", resumed)
+        self.assertNotIn(f"id:{second.id}\n", resumed)
 
 
 class SourceSnapshotStatusTests(unittest.TestCase):

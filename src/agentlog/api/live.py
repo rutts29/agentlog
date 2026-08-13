@@ -390,6 +390,7 @@ def live_payload(
     workers = sum(1 for item in sessions if item["role"] == "worker")
     return {
         "ts": _utc_iso(clock),
+        "epoch": daemon.get("epoch"),
         "generation": daemon.get("generation", 0),
         "active_seconds": PRESENCE_ACTIVE_SECONDS,
         "working_grace_seconds": PRESENCE_WORKING_GRACE_SECONDS,
