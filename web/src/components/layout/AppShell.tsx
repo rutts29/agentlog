@@ -12,6 +12,7 @@ import { fetchMeta, type RangeKey } from "@/lib/api";
 import { CommandPalette } from "@/components/CommandPalette";
 import { cn } from "@/lib/utils";
 import { isEditable } from "@/lib/keyboard";
+import { preloadView } from "@/lib/routePreload";
 
 const NAV_SECTIONS: Array<{
   title: string;
@@ -125,6 +126,8 @@ export function AppShell() {
                     key={item.to}
                     to={{ pathname: item.to, search: params.toString() }}
                     end={item.end}
+                    onMouseEnter={() => preloadView(item.to)}
+                    onFocus={() => preloadView(item.to)}
                     className={({ isActive }) =>
                       cn(
                         "relative shrink-0 rounded-control px-3 py-1.5 text-[13px] text-muted-foreground hover:text-foreground",

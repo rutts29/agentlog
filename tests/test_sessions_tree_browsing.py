@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
 from fastapi.testclient import TestClient
 
@@ -55,14 +56,15 @@ class SessionsTreeBrowsingTests(unittest.TestCase):
         branch: str | None = None,
         originator: str | None = None,
         thread_source: str | None = None,
+        transcript_storage: str = "legacy_materialized",
     ) -> None:
         self.conn.execute(
             """
             INSERT INTO sessions
               (id, harness, external_id, parent_session_id, started_at,
                ended_at, model, model_canonical, effort, repo, branch,
-               originator, thread_source)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               originator, thread_source, transcript_storage)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 session_id,
@@ -78,6 +80,7 @@ class SessionsTreeBrowsingTests(unittest.TestCase):
                 branch,
                 originator,
                 thread_source,
+                transcript_storage,
             ),
         )
 
@@ -689,6 +692,94 @@ class SessionsTreeBrowsingTests(unittest.TestCase):
         self.assertTrue(tree["bounds"]["truncated"])
         self.assertTrue(tree["tree"]["children_truncated"])
         self.assertEqual(tree["tree"]["omitted_descendant_count"], 101)
+
+    def test_session_list_projects_transcript_storage_without_hydration(self) -> None:
+        self.conn.executescript(
+            """
+            INSERT INTO artifacts
+              (harness, path, size, mtime_ns, content_hash, parsed_offset,
+               parser_version, transcript_storage)
+            VALUES
+              ('t3code', '/tmp/source-owner.jsonl', 1, 1, 'source-owner', 0,
+               'test', 'source_backed'),
+              ('codex', '/tmp/source-owner-backing.jsonl', 1, 1,
+               'source-owner-backing', 0, 'test', 'legacy_materialized'),
+              ('codex', '/tmp/legacy-owner-backing.jsonl', 1, 1,
+               'legacy-owner-backing', 0, 'test', 'source_backed');
+            """
+        )
+        self.session(
+            "t3code:source-owner",
+            harness="t3code",
+            external_id="source-owner",
+            transcript_storage="source_backed",
+        )
+        self.session(
+            "codex:source-owner-backing", external_id="source-owner-backing"
+        )
+        self.session(
+            "t3code:legacy-owner",
+            harness="t3code",
+            external_id="legacy-owner",
+        )
+        self.session(
+            "codex:legacy-owner-backing",
+            external_id="legacy-owner-backing",
+            transcript_storage="source_backed",
+        )
+        self.session("codex:legacy", external_id="legacy")
+        self.conn.execute(
+            """
+            INSERT INTO session_links
+              (source_session_id, target_session_id, link_type, target_harness,
+               target_external_id, link_role)
+            VALUES
+              ('t3code:source-owner', 'codex:source-owner-backing',
+               'provider_backing', 'codex', 'source-owner-backing', 'root'),
+              ('t3code:legacy-owner', 'codex:legacy-owner-backing',
+               'provider_backing', 'codex', 'legacy-owner-backing', 'root')
+            """
+        )
+        self.conn.execute(
+            "UPDATE sessions SET artifact_id = 1 WHERE id = 't3code:source-owner'"
+        )
+        self.conn.execute(
+            "UPDATE sessions SET artifact_id = 2 "
+            "WHERE id = 'codex:source-owner-backing'"
+        )
+        self.conn.execute(
+            "UPDATE sessions SET artifact_id = 3 "
+            "WHERE id = 'codex:legacy-owner-backing'"
+        )
+        self.conn.commit()
+        self.conn.close()
+
+        app = create_app(self.path)
+        source_reader = mock.Mock(
+            side_effect=AssertionError("unexpected source read")
+        )
+        app.state.source_transcript_reader = source_reader
+        with TestClient(app) as client:
+            response = client.get("/api/sessions", params={"range": "all"})
+        self.conn = connect(self.path)
+
+        self.assertEqual(response.status_code, 200)
+        rows = {item["id"]: item for item in response.json()["items"]}
+        self.assertIsNone(rows["t3code:source-owner"]["transcript_session_id"])
+        self.assertEqual(
+            rows["t3code:source-owner"]["transcript_storage"], "source_backed"
+        )
+        self.assertEqual(
+            rows["t3code:legacy-owner"]["transcript_session_id"],
+            "codex:legacy-owner-backing",
+        )
+        self.assertEqual(
+            rows["t3code:legacy-owner"]["transcript_storage"], "source_backed"
+        )
+        self.assertEqual(
+            rows["codex:legacy"]["transcript_storage"], "legacy_materialized"
+        )
+        source_reader.assert_not_called()
 
 
 if __name__ == "__main__":

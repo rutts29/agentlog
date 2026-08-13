@@ -101,8 +101,11 @@ def iter_window_input_rows(
             ORDER BY m.session_id, m.seq, m.id
             """
         ):
+            digest = session_digests.get(str(row["session_id"]))
+            if digest is None:
+                continue
             _hash_record(
-                session_digests[str(row["session_id"])],
+                digest,
                 "message",
                 (
                     row["id"],
@@ -124,8 +127,11 @@ def iter_window_input_rows(
             ORDER BY t.session_id, t.seq, t.id
             """
         ):
+            digest = session_digests.get(str(row["session_id"]))
+            if digest is None:
+                continue
             _hash_record(
-                session_digests[str(row["session_id"])],
+                digest,
                 "tool",
                 (
                     row["id"],
@@ -146,8 +152,11 @@ def iter_window_input_rows(
             ORDER BY e.session_id, e.skill_name, e.exposure_type, e.id
             """
         ):
+            digest = session_digests.get(str(row["session_id"]))
+            if digest is None:
+                continue
             _hash_record(
-                session_digests[str(row["session_id"])],
+                digest,
                 "skill",
                 (
                     row["id"],

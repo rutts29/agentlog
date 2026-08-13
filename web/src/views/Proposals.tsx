@@ -397,7 +397,7 @@ export function Proposals() {
 
   const q = useQuery({
     queryKey: ["proposals", filter],
-    queryFn: () => fetchProposals(filter),
+    queryFn: ({ signal }) => fetchProposals(filter, signal),
   });
 
   const decide = useMutation({

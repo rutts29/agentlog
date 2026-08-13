@@ -4,8 +4,13 @@ import sqlite3
 import json
 import tempfile
 import unittest
+from io import BytesIO
 from pathlib import Path
+from threading import Event
+from types import SimpleNamespace
+from unittest import mock
 
+from agentlog.api import search as search_api
 from agentlog.api.descriptive import search_messages
 from agentlog.api.ranges import parse_range
 from agentlog.db.schema import connect, init_db
@@ -144,6 +149,279 @@ class DualSearchTests(unittest.TestCase):
         self.assertEqual(calls, ["codex:source"])
         self.assertEqual(result["total"], 1)
         self.assertEqual(result["items"][0]["provenance"]["mode"], "materialized_fts")
+
+    def test_source_scan_respects_the_explicit_bound_and_reports_it(self) -> None:
+        for index in range(40):
+            session_id = f"codex:source-{index}"
+            self.conn.execute(
+                """
+                INSERT INTO sessions
+                  (id, harness, external_id, started_at, transcript_storage)
+                VALUES (?, 'codex', ?, '2026-08-10T00:03:00+00:00', 'source_backed')
+                """,
+                (session_id, f"source-{index}"),
+            )
+        self.conn.commit()
+        calls: list[str] = []
+
+        def reader(conn: sqlite3.Connection, session_id: str) -> dict:
+            calls.append(session_id)
+            return {"status": "ready", "messages": []}
+
+        result = search_messages(
+            self.conn,
+            self.tr,
+            q="payload",
+            source_reader=reader,
+            source_scan_limit=40,
+        )
+
+        self.assertEqual(len(calls), 40)
+        self.assertEqual(len(set(calls)), 40)
+        self.assertTrue(result["truncated"])
+
+    def test_jsonl_prefilter_skips_canonical_reads_without_the_query(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            matching = root / "matching.jsonl"
+            missing = root / "missing.jsonl"
+            matching.write_text('{"text":"needle payload"}\n', encoding="utf-8")
+            missing.write_text('{"text":"unrelated payload"}\n', encoding="utf-8")
+            for index, path in enumerate((matching, missing)):
+                artifact_id = self.conn.execute(
+                    """
+                    INSERT INTO artifacts
+                      (harness, path, size, mtime_ns, content_hash, parsed_offset,
+                       parser_version, transcript_storage)
+                    VALUES ('codex', ?, ?, ?, 'hash', 0, 'test', 'source_backed')
+                    RETURNING id
+                    """,
+                    (str(path), path.stat().st_size, path.stat().st_mtime_ns),
+                ).fetchone()["id"]
+                self.conn.execute(
+                    """
+                    INSERT INTO sessions
+                      (id, harness, external_id, artifact_id, started_at, repo, transcript_storage)
+                    VALUES (?, 'codex', ?, ?, '2026-08-10T00:03:00+00:00',
+                            '/tmp/prefilter', 'source_backed')
+                    """,
+                    (f"codex:prefilter-{index}", f"prefilter-{index}", artifact_id),
+                )
+            self.conn.commit()
+            calls: list[str] = []
+
+            def reader(conn: sqlite3.Connection, session_id: str) -> dict:
+                calls.append(session_id)
+                return {"status": "ready", "messages": []}
+
+            search_messages(
+                self.conn,
+                self.tr,
+                q="needle",
+                project=["prefilter"],
+                source_reader=reader,
+            )
+
+        self.assertEqual(calls, ["codex:prefilter-0"])
+
+    def test_jsonl_prefilter_finds_a_long_token_split_across_chunks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "split.jsonl"
+            token = "needle-token-which-is-longer-than-twenty-four-bytes"
+            path.write_bytes(b"x" * (1024 * 1024 - 8) + token.encode())
+
+            result = search_api._jsonl_might_contain_tokens(
+                path, [token], cancelled=None
+            )
+
+        self.assertTrue(result)
+
+    def test_jsonl_prefilter_keeps_no_overlap_for_single_byte_tokens(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "single-byte.jsonl"
+            path.write_bytes(b"x" * (1024 * 1024 * 3))
+            reads: list[int] = []
+
+            class CountingFile:
+                def __init__(self, source) -> None:
+                    self.source = source
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_args):
+                    self.source.close()
+
+                def read(self, size: int) -> bytes:
+                    reads.append(size)
+                    return self.source.read(size)
+
+            original_open = Path.open
+            with mock.patch.object(
+                Path,
+                "open",
+                lambda target, mode: CountingFile(original_open(target, mode)),
+            ):
+                result = search_api._jsonl_might_contain_tokens(path, ["a"], cancelled=None)
+
+        self.assertFalse(result)
+        self.assertEqual(reads, [1024 * 1024] * 4)
+
+    def test_jsonl_prefilter_fails_open_for_unicode_and_changed_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "unicode.jsonl"
+            path.write_text('{"text":"unrelated"}\n', encoding="utf-8")
+            self.assertTrue(
+                search_api._jsonl_might_contain_tokens(path, ["café"], cancelled=None)
+            )
+
+        class ChangedPath:
+            suffix = ".jsonl"
+
+            def __init__(self) -> None:
+                self._stats = iter((
+                    SimpleNamespace(st_dev=1, st_ino=1, st_size=9, st_mtime_ns=1, st_ctime_ns=1),
+                    SimpleNamespace(st_dev=1, st_ino=2, st_size=9, st_mtime_ns=1, st_ctime_ns=2),
+                ))
+
+            def stat(self):
+                return next(self._stats)
+
+            def open(self, _mode: str):
+                return BytesIO(b"unrelated")
+
+        self.assertTrue(
+            search_api._jsonl_might_contain_tokens(ChangedPath(), ["needle"], cancelled=None)
+        )
+
+    def test_jsonl_prefilter_fails_open_for_json_escaped_punctuation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "escaped.jsonl"
+            path.write_text(
+                '{"text":"foo\\/bar foo\\u002bbar foo\\u002dbar"}\n', encoding="utf-8"
+            )
+
+            self.assertTrue(
+                search_api._jsonl_might_contain_tokens(path, ["foo/bar"], cancelled=None)
+            )
+            self.assertTrue(
+                search_api._jsonl_might_contain_tokens(path, ["foo+bar"], cancelled=None)
+            )
+            self.assertTrue(
+                search_api._jsonl_might_contain_tokens(path, ["foo-bar"], cancelled=None)
+            )
+
+    def test_jsonl_prefilter_fails_open_for_json_escaped_alphanumeric(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "escaped-alphanumeric.jsonl"
+            path.write_text('{"text":"\\u0061"}\n', encoding="utf-8")
+
+            self.assertTrue(
+                search_api._jsonl_might_contain_tokens(path, ["a"], cancelled=None)
+            )
+
+    def test_jsonl_prefilter_detects_unicode_escape_across_chunk_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "split-unicode-escape.jsonl"
+            path.write_bytes(b"x" * (1024 * 1024 - 1) + b"\\u0061")
+
+            self.assertTrue(
+                search_api._jsonl_might_contain_tokens(path, ["a"], cancelled=None)
+            )
+
+    def test_cancelled_source_search_stops_before_the_next_source_read(self) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO sessions
+              (id, harness, external_id, started_at, transcript_storage)
+            VALUES ('codex:second-source', 'codex', 'second-source',
+                    '2026-08-10T00:03:00+00:00', 'source_backed')
+            """
+        )
+        self.conn.commit()
+        cancelled = Event()
+        calls: list[str] = []
+
+        def reader(conn: sqlite3.Connection, session_id: str) -> dict:
+            calls.append(session_id)
+            cancelled.set()
+            return {"status": "ready", "messages": []}
+
+        result = search_messages(
+            self.conn,
+            self.tr,
+            q="payload",
+            source_reader=reader,
+            cancelled=cancelled,
+        )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(result, {"cancelled": True})
+
+    def test_cancelled_source_search_discards_partial_hits_inside_a_session(self) -> None:
+        cancelled = Event()
+
+        class TriggerText:
+            def __str__(self) -> str:
+                cancelled.set()
+                return "payload"
+
+        class DangerousText:
+            def __str__(self) -> str:
+                raise AssertionError("search processed a message after cancellation")
+
+        def reader(conn: sqlite3.Connection, session_id: str) -> dict:
+            return {
+                "status": "ready",
+                "messages": [
+                    {"id": "first", "seq": 1, "role": "user", "text": TriggerText()},
+                    {"id": "second", "seq": 2, "role": "user", "text": DangerousText()},
+                ],
+            }
+
+        result = search_messages(
+            self.conn,
+            self.tr,
+            q="payload",
+            source_reader=reader,
+            cancelled=cancelled,
+        )
+
+        self.assertEqual(result, {"cancelled": True})
+
+    def test_source_scan_orders_metadata_matches_newest_first(self) -> None:
+        for external_id, started_at in (
+            ("target-old", "2026-08-10T00:03:00+00:00"),
+            ("target-new", "2026-08-10T00:05:00+00:00"),
+            ("other-new", "2026-08-10T00:06:00+00:00"),
+        ):
+            self.conn.execute(
+                """
+                INSERT INTO sessions
+                  (id, harness, external_id, started_at, repo, transcript_storage)
+                VALUES (?, 'codex', ?, ?, '/tmp/order', 'source_backed')
+                """,
+                (f"codex:{external_id}", external_id, started_at),
+            )
+        self.conn.commit()
+        calls: list[str] = []
+
+        def reader(conn: sqlite3.Connection, session_id: str) -> dict:
+            calls.append(session_id)
+            return {"status": "ready", "messages": []}
+
+        search_messages(
+            self.conn,
+            self.tr,
+            q="target",
+            project=["order"],
+            source_reader=reader,
+        )
+
+        self.assertEqual(
+            calls,
+            ["codex:target-new", "codex:target-old", "codex:other-new"],
+        )
 
     def test_default_reader_finds_current_source_without_fts_text(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

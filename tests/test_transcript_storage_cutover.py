@@ -5,6 +5,7 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from agentlog.db.repository import (
     LEGACY_MATERIALIZED,
@@ -15,7 +16,12 @@ from agentlog.db.repository import (
 from agentlog.db.schema import connect, init_db
 from agentlog.ingest.codex import CodexAdapter
 from agentlog.ingest.base import TranscriptAdapter, sqlite_fingerprint
-from agentlog.ingest.pipeline import IngestStats, _ingest_one
+from agentlog.ingest.pipeline import (
+    IngestStats,
+    _ingest_one,
+    ingest_all,
+    ingest_harness,
+)
 from agentlog.normalize.models import (
     Harness,
     NormalizedMessage,
@@ -75,15 +81,31 @@ class TranscriptStorageCutoverTests(unittest.TestCase):
             repo = self._repo(root)
             path.write_bytes(_line("user", "first half"))
             _ingest_one(repo, CodexAdapter(), path, IngestStats())
+            # Simulate a source-backed row created before the v030 tail-fact
+            # migration. The next ordinary append must backfill its facts.
+            repo.conn.execute(
+                """
+                UPDATE sessions SET
+                    attention_final_question = NULL,
+                    attention_tail_revision = NULL
+                """
+            )
             repo.conn.commit()
 
-            path.write_bytes(path.read_bytes() + _line("assistant", "second half"))
-            _ingest_one(repo, CodexAdapter(), path, IngestStats())
+            path.write_bytes(
+                path.read_bytes() + _line("assistant", "Should I continue?")
+            )
+            with mock.patch("agentlog.ingest.codex.CODEX_SESSIONS_DIR", root):
+                stats = ingest_harness(repo, "codex", changed_paths=[path])
             repo.conn.commit()
 
             artifact = repo.get_artifact_by_path(str(path))
             session = repo.conn.execute(
-                "SELECT id, transcript_storage FROM sessions"
+                """
+                SELECT id, transcript_storage, attention_final_question,
+                       attention_tail_revision
+                FROM sessions
+                """
             ).fetchone()
             messages = repo.conn.execute(
                 "SELECT role, text FROM messages ORDER BY seq"
@@ -99,12 +121,191 @@ class TranscriptStorageCutoverTests(unittest.TestCase):
         assert artifact is not None
         self.assertEqual(artifact.transcript_storage, SOURCE_BACKED)
         self.assertEqual(session["transcript_storage"], SOURCE_BACKED)
+        self.assertEqual(session["attention_final_question"], 1)
+        self.assertEqual(session["attention_tail_revision"], 1)
+        self.assertEqual(stats.appended, 1)
         self.assertEqual(
             [(row["role"], row["text"]) for row in messages],
             [("user", ""), ("assistant", "")],
         )
         self.assertEqual(fts_count, 0)
         self.assertEqual(windows, 1)
+
+    def test_source_backed_ingest_persists_non_text_attention_tail(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self._repo(root)
+            artifact = repo.upsert_artifact(
+                harness="codex",
+                path=str(root / "tail.jsonl"),
+                size=1,
+                mtime_ns=1,
+                content_hash="tail",
+                parsed_offset=1,
+                parser_version="test",
+                transcript_storage=SOURCE_BACKED,
+            )
+            repo.save_parse_result(
+                artifact_id=artifact,
+                result=_result(
+                    ("user", "Please inspect this."),
+                    ("assistant", "Should I continue?"),
+                    external_id="attention-tail",
+                ),
+                append=False,
+                transcript_storage=SOURCE_BACKED,
+            )
+            row = repo.conn.execute(
+                """
+                SELECT attention_last_substantive_role,
+                       attention_final_question,
+                       attention_incomplete_todo,
+                       attention_tail_revision
+                FROM sessions WHERE id = 'codex:attention-tail'
+                """
+            ).fetchone()
+            stored_text = repo.conn.execute(
+                "SELECT text FROM messages WHERE session_id = 'codex:attention-tail'"
+            ).fetchall()
+
+        assert row is not None
+        self.assertEqual(row["attention_last_substantive_role"], "assistant")
+        self.assertEqual(row["attention_final_question"], 1)
+        self.assertEqual(row["attention_incomplete_todo"], 0)
+        self.assertEqual(row["attention_tail_revision"], 1)
+        self.assertEqual([item["text"] for item in stored_text], ["", ""])
+
+    def test_source_backed_append_reconciles_full_metadata_before_windows(self) -> None:
+        class OffsetRelativeAppendAdapter(TranscriptAdapter):
+            harness = Harness.CODEX
+
+            def discover(self) -> list[Path]:
+                return []
+
+            def parse_chunk(self, path, data, *, start_offset):
+                raise NotImplementedError
+
+            def parse_path(self, path, data, *, start_offset):
+                if start_offset:
+                    result = _result(
+                        ("assistant", "follow-up"),
+                        external_id="offset-relative",
+                    )
+                elif path.stat().st_size == 1:
+                    result = _result(
+                        ("user", "request"),
+                        ("assistant", "response"),
+                        external_id="offset-relative",
+                    )
+                else:
+                    result = _result(
+                        ("user", "request"),
+                        ("assistant", "response"),
+                        ("user", "next request"),
+                        ("assistant", "follow-up"),
+                        external_id="offset-relative",
+                    )
+                return [
+                    result.model_copy(
+                        update={"bytes_consumed": path.stat().st_size}
+                    )
+                ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "offset-relative.jsonl"
+            repo = self._repo(root)
+            adapter = OffsetRelativeAppendAdapter()
+            path.write_bytes(b"a")
+            _ingest_one(repo, adapter, path, IngestStats())
+            repo.conn.commit()
+
+            path.write_bytes(b"ab")
+            _ingest_one(repo, adapter, path, IngestStats())
+            repo.conn.commit()
+
+            messages = repo.conn.execute(
+                "SELECT seq, role FROM messages ORDER BY seq"
+            ).fetchall()
+            windows = repo.conn.execute(
+                "SELECT request_message_id, response_message_id "
+                "FROM exchange_windows ORDER BY request_message_id"
+            ).fetchall()
+            fk_errors = repo.conn.execute("PRAGMA foreign_key_check").fetchall()
+
+        self.assertEqual(
+            [(row["seq"], row["role"]) for row in messages],
+            [(1, "user"), (2, "assistant"), (3, "user"), (4, "assistant")],
+        )
+        self.assertEqual(
+            [(row["request_message_id"], row["response_message_id"]) for row in windows],
+            [
+                ("codex:offset-relative:m:1", "codex:offset-relative:m:2"),
+                ("codex:offset-relative:m:3", "codex:offset-relative:m:4"),
+            ],
+        )
+        self.assertEqual(fk_errors, [])
+
+    def test_divergent_source_backed_append_is_frozen_without_retry_failure(self) -> None:
+        class OffsetRelativeAppendAdapter(TranscriptAdapter):
+            harness = Harness.CODEX
+
+            def discover(self) -> list[Path]:
+                return [path]
+
+            def parse_chunk(self, path, data, *, start_offset):
+                raise NotImplementedError
+
+            def parse_path(self, path, data, *, start_offset):
+                if start_offset:
+                    result = _result(
+                        ("assistant", "follow-up"), external_id="divergent"
+                    )
+                elif path.stat().st_size == 1:
+                    result = _result(
+                        ("user", "request"),
+                        ("assistant", "response"),
+                        external_id="divergent",
+                    )
+                else:
+                    result = _result(
+                        ("user", "request"),
+                        ("assistant", "response"),
+                        ("user", "next request"),
+                        ("assistant", "follow-up"),
+                        external_id="divergent",
+                    )
+                return [
+                    result.model_copy(
+                        update={"bytes_consumed": path.stat().st_size}
+                    )
+                ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "divergent.jsonl"
+            repo = self._repo(root)
+            adapter = OffsetRelativeAppendAdapter()
+            path.write_bytes(b"a")
+            _ingest_one(repo, adapter, path, IngestStats())
+            repo.conn.commit()
+            repo.conn.execute(
+                "UPDATE messages SET content_hash = 'stale' WHERE "
+                "id = 'codex:divergent:m:1'"
+            )
+            repo.conn.commit()
+
+            path.write_bytes(b"ab")
+            with mock.patch("agentlog.ingest.pipeline.adapter_for", return_value=adapter):
+                stats = ingest_harness(repo, "codex", changed_paths=[path])
+            session = repo.conn.execute(
+                "SELECT source_sync_status FROM sessions WHERE id = 'codex:divergent'"
+            ).fetchone()
+
+        self.assertEqual(stats.failed, 0)
+        self.assertEqual(stats.skipped, 1)
+        self.assertIn("identity frozen", stats.warnings[0])
+        self.assertEqual(session["source_sync_status"], "frozen_diverged")
 
     def test_source_reparse_preserves_session_and_rejects_divergence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -523,3 +724,73 @@ class TranscriptStorageCutoverTests(unittest.TestCase):
             [("new", SOURCE_BACKED), ("old", LEGACY_MATERIALIZED)],
         )
         self.assertEqual(new_text, "")
+
+    def test_unchanged_source_backed_tail_requires_explicit_maintenance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / ROLLOUT
+            repo = self._repo(root)
+            path.write_bytes(
+                _line("user", "first half")
+                + _line("assistant", "Should I continue?")
+            )
+            _ingest_one(repo, CodexAdapter(), path, IngestStats())
+            repo.conn.execute(
+                """
+                UPDATE sessions SET
+                    attention_final_question = NULL,
+                    attention_tail_revision = NULL
+                """
+            )
+            repo.conn.commit()
+
+            with mock.patch(
+                "agentlog.ingest.codex.CODEX_SESSIONS_DIR", root
+            ), mock.patch(
+                "agentlog.ingest.pipeline.adapters",
+                return_value=[CodexAdapter()],
+            ):
+                event_stats = ingest_harness(
+                    repo,
+                    "codex",
+                    changed_paths=[path],
+                    catch_up_attention_tails=True,
+                )
+                pending = repo.conn.execute(
+                    "SELECT attention_tail_revision FROM sessions"
+                ).fetchone()
+                default_stats = ingest_all(repo)
+                default_pending = repo.conn.execute(
+                    "SELECT attention_tail_revision FROM sessions"
+                ).fetchone()
+                maintenance_stats = ingest_harness(
+                    repo, "codex", catch_up_attention_tails=True
+                )
+                current = repo.conn.execute(
+                    """
+                    SELECT attention_final_question, attention_tail_revision
+                    FROM sessions
+                    """
+                ).fetchone()
+                stored_text = repo.conn.execute(
+                    "SELECT text FROM messages ORDER BY seq"
+                ).fetchall()
+                before_repeat = repo.conn.total_changes
+                repeat_stats = ingest_harness(
+                    repo, "codex", catch_up_attention_tails=True
+                )
+
+        assert pending is not None
+        assert default_pending is not None
+        assert current is not None
+        self.assertGreaterEqual(event_stats.skipped, 1)
+        self.assertIsNone(pending["attention_tail_revision"])
+        self.assertGreaterEqual(default_stats.skipped, 1)
+        self.assertIsNone(default_pending["attention_tail_revision"])
+        self.assertEqual(maintenance_stats.parsed, 1)
+        self.assertEqual(current["attention_final_question"], 1)
+        self.assertEqual(current["attention_tail_revision"], 1)
+        self.assertEqual([row["text"] for row in stored_text], ["", ""])
+        self.assertEqual(repeat_stats.parsed, 0)
+        self.assertGreaterEqual(repeat_stats.skipped, 1)
+        self.assertEqual(repo.conn.total_changes, before_repeat)

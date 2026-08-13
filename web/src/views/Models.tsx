@@ -18,6 +18,7 @@ import { HarnessTag } from "@/components/ui/badges";
 import { Meter } from "@/components/ui/spark";
 import { CHART_TOOLTIP } from "@/components/ui/chartdefs";
 import { dayTickFormatter, harnessColor } from "@/lib/utils";
+import { rangeViewQueryOptions } from "@/lib/viewQueries";
 
 type Ctx = { range: string };
 
@@ -105,12 +106,18 @@ export function Models() {
   const [params] = useSearchParams();
   const [mixQ, monthlyQ, byModelQ] = useQueries({
     queries: [
-      { queryKey: ["models-page", range], queryFn: () => fetchModelMix(range) },
-      { queryKey: ["models-monthly", range], queryFn: () => fetchModelMonthly(range) },
-      {
+      rangeViewQueryOptions({
+        queryKey: ["models-page", range],
+        queryFn: (signal) => fetchModelMix(range, signal),
+      }),
+      rangeViewQueryOptions({
+        queryKey: ["models-monthly", range],
+        queryFn: (signal) => fetchModelMonthly(range, signal),
+      }),
+      rangeViewQueryOptions({
         queryKey: ["timeseries-model", range],
-        queryFn: () => fetchTimeseries(range, "model"),
-      },
+        queryFn: (signal) => fetchTimeseries(range, "model", signal),
+      }),
     ],
   });
 

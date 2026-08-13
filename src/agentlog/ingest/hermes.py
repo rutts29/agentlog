@@ -93,6 +93,27 @@ class HermesAdapter(TranscriptAdapter):
     harness = Harness.HERMES
     supports_byte_append = False
 
+    def accepts_watch_path(self, path: Path, source_root: Path) -> bool:
+        try:
+            parts = path.relative_to(source_root).parts
+        except ValueError:
+            return False
+        if parts in {("state.db",), ("kanban.db",)}:
+            return True
+        if source_root.name == "boards":
+            return len(parts) == 2 and parts[1] == "kanban.db"
+        if source_root.name == "kanban":
+            return (
+                len(parts) == 3
+                and parts[0] == "boards"
+                and parts[2] == "kanban.db"
+            )
+        return (
+            len(parts) == 4
+            and parts[:2] == ("kanban", "boards")
+            and parts[3] == "kanban.db"
+        )
+
     def discover(self) -> list[Path]:
         return _discover_hermes_dbs()
 

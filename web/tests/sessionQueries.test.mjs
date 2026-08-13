@@ -8,8 +8,12 @@ import {
   SESSION_TREE_GC_TIME,
   SESSION_TREE_STALE_TIME,
   canPrefetchSessionDetail,
+  createMatchingPresenceRefreshGate,
+  createPresenceVersionGate,
+  createSessionPresenceRefreshScheduler,
   createSessionRangeWarmer,
   invalidateSessionDetailCache,
+  presenceMatchesSessionDetail,
   refreshActiveSessionQueries,
   sessionDetailQueryKey,
   sessionDetailQueryOptions,
@@ -56,6 +60,62 @@ test("detail intent never prefetches an unstable source snapshot", () => {
   assert.equal(canPrefetchSessionDetail(undefined), true);
 });
 
+test("detail prefetch keeps only hot stable source-backed transcripts", () => {
+  const now = () => Date.parse("2026-08-12T12:00:00.000Z");
+  const sourceBacked = (timestamps) => ({
+    transcript_storage: "source_backed",
+    ...timestamps,
+  });
+
+  assert.equal(
+    canPrefetchSessionDetail(
+      "stable",
+      sourceBacked({ activity_at: "2026-08-05T12:00:00.000Z" }),
+      now,
+    ),
+    true,
+  );
+  assert.equal(
+    canPrefetchSessionDetail(
+      "stable",
+      sourceBacked({ activity_at: "2026-08-05T11:59:59.999Z" }),
+      now,
+    ),
+    false,
+  );
+  assert.equal(
+    canPrefetchSessionDetail(
+      "stable",
+      sourceBacked({
+        activity_at: "not-a-date",
+        ended_at: "2026-08-12T11:00:00.000Z",
+      }),
+      now,
+    ),
+    true,
+  );
+  assert.equal(
+    canPrefetchSessionDetail(
+      "stable",
+      sourceBacked({ started_at: "2026-08-12T11:00:00.000Z" }),
+      now,
+    ),
+    true,
+  );
+  assert.equal(
+    canPrefetchSessionDetail("stable", sourceBacked({}), now),
+    false,
+  );
+  assert.equal(
+    canPrefetchSessionDetail(
+      "stable",
+      { transcript_storage: "legacy_materialized", started_at: "2020-01-01T00:00:00.000Z" },
+      now,
+    ),
+    true,
+  );
+});
+
 test("combined range request signal aborts when either owner aborts", () => {
   for (const owner of ["warmer", "react-query"]) {
     const warmer = new AbortController();
@@ -77,7 +137,7 @@ test("combined range request signal aborts when either owner aborts", () => {
   assert.equal(cleaned.signal.aborted, false);
 });
 
-test("ingest marks every cached session detail stale without refetching", async () => {
+test("presence marks every cached detail, including closed sessions, stale without refetching", async () => {
   const queryClient = new QueryClient();
   const first = sessionDetailQueryKey("t3code:first");
   const second = sessionDetailQueryKey("codex:second");
@@ -93,6 +153,35 @@ test("ingest marks every cached session detail stale without refetching", async 
     queryClient.getQueryState(["sessions", "24h"])?.isInvalidated,
     false,
   );
+});
+
+test("equal-generation presence heartbeats do not repeat session cache invalidation", async () => {
+  const queryClient = new QueryClient();
+  const key = sessionDetailQueryKey("t3code:closed");
+  const gate = createPresenceVersionGate();
+  const frame = (generation, ts) => ({
+    epoch: "watcher-a",
+    generation,
+    ts,
+  });
+  queryClient.setQueryData(key, { revision: 1 });
+
+  if (gate.accept(frame(4, "2026-08-13T10:00:00Z"))) {
+    await invalidateSessionDetailCache(queryClient);
+  }
+  assert.equal(queryClient.getQueryState(key)?.isInvalidated, true);
+  queryClient.setQueryData(key, { revision: 2 });
+  assert.equal(queryClient.getQueryState(key)?.isInvalidated, false);
+
+  if (gate.accept(frame(4, "2026-08-13T10:00:15Z"))) {
+    await invalidateSessionDetailCache(queryClient);
+  }
+  assert.equal(queryClient.getQueryState(key)?.isInvalidated, false);
+
+  if (gate.accept(frame(5, "2026-08-13T10:00:16Z"))) {
+    await invalidateSessionDetailCache(queryClient);
+  }
+  assert.equal(queryClient.getQueryState(key)?.isInvalidated, true);
 });
 
 test("ingest refetches the exact active transcript and branch tree", async () => {
@@ -163,6 +252,169 @@ class FakeClock {
   }
 }
 
+test("a relevant presence source refreshes the warm detail before ingest", async () => {
+  const clock = new FakeClock();
+  const queryClient = new QueryClient();
+  const sessionId = "t3code:logical-a";
+  let detailFetches = 0;
+  let treeFetches = 0;
+  const detailOptions = {
+    queryKey: sessionDetailQueryKey(sessionId),
+    queryFn: async () => ({ revision: ++detailFetches }),
+    staleTime: Infinity,
+  };
+  const treeOptions = {
+    queryKey: sessionTreeQueryKey(sessionId),
+    queryFn: async () => ({ revision: ++treeFetches }),
+    staleTime: Infinity,
+  };
+  await Promise.all([
+    queryClient.fetchQuery(detailOptions),
+    queryClient.fetchQuery(treeOptions),
+  ]);
+  const unsubscribeDetail = new QueryObserver(queryClient, detailOptions).subscribe(() => undefined);
+  const unsubscribeTree = new QueryObserver(queryClient, treeOptions).subscribe(() => undefined);
+  const detail = {
+    id: sessionId,
+    harness: "t3code",
+    runtime_harness: "codex",
+    external_id: "source-a",
+    transcript_session_id: "codex:source-a",
+  };
+  const scheduler = createSessionPresenceRefreshScheduler({
+    refresh: () => refreshActiveSessionQueries(queryClient, sessionId),
+    setTimeout: clock.setTimeout,
+    clearTimeout: clock.clearTimeout,
+  });
+
+  try {
+    const relevant = {
+      harness: "codex",
+      external_id: "source-a",
+      session_id: null,
+      source_path: "/tmp/source-a.jsonl",
+      state: "streaming",
+      last_activity_at: null,
+      age_seconds: 0,
+      pending_ingest: true,
+      title: null,
+      repo: null,
+    };
+    assert.equal(presenceMatchesSessionDetail(relevant, detail), true);
+    scheduler.schedule();
+    await clock.advance(299);
+    assert.equal(detailFetches, 1);
+    await clock.advance(1);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(detailFetches, 2);
+    assert.equal(treeFetches, 2);
+  } finally {
+    scheduler.cancel();
+    unsubscribeDetail();
+    unsubscribeTree();
+  }
+});
+
+test("unrelated presence does not refetch an open session", async () => {
+  const clock = new FakeClock();
+  const detail = {
+    id: "t3code:logical-a",
+    harness: "t3code",
+    runtime_harness: "codex",
+    external_id: "source-a",
+  };
+  let refreshes = 0;
+  const scheduler = createSessionPresenceRefreshScheduler({
+    refresh: () => { refreshes += 1; },
+    setTimeout: clock.setTimeout,
+    clearTimeout: clock.clearTimeout,
+  });
+  const unrelated = {
+    harness: "codex",
+    external_id: "worker-b",
+    session_id: "codex:worker-b",
+    logical_session_id: "t3code:logical-b",
+    source_path: "/tmp/worker-b.jsonl",
+    state: "tool_running",
+    last_activity_at: null,
+    age_seconds: 0,
+    pending_ingest: true,
+    title: null,
+    repo: null,
+  };
+
+  if (presenceMatchesSessionDetail(unrelated, detail)) scheduler.schedule();
+  await clock.advance(1_000);
+  assert.equal(refreshes, 0);
+});
+
+test("related presence frames coalesce into one detail refresh", async () => {
+  const clock = new FakeClock();
+  let refreshes = 0;
+  const scheduler = createSessionPresenceRefreshScheduler({
+    refresh: () => { refreshes += 1; },
+    setTimeout: clock.setTimeout,
+    clearTimeout: clock.clearTimeout,
+  });
+
+  scheduler.schedule();
+  await clock.advance(200);
+  scheduler.schedule();
+  await clock.advance(200);
+  scheduler.schedule();
+  await clock.advance(299);
+  assert.equal(refreshes, 0);
+  await clock.advance(1);
+  assert.equal(refreshes, 1);
+});
+
+test("matching detail refresh ignores heartbeats and unrelated generation changes", () => {
+  const gate = createMatchingPresenceRefreshGate();
+  const detail = {
+    id: "t3code:logical-a",
+    harness: "t3code",
+    runtime_harness: "codex",
+    external_id: "source-a",
+  };
+  const relevant = (lastActivityAt) => ({
+    harness: "codex",
+    external_id: "source-a",
+    session_id: "codex:source-a",
+    logical_session_id: "t3code:logical-a",
+    source_path: "/tmp/source-a.jsonl",
+    state: "streaming",
+    last_activity_at: lastActivityAt,
+    age_seconds: 0,
+    pending_ingest: true,
+    title: null,
+    repo: null,
+  });
+  const frame = (generation, ts, sessions) => ({
+    epoch: "watcher-a",
+    generation,
+    ts,
+    sessions,
+    transitions: [],
+  });
+
+  assert.equal(
+    gate.accept(frame(1, "2026-08-13T10:00:00Z", [relevant("2026-08-13T10:00:00Z")]), detail),
+    true,
+  );
+  assert.equal(
+    gate.accept(frame(1, "2026-08-13T10:00:15Z", [relevant("2026-08-13T10:00:00Z")]), detail),
+    false,
+  );
+  assert.equal(
+    gate.accept(frame(2, "2026-08-13T10:00:16Z", [relevant("2026-08-13T10:00:00Z")]), detail),
+    false,
+  );
+  assert.equal(
+    gate.accept(frame(3, "2026-08-13T10:00:17Z", [relevant("2026-08-13T10:00:17Z")]), detail),
+    true,
+  );
+});
+
 test("range warming waits for quiet time and aborts on ingest activity", async () => {
   const clock = new FakeClock();
   const warmer = createSessionRangeWarmer({
@@ -208,6 +460,68 @@ test("range warming switches epochs without retaining an old timer", async () =>
   warmer.schedule("new", async () => started.push("new"));
   await clock.advance(750);
   assert.deepEqual(started, ["new"]);
+});
+
+test("range warming retries the same key after a rejected fill", async () => {
+  const clock = new FakeClock();
+  const warmer = createSessionRangeWarmer({
+    now: clock.now,
+    setTimeout: clock.setTimeout,
+    clearTimeout: clock.clearTimeout,
+  });
+  let attempts = 0;
+
+  warmer.schedule("epoch-1", async () => {
+    attempts += 1;
+    throw new Error("temporary warm failure");
+  });
+  await clock.advance(750);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  warmer.schedule("epoch-1", async () => {
+    attempts += 1;
+  });
+  await clock.advance(750);
+
+  assert.equal(attempts, 2);
+});
+
+test("range warming retries a failed QueryClient fill for the same key", async () => {
+  const clock = new FakeClock();
+  const warmer = createSessionRangeWarmer({
+    now: clock.now,
+    setTimeout: clock.setTimeout,
+    clearTimeout: clock.clearTimeout,
+  });
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  const key = ["sessions", "7d"];
+  let fetches = 0;
+  const fill = () => queryClient.fetchQuery({
+    queryKey: key,
+    queryFn: async () => {
+      fetches += 1;
+      if (fetches === 1) throw new Error("temporary warm failure");
+      return { warmed: true };
+    },
+  });
+
+  warmer.schedule("epoch-1", async () => {
+    await fill();
+  });
+  await clock.advance(750);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(queryClient.getQueryState(key)?.status, "error");
+
+  warmer.schedule("epoch-1", async () => {
+    await fill();
+  });
+  await clock.advance(750);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(fetches, 2);
+  assert.deepEqual(queryClient.getQueryData(key), { warmed: true });
 });
 
 test("range warming cancel leaves no work after unmount", async () => {

@@ -295,18 +295,22 @@ export function fetchSummary(range: string) {
   }>("/api/summary", { range });
 }
 
-export function fetchTimeseries(range: string, by: "harness" | "model" = "harness") {
+export function fetchTimeseries(
+  range: string,
+  by: "harness" | "model" = "harness",
+  signal?: AbortSignal,
+) {
   return getJson<{
     series: Array<Record<string, string | number>>;
     note: string;
     by: string;
-  }>("/api/timeseries/sessions", { range, by });
+  }>("/api/timeseries/sessions", { range, by }, signal);
 }
 
 /** Per-harness split of a single model row — never its own chart row. */
 export type HarnessSplit = { harness: string; sessions: number };
 
-export function fetchModelMix(range: string) {
+export function fetchModelMix(range: string, signal?: AbortSignal) {
   return getJson<{
     title: string;
     subtitle: string;
@@ -339,10 +343,10 @@ export function fetchModelMix(range: string) {
       share: number;
     }>;
     profiles_note: string;
-  }>("/api/models", { range });
+  }>("/api/models", { range }, signal);
 }
 
-export function fetchModelMonthly(range: string) {
+export function fetchModelMonthly(range: string, signal?: AbortSignal) {
   return getJson<{
     series: Array<{
       month: string;
@@ -355,7 +359,7 @@ export function fetchModelMonthly(range: string) {
       }>;
     }>;
     note: string;
-  }>("/api/models/monthly", { range });
+  }>("/api/models/monthly", { range }, signal);
 }
 
 export function fetchTools(range: string, limit = 30) {
@@ -589,6 +593,7 @@ export function fetchSearch(
     cursor?: number;
     limit?: number;
   },
+  signal?: AbortSignal,
 ) {
   return getJson<{
     q: string;
@@ -626,10 +631,10 @@ export function fetchSearch(
     project: filters?.project,
     cursor: filters?.cursor != null ? String(filters.cursor) : undefined,
     limit: filters?.limit != null ? String(filters.limit) : undefined,
-  });
+  }, signal);
 }
 
-export function fetchOrchestration(range: string) {
+export function fetchOrchestration(range: string, signal?: AbortSignal) {
   return getJson<{
     supervisor_roots: number;
     child_sessions: number;
@@ -645,7 +650,7 @@ export function fetchOrchestration(range: string) {
       message_count: number;
     }>;
     note: string;
-  }>("/api/orchestration", { range });
+  }>("/api/orchestration", { range }, signal);
 }
 
 export function fetchSessionTree(sessionId: string, signal?: AbortSignal) {
@@ -690,7 +695,7 @@ export type TreeNode = SessionIdentityFields & {
   children: TreeNode[];
 };
 
-export function fetchAutoReview(range: string) {
+export function fetchAutoReview(range: string, signal?: AbortSignal) {
   return getJson<{
     total: number;
     by_model: Array<{
@@ -714,10 +719,10 @@ export function fetchAutoReview(range: string) {
       request_kind: string;
     }>;
     note: string;
-  }>("/api/auto-review", { range });
+  }>("/api/auto-review", { range }, signal);
 }
 
-export function fetchSkills(range: string) {
+export function fetchSkills(range: string, signal?: AbortSignal) {
   return getJson<{
     activations: number;
     distinct_fired: number;
@@ -729,7 +734,7 @@ export function fetchSkills(range: string) {
       sparkline?: number[];
     }>;
     note: string;
-  }>("/api/skills", { range });
+  }>("/api/skills", { range }, signal);
 }
 
 export type GraphSessionNode = {
@@ -780,8 +785,8 @@ export type GraphPayload = {
   note: string;
 };
 
-export function fetchGraph(range: string) {
-  return getJson<GraphPayload>("/api/graph", { range });
+export function fetchGraph(range: string, signal?: AbortSignal) {
+  return getJson<GraphPayload>("/api/graph", { range }, signal);
 }
 
 export type PresenceState =
@@ -829,6 +834,7 @@ export type LiveSession = {
 
 export type LivePayload = {
   ts: string | null;
+  epoch?: string | null;
   generation: number;
   active_seconds: number;
   working_grace_seconds?: number;
@@ -850,6 +856,7 @@ export type LivePayload = {
 
 export type PresenceEvent = {
   ts: string | null;
+  epoch?: string | null;
   generation: number;
   sessions: LiveSession[];
   transitions: Array<{ action: "active" | "idle" | string; key: string }>;
@@ -872,12 +879,12 @@ export type HealthPayload = {
   last_ingest_at?: string | null;
 };
 
-export function fetchLive() {
-  return getJson<LivePayload>("/api/live");
+export function fetchLive(signal?: AbortSignal) {
+  return getJson<LivePayload>("/api/live", undefined, signal);
 }
 
-export function fetchHealth() {
-  return getJson<HealthPayload>("/api/health");
+export function fetchHealth(signal?: AbortSignal) {
+  return getJson<HealthPayload>("/api/health", { derived: "false" }, signal);
 }
 
 export type AttentionItem = {
@@ -892,6 +899,14 @@ export type AttentionItem = {
   branch?: string | null;
 };
 
+export type AttentionTailSignalCoverage = {
+  eligible_sessions: number;
+  covered_sessions: number;
+  missing_sessions: number;
+  ignored_sessions: number;
+  complete: boolean;
+};
+
 export type AttentionPayload = {
   generated_at: string;
   count: number;
@@ -899,11 +914,28 @@ export type AttentionPayload = {
   resumable_count?: number;
   resumable?: AttentionItem[];
   stats?: Record<string, number>;
+  tail_signal_coverage?: AttentionTailSignalCoverage;
   thresholds?: Record<string, number>;
 };
 
 export function fetchAttention() {
   return getJson<AttentionPayload>("/api/attention");
+}
+
+export type OverviewPayload = {
+  summary: Awaited<ReturnType<typeof fetchSummary>>;
+  timeseries: Awaited<ReturnType<typeof fetchTimeseries>>;
+  models: Awaited<ReturnType<typeof fetchModelMix>>;
+  heatmap: Awaited<ReturnType<typeof fetchHeatmap>>;
+  projects: Awaited<ReturnType<typeof fetchProjects>>;
+  recent: Awaited<ReturnType<typeof fetchRecent>>;
+  tools: Awaited<ReturnType<typeof fetchTools>>;
+  kinds: Awaited<ReturnType<typeof fetchRequestKinds>>;
+  distributions: Awaited<ReturnType<typeof fetchDistributions>>;
+};
+
+export function fetchOverview(range: string, signal?: AbortSignal) {
+  return getJson<OverviewPayload>("/api/overview", { range }, signal);
 }
 
 export type IngestEvent = {
@@ -982,8 +1014,8 @@ export type InsightsPayload = {
   empty: { title: string; body: string; missing: string[] };
 };
 
-export function fetchInsights(range: string) {
-  return getJson<InsightsPayload>("/api/insights", { range });
+export function fetchInsights(range: string, signal?: AbortSignal) {
+  return getJson<InsightsPayload>("/api/insights", { range }, signal);
 }
 
 export type AdjudicationLabels = {
@@ -1072,7 +1104,7 @@ export type AdjudicationQueueResponse = {
   };
 };
 
-export function fetchAdjudicationTaxonomy() {
+export function fetchAdjudicationTaxonomy(signal?: AbortSignal) {
   return getJson<{
     human_present: TaxonomyOption[];
     turn_kind: TaxonomyOption[];
@@ -1080,17 +1112,17 @@ export function fetchAdjudicationTaxonomy() {
     agent_stance: TaxonomyOption[];
     prior_outcome: TaxonomyOption[];
     vague_key: string;
-  }>("/api/adjudication/taxonomy");
+  }>("/api/adjudication/taxonomy", undefined, signal);
 }
 
-export function fetchAdjudicationQueue(rebuild = false) {
+export function fetchAdjudicationQueue(rebuild = false, signal?: AbortSignal) {
   return getJson<AdjudicationQueueResponse>("/api/adjudication/queue", {
     rebuild: rebuild ? "true" : undefined,
-  });
+  }, signal);
 }
 
-export function fetchAdjudicationReport() {
-  return getJson<AdjudicationReport>("/api/adjudication/report");
+export function fetchAdjudicationReport(signal?: AbortSignal) {
+  return getJson<AdjudicationReport>("/api/adjudication/report", undefined, signal);
 }
 
 export async function postAdjudication(
@@ -1353,10 +1385,10 @@ export function normalizeProposalsPayload(raw: Partial<ProposalsPayload> & Recor
   };
 }
 
-export function fetchProposals(status?: string) {
+export function fetchProposals(status?: string, signal?: AbortSignal) {
   return getJson<Record<string, unknown>>("/api/proposals", {
     status: status && status !== "all" ? status : undefined,
-  }).then(normalizeProposalsPayload);
+  }, signal).then(normalizeProposalsPayload);
 }
 
 export async function postProposalDecision(

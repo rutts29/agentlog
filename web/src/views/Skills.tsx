@@ -6,6 +6,7 @@ import { LoadingOrb } from "@/components/LoadingOrb";
 import { Card, CardTitle, PanelCard } from "@/components/ui/card";
 import { MicroBars } from "@/components/ui/spark";
 import { formatDay } from "@/lib/utils";
+import { rangeViewQueryOptions } from "@/lib/viewQueries";
 
 type Ctx = { range: string };
 
@@ -26,10 +27,10 @@ function GatedChip() {
 
 export function Skills() {
   const { range } = useOutletContext<Ctx>();
-  const q = useQuery({
+  const q = useQuery(rangeViewQueryOptions({
     queryKey: ["skills", range],
-    queryFn: () => fetchSkills(range),
-  });
+    queryFn: (signal) => fetchSkills(range, signal),
+  }));
 
   if (q.isLoading) {
     return <LoadingOrb label="Reading skills" />;

@@ -8,6 +8,7 @@ import { LoadingOrb } from "@/components/LoadingOrb";
 import { PanelCard } from "@/components/ui/card";
 import { HarnessTag, ModelBadge, TranscriptStorageBadge } from "@/components/ui/badges";
 import { formatDayTime } from "@/lib/utils";
+import { rangeViewQueryOptions } from "@/lib/viewQueries";
 
 type Ctx = { range: string };
 
@@ -21,21 +22,21 @@ export function Search() {
   const project = params.get("project") ?? "";
   const cursor = Number(params.get("cursor") || "0");
 
-  const facets = useQuery({
+  const facets = useQuery(rangeViewQueryOptions({
     queryKey: ["facets", range],
-    queryFn: () => fetchFacets(range),
-  });
+    queryFn: (signal) => fetchFacets(range, undefined, signal),
+  }));
 
   const results = useQuery({
     queryKey: ["search", range, qParam, harness, model, project, cursor],
-    queryFn: () =>
+    queryFn: ({ signal }) =>
       fetchSearch(range, qParam, {
         harness: harness || undefined,
         model: model || undefined,
         project: project || undefined,
         cursor,
         limit: 40,
-      }),
+      }, signal),
     enabled: qParam.trim().length > 0,
   });
 

@@ -13,9 +13,9 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from agentlog.analysis.attention import (
-    _incomplete_todo_in_text,
-    derive_attention,
+from agentlog.analysis.attention import derive_attention
+from agentlog.analysis.attention_signals import (
+    incomplete_todo_in_text as _incomplete_todo_in_text,
 )
 from agentlog.session_identity import (
     explicit_worker_parent_ids,

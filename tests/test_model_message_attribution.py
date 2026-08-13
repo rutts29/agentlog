@@ -6,10 +6,12 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
+import agentlog.api.queries as queries_api
 from agentlog.api.descriptive import list_sessions_v2
 from agentlog.api.model_rollup import strict_message_model_sql
-from agentlog.api.queries import model_mix, models_profile
+from agentlog.api.queries import _aggregate_sessions, model_mix, models_profile
 from agentlog.api.ranges import TimeRange
 from agentlog.api.semantic import eligible_windows
 from agentlog.db.schema import connect, init_db
@@ -94,6 +96,62 @@ class ModelMessageAttributionTests(unittest.TestCase):
         for model in ("gpt-5.5", "grok-4.5", "(unknown)"):
             result = list_sessions_v2(self.conn, _tr(), model=[model])
             self.assertEqual([item["id"] for item in result["items"]], ["cursor:s1"])
+
+    def test_unfiltered_session_listing_skips_model_message_scan(self) -> None:
+        statements: list[str] = []
+        self.conn.set_trace_callback(statements.append)
+        try:
+            unfiltered = list_sessions_v2(self.conn, _tr())
+        finally:
+            self.conn.set_trace_callback(None)
+        self.assertEqual([item["id"] for item in unfiltered["items"]], ["cursor:s1"])
+        self.assertFalse(
+            any(
+                "from messages model_message" in statement.lower()
+                for statement in statements
+            )
+        )
+
+    def test_models_profile_reuses_logical_session_snapshot(self) -> None:
+        expected = model_mix(self.conn, _tr())
+        sessions = _aggregate_sessions(self.conn, _tr())
+        self.assertEqual(model_mix(self.conn, _tr(), sessions=sessions), expected)
+
+        statements: list[str] = []
+        self.conn.set_trace_callback(statements.append)
+        try:
+            profile = models_profile(self.conn, _tr())
+        finally:
+            self.conn.set_trace_callback(None)
+        self.assertEqual(
+            {item["model"] for item in profile["items"]},
+            {item["model"] for item in expected},
+        )
+        self.assertEqual(
+            sum(
+                "from session_links l" in statement.lower()
+                for statement in statements
+            ),
+            1,
+        )
+
+    def test_unavailable_model_cells_share_one_recent_root_snapshot(self) -> None:
+        with (
+            patch.object(queries_api, "count_ux_observations", return_value=1),
+            patch.object(
+                queries_api, "_recent_root_ids", return_value=["cursor:s1"]
+            ) as recent_roots,
+        ):
+            profile = models_profile(self.conn, _tr())
+
+        self.assertEqual(recent_roots.call_count, 1)
+        self.assertTrue(
+            all(
+                item["interaction_style"]["session_ids"] == ["cursor:s1"]
+                for item in profile["items"]
+                if item["model"] != "(unknown)"
+            )
+        )
 
     def test_performance_windows_follow_their_response_model(self) -> None:
         self.assertEqual(

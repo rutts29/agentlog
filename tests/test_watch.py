@@ -10,9 +10,12 @@ from pathlib import Path
 from unittest import mock
 
 from fastapi.testclient import TestClient
+from starlette.requests import Request
+from watchdog.events import FileMovedEvent
 
+from agentlog.analysis.windows import build_exchange_windows
 from agentlog.api.app import create_app
-from agentlog.db.repository import Repository
+from agentlog.db.repository import SOURCE_BACKED, Repository
 from agentlog.db.schema import connect, init_db
 from agentlog.ingest.base import TranscriptAdapter
 from agentlog.ingest.pipeline import (
@@ -27,7 +30,11 @@ from agentlog.normalize.models import (
     NormalizedSession,
     ParseResult,
 )
-from agentlog.watch.daemon import WatchDaemon, _WriteSerializedConnection
+from agentlog.watch.daemon import (
+    WatchDaemon,
+    _HarnessHandler,
+    _WriteSerializedConnection,
+)
 from agentlog.watch.debounce import Debouncer
 from agentlog.watch.events import list_ingest_events, record_ingest_event
 from agentlog.watch.sources import WatchSource
@@ -285,6 +292,37 @@ class EventsApiTests(unittest.TestCase):
         paths = create_app(self.db).openapi()["paths"]
         self.assertIn("/api/events/stream", paths)
 
+    def test_events_stream_honors_last_event_id(self) -> None:
+        from agentlog.api.events import events_stream
+
+        app = create_app(self.db)
+        request = Request(
+            {
+                "type": "http",
+                "asgi": {"version": "3.0"},
+                "http_version": "1.1",
+                "method": "GET",
+                "scheme": "http",
+                "path": "/api/events/stream",
+                "raw_path": b"/api/events/stream",
+                "query_string": b"",
+                "headers": [(b"last-event-id", b"41")],
+                "client": ("127.0.0.1", 123),
+                "server": ("127.0.0.1", 8787),
+                "app": app,
+            }
+        )
+        with mock.patch(
+            "agentlog.api.events.iter_event_sse",
+            return_value=iter(()),
+        ) as stream:
+            events_stream(request, since="2026-08-12T10:00:00+00:00")
+        stream.assert_called_once_with(
+            self.db,
+            since="2026-08-12T10:00:00+00:00",
+            after_id=41,
+        )
+
 
 class WatchDaemonIngestTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -344,6 +382,55 @@ class WatchDaemonIngestTests(unittest.TestCase):
         self.assertEqual(second.parsed, 0)
         self.assertEqual(second.appended, 0)
         self.assertGreaterEqual(second.skipped, 1)
+
+    def test_startup_skip_never_derives_or_hydrates_cold_source(self) -> None:
+        path = self.sessions / "rollout-cold-startup.jsonl"
+        path.write_text(_codex_jsonl("cold-startup"), encoding="utf-8")
+        daemon = WatchDaemon(
+            db_path=self.db,
+            sources=[WatchSource("codex", self.sessions, poll=False)],
+            debounce_seconds=0,
+            use_watchdog=False,
+        )
+        with mock.patch(
+            "agentlog.ingest.codex.CODEX_SESSIONS_DIR", self.sessions
+        ):
+            first = daemon._run_ingest("codex")
+            self.assertTrue(first)
+            conn = connect(self.db)
+            try:
+                session = conn.execute(
+                    "SELECT id FROM sessions WHERE id = 'codex:cold-startup'"
+                ).fetchone()
+                messages = conn.execute(
+                    "SELECT id FROM messages WHERE session_id = 'codex:cold-startup' "
+                    "ORDER BY seq"
+                ).fetchall()
+                self.assertIsNotNone(session)
+                self.assertEqual(len(messages), 1)
+                response_id = "codex:cold-startup:m:2"
+                conn.execute(
+                    "INSERT INTO messages (id, session_id, seq, role, text, "
+                    "content_hash) VALUES (?, ?, 2, 'assistant', '', 'cold-response')",
+                    (response_id, str(session["id"])),
+                )
+                Repository(conn).replace_exchange_windows(
+                    str(session["id"]),
+                    [(str(messages[0]["id"]), response_id, "cold")],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            with mock.patch.object(daemon, "_run_derive") as derive, mock.patch(
+                "agentlog.analysis.extractors.deterministic.CachedSourceTranscriptReader"
+            ) as reader:
+                worker = daemon._schedule_ingest("codex")
+                assert worker is not None
+                worker.join(timeout=2.0)
+                self.assertFalse(worker.is_alive())
+
+        derive.assert_not_called()
+        reader.assert_not_called()
 
     def test_changed_path_ingest_does_not_discover_other_artifacts(self) -> None:
         changed = self.sessions / "rollout-changed.jsonl"
@@ -507,28 +594,339 @@ class WatchDaemonIngestTests(unittest.TestCase):
         self.assertEqual(sqlite_stats.failed, 0)
         ingest_one.assert_not_called()
 
-    def test_cursor_state_change_refreshes_all_transcripts(self) -> None:
+    def test_cursor_state_change_reconciles_metadata_without_reparsing(self) -> None:
         state = self.root / "state.vscdb"
-        transcript = self.sessions / "composer.jsonl"
-        state.write_bytes(b"state")
-        transcript.write_text("{}\n", encoding="utf-8")
+        composer_id = "cursor-metadata-control"
+        old_metadata = {
+            "modelConfig": {
+                "modelName": "old-model",
+                "selectedModels": [
+                    {"parameters": [{"id": "effort", "value": "low"}]}
+                ],
+            },
+            "trackedGitRepos": [
+                {
+                    "branches": [
+                        {"branchName": "old-branch", "lastInteractionAt": 1}
+                    ]
+                }
+            ],
+        }
+        new_metadata = {
+            "modelConfig": {
+                "modelName": "new-model",
+                "selectedModels": [
+                    {"parameters": [{"id": "effort", "value": "high"}]}
+                ],
+            },
+            "trackedGitRepos": [
+                {
+                    "branches": [
+                        {"branchName": "new-branch", "lastInteractionAt": 2}
+                    ]
+                }
+            ],
+        }
+        state_conn = sqlite3.connect(state)
+        state_conn.execute(
+            "CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value BLOB)"
+        )
+        state_conn.execute(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            (f"composerData:{composer_id}", json.dumps(old_metadata)),
+        )
+        state_conn.commit()
+        state_conn.execute(
+            "UPDATE cursorDiskKV SET value = ? WHERE key = ?",
+            (json.dumps(new_metadata), f"composerData:{composer_id}"),
+        )
+        state_conn.commit()
+        state_conn.close()
         conn = connect(self.db)
         try:
             repo = Repository(conn)
-            with mock.patch(
-                "agentlog.ingest.cursor.CursorAdapter.discover",
-                return_value=[transcript],
-            ) as discover, mock.patch(
-                "agentlog.ingest.pipeline._ingest_one"
-            ) as ingest_one:
-                stats = ingest_harness(
-                    repo, "cursor", changed_paths=[str(state)]
-                )
+            artifact_id = repo.upsert_artifact(
+                harness="cursor",
+                path=str(self.sessions / "original.jsonl"),
+                size=42,
+                mtime_ns=1,
+                content_hash="source-checkpoint",
+                parsed_offset=42,
+                parser_version="15",
+                transcript_storage=SOURCE_BACKED,
+            )
+            session_id = repo.save_parse_result(
+                artifact_id=artifact_id,
+                result=ParseResult(
+                    session=NormalizedSession(
+                        harness=Harness.CURSOR,
+                        external_id=composer_id,
+                        model="old-model",
+                        effort="low",
+                        effort_source="low",
+                        branch="old-branch",
+                    ),
+                    messages=[
+                        NormalizedMessage(
+                            seq=1,
+                            role="user",
+                            text="stored request",
+                            content_hash="request-checkpoint",
+                        ),
+                        NormalizedMessage(
+                            seq=2,
+                            role="assistant",
+                            model="message-model",
+                            text="stored transcript text",
+                            content_hash="message-checkpoint",
+                        )
+                    ],
+                ),
+                append=False,
+                transcript_storage=SOURCE_BACKED,
+            )
+            repo.replace_exchange_windows(
+                session_id, build_exchange_windows(repo.list_messages(session_id))
+            )
+            conn.commit()
         finally:
             conn.close()
-        self.assertEqual(stats.failed, 0)
-        discover.assert_called_once_with()
-        ingest_one.assert_called_once()
+
+        daemon = WatchDaemon(
+            db_path=self.db,
+            sources=[
+                WatchSource("cursor", self.sessions, poll=False),
+                WatchSource("cursor", state, poll=True),
+            ],
+            debounce_seconds=0,
+            use_watchdog=False,
+        )
+        daemon._note_change("cursor", str(state))
+        with mock.patch(
+            "agentlog.ingest.cursor.CursorAdapter.discover",
+            side_effect=AssertionError("state control must not discover transcripts"),
+        ), mock.patch(
+            "agentlog.ingest.pipeline._ingest_one",
+            side_effect=AssertionError("state control must not parse transcripts"),
+        ):
+            self.assertTrue(daemon._run_ingest("cursor"))
+
+        conn = connect(self.db)
+        try:
+            session = conn.execute(
+                """
+                SELECT model, model_canonical, provider, agent_profile,
+                       effort, effort_source, branch, artifact_id,
+                       transcript_storage
+                FROM sessions WHERE id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+            message = conn.execute(
+                """
+                SELECT model, text, content_hash FROM messages
+                WHERE session_id = ? AND seq = 2
+                """,
+                (session_id,),
+            ).fetchone()
+            artifact = conn.execute(
+                "SELECT content_hash, parsed_offset FROM artifacts WHERE id = ?",
+                (artifact_id,),
+            ).fetchone()
+            window_count = conn.execute(
+                "SELECT COUNT(*) AS c FROM exchange_windows WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            events = list_ingest_events(conn)
+        finally:
+            conn.close()
+        assert session is not None
+        assert message is not None
+        assert artifact is not None
+        assert window_count is not None
+        self.assertEqual(
+            (session["model"], session["effort"], session["effort_source"], session["branch"]),
+            ("new-model", "high", "high", "new-branch"),
+        )
+        self.assertEqual(
+            (session["model_canonical"], session["provider"], session["agent_profile"]),
+            ("new-model", None, None),
+        )
+        self.assertEqual(session["artifact_id"], artifact_id)
+        self.assertEqual(session["transcript_storage"], SOURCE_BACKED)
+        self.assertEqual(
+            (message["model"], message["text"], message["content_hash"]),
+            ("message-model", "", "message-checkpoint"),
+        )
+        self.assertEqual((artifact["content_hash"], artifact["parsed_offset"]), ("source-checkpoint", 42))
+        self.assertEqual(int(window_count["c"]), 1)
+        self.assertEqual(events[-1].sessions_updated, 1)
+
+    def test_cursor_configured_state_event_passes_metadata_control_path(self) -> None:
+        state = self.root / "state.vscdb"
+        state.write_bytes(b"state")
+        outside = self.root / "outside" / "state.vscdb"
+        outside.parent.mkdir()
+        outside.write_bytes(b"outside")
+        wal = Path(f"{state}-wal")
+        wal.write_bytes(b"wal")
+        deleted = self.root / "deleted.vscdb"
+        daemon = WatchDaemon(
+            db_path=self.db,
+            sources=[
+                WatchSource("cursor", self.sessions, poll=False),
+                WatchSource("cursor", state, poll=True),
+            ],
+            debounce_seconds=0,
+            use_watchdog=False,
+        )
+
+        daemon._note_change("cursor", str(state))
+        with mock.patch(
+            "agentlog.watch.daemon.ingest_harness",
+            return_value=IngestStats(skipped=1),
+        ) as ingest:
+            self.assertTrue(daemon._run_ingest("cursor"))
+        self.assertEqual(
+            ingest.call_args.kwargs["changed_paths"], []
+        )
+        self.assertEqual(
+            ingest.call_args.kwargs["cursor_metadata_state_db"], state.resolve()
+        )
+
+        state.unlink()
+        daemon._note_change("cursor", str(outside))
+        daemon._note_change("cursor", str(wal))
+        daemon._note_change("cursor", str(deleted))
+        daemon._note_change("cursor", str(state))
+        with mock.patch("agentlog.watch.daemon.ingest_harness") as ingest:
+            self.assertFalse(daemon._run_ingest("cursor"))
+        ingest.assert_not_called()
+
+    def test_cursor_watch_paths_require_transcript_grammar(self) -> None:
+        projects = self.root / "cursor-projects"
+        main = projects / "project" / "agent-transcripts" / "root.jsonl"
+        subagent = (
+            projects
+            / "project"
+            / "agent-transcripts"
+            / "parent"
+            / "subagents"
+            / "child.jsonl"
+        )
+        unrelated = projects / "project" / "notes" / "unrelated.jsonl"
+        root_noise = projects / "unrelated.jsonl"
+        outside = self.root / "outside.jsonl"
+        for path in (main, subagent, unrelated, root_noise, outside):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("{}\n", encoding="utf-8")
+        escaped = projects / "project" / "agent-transcripts" / "escaped.jsonl"
+        escaped.symlink_to(outside)
+        daemon = WatchDaemon(
+            db_path=self.db,
+            sources=[WatchSource("cursor", projects, poll=False)],
+            debounce_seconds=0,
+            use_watchdog=False,
+        )
+
+        accepted = daemon._canonical_changed_paths(
+            "cursor",
+            [str(main), str(subagent), str(unrelated), str(root_noise), str(escaped)],
+        )
+
+        self.assertEqual(accepted, sorted([str(main.resolve()), str(subagent.resolve())]))
+
+    def test_t3_watch_paths_require_state_database_grammar(self) -> None:
+        root = self.root / "t3"
+        direct = root / "state.sqlite"
+        nested = root / "userdata" / "state.sqlite"
+        unrelated = root / "other" / "state.sqlite"
+        for path in (direct, nested, unrelated):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"sqlite")
+        daemon = WatchDaemon(
+            db_path=self.db,
+            sources=[WatchSource("t3code", root, poll=False)],
+            debounce_seconds=0,
+            use_watchdog=False,
+        )
+
+        accepted = daemon._canonical_changed_paths(
+            "t3code", [str(direct), str(nested), str(unrelated)]
+        )
+
+        self.assertEqual(accepted, sorted([str(direct.resolve()), str(nested.resolve())]))
+
+    def test_hermes_watch_paths_require_board_kanban_grammar(self) -> None:
+        root = self.root / "hermes"
+        state = root / "state.db"
+        kanban = root / "kanban.db"
+        board = root / "kanban" / "boards" / "board-a" / "kanban.db"
+        unrelated = root / "kanban" / "boards" / "board-a" / "other.db"
+        nested = root / "kanban" / "boards" / "board-a" / "nested" / "kanban.db"
+        for path in (state, kanban, board, unrelated, nested):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"sqlite")
+        daemon = WatchDaemon(
+            db_path=self.db,
+            sources=[WatchSource("hermes", root, poll=False)],
+            debounce_seconds=0,
+            use_watchdog=False,
+        )
+
+        accepted = daemon._canonical_changed_paths(
+            "hermes", [str(state), str(kanban), str(board), str(unrelated), str(nested)]
+        )
+
+        self.assertEqual(
+            accepted,
+            sorted([str(state.resolve()), str(kanban.resolve()), str(board.resolve())]),
+        )
+
+    def test_moved_watch_event_notes_source_and_destination(self) -> None:
+        changes: list[tuple[str, str]] = []
+        handler = _HarnessHandler("codex", lambda harness, path: changes.append((harness, path)))
+        handler.dispatch(FileMovedEvent("/tmp/old.jsonl", "/tmp/new.jsonl"))
+
+        self.assertEqual(
+            changes,
+            [("codex", "/tmp/old.jsonl"), ("codex", "/tmp/new.jsonl")],
+        )
+
+    def test_poll_loop_does_not_clear_pending_watchdog_change(self) -> None:
+        path = self.sessions / "rollout-race.jsonl"
+        path.write_text(_codex_jsonl("race"), encoding="utf-8")
+        daemon = WatchDaemon(
+            db_path=self.db,
+            sources=[WatchSource("codex", self.sessions, poll=True)],
+            debounce_seconds=0,
+            use_watchdog=False,
+        )
+        daemon._note_change("codex", str(path))
+        daemon.request_stop()
+
+        daemon._poll_loop()
+
+        self.assertEqual(daemon._take_changed("codex"), [str(path)])
+
+    def test_directory_poll_detects_hermes_board_wal_only_change(self) -> None:
+        boards = self.root / "hermes" / "kanban" / "boards"
+        board_db = boards / "board-a" / "kanban.db"
+        board_db.parent.mkdir(parents=True)
+        board_db.write_bytes(b"sqlite")
+        daemon = WatchDaemon(
+            db_path=self.db,
+            sources=[WatchSource("hermes", boards, poll=True)],
+            debounce_seconds=0,
+            use_watchdog=False,
+        )
+        daemon._poll_once(emit_changes=False)
+        wal = Path(f"{board_db}-wal")
+        wal.write_bytes(b"wal")
+
+        daemon._poll_once()
+
+        self.assertEqual(daemon._take_changed("hermes"), [str(board_db)])
 
     def test_cursor_jsonl_change_stays_exactly_scoped(self) -> None:
         transcript = self.sessions / "composer.jsonl"
@@ -737,7 +1135,7 @@ class WatchDaemonIngestTests(unittest.TestCase):
 
         def fail_then_succeed(_repo: Repository, _harness: str) -> IngestStats:
             if recovered.is_set():
-                return IngestStats(skipped=1)
+                return IngestStats(changed_window_ids={"changed-window"})
             recovered.set()
             return IngestStats(failed=1)
 
@@ -1148,7 +1546,9 @@ class WatchDaemonIngestTests(unittest.TestCase):
             use_watchdog=False,
         )
 
-        def slow_first_derive(_harnesses: tuple[str, ...]) -> None:
+        def slow_first_derive(
+            _harnesses: tuple[str, ...], *, window_ids: set[str] | None = None
+        ) -> None:
             nonlocal derive_calls
             derive_calls += 1
             if derive_calls == 1:
@@ -1157,7 +1557,10 @@ class WatchDaemonIngestTests(unittest.TestCase):
 
         with mock.patch(
             "agentlog.watch.daemon.ingest_harness",
-            return_value=IngestStats(skipped=1),
+            side_effect=[
+                IngestStats(changed_window_ids={"codex-window"}),
+                IngestStats(changed_window_ids={"t3-window"}),
+            ],
         ), mock.patch.object(
             daemon, "_run_derive", side_effect=slow_first_derive
         ):

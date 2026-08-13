@@ -110,6 +110,215 @@ class AttentionDerivationTests(unittest.TestCase):
         self.assertEqual(wait.lane, "urgent")
         self.assertIn("Which approach should I take?", wait.reason)
 
+    def test_source_backed_tail_fact_needs_no_source_read(self) -> None:
+        self._session(
+            "codex:source-question",
+            started="2026-08-09T08:00:00+00:00",
+            ended="2026-08-09T09:00:00+00:00",
+            repo="demo/source",
+        )
+        self.conn.execute(
+            """
+            UPDATE sessions SET
+                transcript_storage = 'source_backed',
+                attention_final_question = 1,
+                attention_incomplete_todo = 0,
+                attention_last_plan_open = 0,
+                attention_tail_revision = 1
+            WHERE id = 'codex:source-question'
+            """
+        )
+        self.conn.execute(
+            """
+            INSERT INTO messages (id, session_id, seq, role, timestamp, text)
+            VALUES ('source-q', 'codex:source-question', 1, 'assistant',
+                    '2026-08-09T09:00:00+00:00', '')
+            """
+        )
+        self.conn.commit()
+
+        items = self._derive()
+        item = next(i for i in items if i.session_id == "codex:source-question")
+        self.assertEqual(item.state, "waiting_on_user")
+        self.assertNotIn("canonical source", item.reason)
+
+    def test_known_source_divergence_skips_only_that_tail_signal(self) -> None:
+        self._session(
+            "codex:source-diverged",
+            started="2026-08-09T08:00:00+00:00",
+            ended="2026-08-09T09:00:00+00:00",
+            repo="demo/source",
+        )
+        self.conn.execute(
+            """
+            UPDATE sessions SET
+                transcript_storage = 'source_backed',
+                source_sync_status = 'source_changed',
+                attention_final_question = 1,
+                attention_tail_revision = 1
+            WHERE id = 'codex:source-diverged'
+            """
+        )
+        self.conn.execute(
+            """
+            INSERT INTO messages (id, session_id, seq, role, timestamp, text)
+            VALUES ('source-d', 'codex:source-diverged', 1, 'assistant',
+                    '2026-08-09T09:00:00+00:00', '')
+            """
+        )
+        self._session(
+            "codex:healthy",
+            started="2026-08-09T08:00:00+00:00",
+            ended="2026-08-09T09:00:00+00:00",
+        )
+        self.conn.execute(
+            """
+            INSERT INTO messages (id, session_id, seq, role, timestamp, text)
+            VALUES ('healthy-q', 'codex:healthy', 1, 'assistant',
+                    '2026-08-09T09:00:00+00:00', 'Should I continue?')
+            """
+        )
+        self.conn.commit()
+
+        items = self._derive()
+        self.assertNotIn("codex:source-diverged", {item.session_id for item in items})
+        self.assertIn("codex:healthy", {item.session_id for item in items})
+
+    def test_api_isolated_from_missing_source_backed_artifact(self) -> None:
+        self._session(
+            "codex:source-missing",
+            started="2026-08-09T08:00:00+00:00",
+            ended="2026-08-09T09:00:00+00:00",
+        )
+        self.conn.execute(
+            """
+            UPDATE sessions SET
+                transcript_storage = 'source_backed',
+                attention_final_question = 1,
+                attention_tail_revision = 1
+            WHERE id = 'codex:source-missing'
+            """
+        )
+        self.conn.execute(
+            """
+            INSERT INTO messages (id, session_id, seq, role, timestamp, text)
+            VALUES ('source-missing', 'codex:source-missing', 1, 'assistant',
+                    '2026-08-09T09:00:00+00:00', '')
+            """
+        )
+        self.conn.commit()
+
+        response = TestClient(create_app(self.path)).get("/api/attention")
+        self.assertEqual(response.status_code, 200)
+
+    def test_tail_signal_coverage_reports_partial_source_backfill(self) -> None:
+        self._session(
+            "codex:source-current",
+            started="2026-08-09T08:00:00+00:00",
+            ended="2026-08-09T09:00:00+00:00",
+        )
+        self._session(
+            "codex:source-pending",
+            started="2026-08-09T08:00:00+00:00",
+            ended="2026-08-09T09:00:00+00:00",
+        )
+        self.conn.execute(
+            """
+            UPDATE sessions SET
+                transcript_storage = 'source_backed',
+                attention_tail_revision = 1
+            WHERE id = 'codex:source-current'
+            """
+        )
+        self.conn.execute(
+            """
+            UPDATE sessions SET transcript_storage = 'source_backed'
+            WHERE id = 'codex:source-pending'
+            """
+        )
+        self.conn.commit()
+
+        before = self.conn.total_changes
+        payload = attention_payload(
+            self.conn, now=self.now, presence_path=self.presence_path
+        )
+
+        self.assertEqual(
+            payload["tail_signal_coverage"],
+            {
+                "eligible_sessions": 2,
+                "covered_sessions": 1,
+                "missing_sessions": 1,
+                "ignored_sessions": 0,
+                "complete": False,
+            },
+        )
+        self.assertEqual(self.conn.total_changes, before)
+
+    def test_tail_signal_coverage_uses_visible_current_logical_sessions(self) -> None:
+        self._session(
+            "t3code:root",
+            started="2026-08-09T08:00:00+00:00",
+            ended="2026-08-09T10:00:00+00:00",
+            harness="t3code",
+        )
+        self._session(
+            "codex:backing",
+            started="2026-08-09T08:01:00+00:00",
+            ended="2026-08-09T10:00:00+00:00",
+        )
+        self._session(
+            "codex:pending",
+            started="2026-08-09T08:00:00+00:00",
+            ended="2026-08-09T10:00:00+00:00",
+        )
+        self._session(
+            "codex:unverified",
+            started="2026-08-09T08:00:00+00:00",
+            ended="2026-08-09T10:00:00+00:00",
+        )
+        self._session(
+            "codex:old",
+            started="2026-07-01T08:00:00+00:00",
+            ended="2026-07-01T10:00:00+00:00",
+        )
+        self.conn.executescript(
+            """
+            INSERT INTO session_links
+              (source_session_id, target_session_id, link_type,
+               target_harness, target_external_id, link_role, confidence, evidence_json)
+            VALUES
+              ('t3code:root', 'codex:backing', 'provider_backing',
+               'codex', 'backing', 'root', 'observed', '{}');
+            UPDATE sessions SET
+              transcript_storage = 'source_backed', attention_tail_revision = 1
+            WHERE id = 'codex:backing';
+            UPDATE sessions SET transcript_storage = 'source_backed'
+            WHERE id IN ('codex:pending', 'codex:old');
+            UPDATE sessions SET
+              transcript_storage = 'source_backed',
+              source_sync_status = 'source_changed',
+              attention_tail_revision = 1
+            WHERE id = 'codex:unverified';
+            """
+        )
+        self.conn.commit()
+
+        payload = attention_payload(
+            self.conn, now=self.now, presence_path=self.presence_path
+        )
+
+        self.assertEqual(
+            payload["tail_signal_coverage"],
+            {
+                "eligible_sessions": 2,
+                "covered_sessions": 1,
+                "missing_sessions": 1,
+                "ignored_sessions": 1,
+                "complete": False,
+            },
+        )
+
     def test_t3_root_uses_backing_metrics_and_keeps_worker_visible(self) -> None:
         self._session(
             "t3code:root",

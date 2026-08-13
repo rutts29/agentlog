@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 import sqlite3
 from collections.abc import Iterable, Mapping
+from pathlib import Path
+from threading import Event
 from typing import Any, Protocol
 
 from agentlog.api.identity_aggregates import (
@@ -12,11 +14,14 @@ from agentlog.api.identity_aggregates import (
     visible_logical_sessions,
 )
 from agentlog.api.ranges import TimeRange, session_time_clause
+from agentlog.ingest.base import is_sqlite_path
 from agentlog.normalize.model_identity import display_model
 
 _FTS_TOKEN_RE = re.compile(r"[A-Za-z0-9_./+-]+")
+_JSONL_PREFILTER_TOKEN_RE = re.compile(r"[A-Za-z0-9_]+\Z")
 DEFAULT_SOURCE_SCAN_LIMIT = 200
 MAX_SOURCE_SCAN_LIMIT = 1000
+DEFAULT_SOURCE_SCAN_WORKERS = 1
 
 
 class SourceReader(Protocol):
@@ -196,13 +201,20 @@ def _scan_source_session(
     query_tokens: list[str],
     *,
     max_messages: int,
-) -> tuple[list[Mapping[str, Any]], Mapping[str, Any], bool]:
+    cancelled: Event | None = None,
+) -> tuple[list[Mapping[str, Any]], Mapping[str, Any], bool, bool]:
+    if cancelled is not None and cancelled.is_set():
+        return [], {}, False, True
     messages, metadata = _reader_result(source_reader, conn, session_id)
+    if cancelled is not None and cancelled.is_set():
+        return [], metadata, False, True
     if str(metadata.get("status") or "") != "ready":
-        return [], metadata, False
+        return [], metadata, False, False
     truncated = len(messages) > max_messages
     hits: list[Mapping[str, Any]] = []
     for message in messages[:max_messages]:
+        if cancelled is not None and cancelled.is_set():
+            return [], metadata, truncated, True
         text = str(message.get("text") or "")
         folded = text.casefold()
         if not all(token.casefold() in folded for token in query_tokens):
@@ -236,7 +248,150 @@ def _scan_source_session(
                 "source_hash": metadata.get("source_hash"),
             }
         )
-    return hits, metadata, truncated
+    return hits, metadata, truncated, False
+
+
+def _jsonl_might_contain_tokens(
+    path: Path,
+    query_tokens: list[str],
+    *,
+    cancelled: Event | None,
+) -> bool | None:
+    """Return False only when an ASCII query cannot occur in a stable JSONL file."""
+    try:
+        encoded = {token.lower().encode("ascii") for token in query_tokens}
+    except UnicodeEncodeError:
+        return True
+    if any(_JSONL_PREFILTER_TOKEN_RE.fullmatch(token) is None for token in query_tokens):
+        return True
+    if not encoded or is_sqlite_path(path):
+        return True
+    try:
+        before = path.stat()
+        found: set[bytes] = set()
+        carry = b""
+        saw_unicode_escape = False
+        overlap = max(map(len, encoded)) - 1
+        carry_len = max(overlap, 1)
+        with path.open("rb") as source:
+            while chunk := source.read(1024 * 1024):
+                if cancelled is not None and cancelled.is_set():
+                    return None
+                folded = (carry + chunk).lower()
+                saw_unicode_escape = saw_unicode_escape or b"\\u" in folded
+                found.update(token for token in encoded - found if token in folded)
+                if found == encoded:
+                    return True
+                carry = folded[-carry_len:]
+        after = path.stat()
+    except OSError:
+        return True
+    identity = lambda stat: (
+        stat.st_dev,
+        stat.st_ino,
+        stat.st_size,
+        stat.st_mtime_ns,
+        stat.st_ctime_ns,
+    )
+    if identity(before) != identity(after):
+        return True
+    if saw_unicode_escape:
+        return True
+    return False
+
+
+def _source_candidate_ids(
+    conn: sqlite3.Connection,
+    sessions: list[VisibleLogicalSession],
+    metrics: Mapping[str, sqlite3.Row],
+    query_tokens: list[str],
+    *,
+    cancelled: Event | None,
+) -> set[str] | None:
+    source_ids = sorted({
+        session.metric_session_id
+        if metrics.get(session.metric_session_id) is not None
+        and metrics[session.metric_session_id]["transcript_storage"] == "source_backed"
+        else session.session_id
+        for session in sessions
+    })
+    if not source_ids:
+        return set()
+    placeholders = ",".join("?" for _ in source_ids)
+    rows = conn.execute(
+        f"""
+        SELECT s.id, a.path
+        FROM sessions s
+        LEFT JOIN artifacts a ON a.id = s.artifact_id
+        WHERE s.id IN ({placeholders})
+        """,
+        source_ids,
+    ).fetchall()
+    candidates: set[str] = set()
+    for row in rows:
+        if cancelled is not None and cancelled.is_set():
+            return None
+        path = Path(str(row["path"])) if row["path"] else None
+        if path is None or _jsonl_might_contain_tokens(
+            path, query_tokens, cancelled=cancelled
+        ) is not False:
+            candidates.add(str(row["id"]))
+    return candidates
+
+
+def _scan_source_sessions(
+    source_reader: SourceReader | Any,
+    conn: sqlite3.Connection,
+    sessions: list[VisibleLogicalSession],
+    metrics: Mapping[str, sqlite3.Row],
+    query_tokens: list[str],
+    *,
+    workers: int,
+    cancelled: Event | None,
+) -> list[tuple[VisibleLogicalSession, list[Mapping[str, Any]], Mapping[str, Any], bool]]:
+    def scan(scan_conn: sqlite3.Connection, session: VisibleLogicalSession):
+        metric = metrics.get(session.metric_session_id)
+        source_id = (
+            session.metric_session_id
+            if metric is not None and metric["transcript_storage"] == "source_backed"
+            else session.session_id
+        )
+        hits, metadata, message_truncated, scan_cancelled = _scan_source_session(
+            source_reader,
+            scan_conn,
+            source_id,
+            query_tokens,
+            max_messages=5000,
+            cancelled=cancelled,
+        )
+        if scan_cancelled:
+            return None
+        return session, hits, metadata, message_truncated
+
+    if workers != 1:
+        raise ValueError("source scan workers must be one to avoid competing with metadata requests")
+    candidate_ids = _source_candidate_ids(
+        conn, sessions, metrics, query_tokens, cancelled=cancelled
+    )
+    if candidate_ids is None:
+        return []
+    results = []
+    for session in sessions:
+        if cancelled is not None and cancelled.is_set():
+            break
+        metric = metrics.get(session.metric_session_id)
+        source_id = (
+            session.metric_session_id
+            if metric is not None and metric["transcript_storage"] == "source_backed"
+            else session.session_id
+        )
+        if source_id not in candidate_ids:
+            continue
+        scanned = scan(conn, session)
+        if scanned is None:
+            break
+        results.append(scanned)
+    return results
 
 
 def search_messages(
@@ -251,6 +406,8 @@ def search_messages(
     limit: int = 40,
     source_reader: SourceReader | None = None,
     source_scan_limit: int = DEFAULT_SOURCE_SCAN_LIMIT,
+    source_scan_workers: int = DEFAULT_SOURCE_SCAN_WORKERS,
+    cancelled: Event | None = None,
 ) -> dict[str, Any]:
     match = fts_match_query(q)
     if match is None:
@@ -268,6 +425,9 @@ def search_messages(
     metrics = _metric_rows(conn, visible)
     visible = _filter_sessions(visible, metrics, harness=harness, model=model, project=project)
     by_id = {session.session_id: session for session in visible}
+    visible_by_metric: dict[str, VisibleLogicalSession] = {}
+    for session in visible:
+        visible_by_metric.setdefault(session.metric_session_id, session)
     source_sessions = [
         session
         for session in visible
@@ -300,7 +460,7 @@ def search_messages(
             params,
         ).fetchall()
         for row in rows:
-            session = next((item for item in visible if item.metric_session_id == str(row["session_id"])), None)
+            session = visible_by_metric.get(str(row["session_id"]))
             if session is None:
                 continue
             item = {
@@ -338,28 +498,25 @@ def search_messages(
         scan_limit = max(1, min(int(source_scan_limit), MAX_SOURCE_SCAN_LIMIT))
         ordered = sorted(
             source_sessions,
-            key=lambda session: (
-                not _metadata_matches(session.row, q),
-                str(session.row["started_at"] or ""),
-            ),
+            key=lambda session: str(session.row["started_at"] or ""),
+            reverse=True,
         )
+        ordered.sort(key=lambda session: not _metadata_matches(session.row, q))
         selected = ordered[:scan_limit]
         source_truncated = len(selected) < len(ordered)
         query_tokens = _FTS_TOKEN_RE.findall(q)[:24]
-        for session in selected:
-            metric = metrics.get(session.metric_session_id)
-            source_id = (
-                session.metric_session_id
-                if metric is not None and metric["transcript_storage"] == "source_backed"
-                else session.session_id
-            )
-            hits, metadata, message_truncated = _scan_source_session(
-                source_reader,
-                conn,
-                source_id,
-                query_tokens,
-                max_messages=5000,
-            )
+        scanned = _scan_source_sessions(
+            source_reader,
+            conn,
+            selected,
+            metrics,
+            query_tokens,
+            workers=source_scan_workers,
+            cancelled=cancelled,
+        )
+        if cancelled is not None and cancelled.is_set():
+            return {"cancelled": True}
+        for session, hits, metadata, message_truncated in scanned:
             source_truncated = source_truncated or message_truncated
             if metadata.get("warning"):
                 source_warnings.append(str(metadata["warning"]))
@@ -401,6 +558,7 @@ def search_messages(
 
 __all__ = [
     "DEFAULT_SOURCE_SCAN_LIMIT",
+    "DEFAULT_SOURCE_SCAN_WORKERS",
     "MAX_SOURCE_SCAN_LIMIT",
     "SourceReader",
     "fts_match_query",

@@ -232,6 +232,13 @@ class T3CodeAdapter(TranscriptAdapter):
     harness = Harness.T3CODE
     supports_byte_append = False
 
+    def accepts_watch_path(self, path: Path, source_root: Path) -> bool:
+        try:
+            parts = path.relative_to(source_root).parts
+        except ValueError:
+            return False
+        return parts in {("state.sqlite",), ("userdata", "state.sqlite")}
+
     def discover(self) -> list[Path]:
         return discover_t3code_dbs()
 
@@ -295,6 +302,78 @@ class T3CodeAdapter(TranscriptAdapter):
                     separators=(",", ":"),
                 ).encode()
                 return result, hashlib.sha256(encoded).hexdigest()
+            finally:
+                conn.rollback()
+
+    def session_revision(self, path: Path, external_id: str) -> str | None:
+        """Return a cheap, thread-scoped revision for detail-read caching."""
+        with open_sqlite_readonly(path) as conn:
+            conn.execute("BEGIN")
+            try:
+                if not table_exists(conn, "projection_threads"):
+                    return None
+                thread = conn.execute(
+                    """
+                    SELECT project_id, title, branch, worktree_path, created_at,
+                           updated_at, deleted_at, model_selection_json,
+                           runtime_mode, interaction_mode
+                    FROM projection_threads WHERE thread_id = ?
+                    """,
+                    (external_id,),
+                ).fetchone()
+                if thread is None:
+                    return None
+                digest = hashlib.sha256()
+
+                def update(value: object) -> None:
+                    encoded = repr((type(value).__name__, value)).encode(
+                        "utf-8", errors="backslashreplace"
+                    )
+                    digest.update(len(encoded).to_bytes(8, "big"))
+                    digest.update(encoded)
+
+                update("projection_threads")
+                for value in thread:
+                    update(value)
+                # Provider-backing extraction suppresses task ids that name any
+                # T3 thread, so this target depends on the complete id set.
+                for row in conn.execute(
+                    "SELECT thread_id FROM projection_threads ORDER BY thread_id"
+                ):
+                    update(row[0])
+                project_id = thread["project_id"]
+                if table_exists(conn, "projection_projects"):
+                    project = conn.execute(
+                        """
+                        SELECT title, workspace_root, default_model_selection_json
+                        FROM projection_projects WHERE project_id = ?
+                        """,
+                        (project_id,),
+                    ).fetchone()
+                    update("projection_projects")
+                    if project is not None:
+                        for value in project:
+                            update(value)
+                for table, where, params in (
+                    ("projection_thread_messages", "thread_id = ?", (external_id,)),
+                    ("projection_thread_activities", "thread_id = ?", (external_id,)),
+                    ("projection_turns", "thread_id = ?", (external_id,)),
+                    ("projection_thread_sessions", "thread_id = ?", (external_id,)),
+                    ("provider_session_runtime", "thread_id = ?", (external_id,)),
+                    ("projection_thread_proposed_plans", "implementation_thread_id = ?", (external_id,)),
+                    ("orchestration_events", "aggregate_kind = 'thread' AND stream_id = ?", (external_id,)),
+                ):
+                    if not table_exists(conn, table):
+                        continue
+                    update(table)
+                    rows = conn.execute(
+                        f"SELECT rowid, * FROM {table} WHERE {where} ORDER BY rowid",
+                        params,
+                    )
+                    for row in rows:
+                        for value in row:
+                            update(value)
+                return digest.hexdigest()
             finally:
                 conn.rollback()
 

@@ -32,6 +32,7 @@ from agentlog.db.migrations.v026_tool_operation_kind import apply as apply_v026
 from agentlog.db.migrations.v027_transcript_storage import apply as apply_v027
 from agentlog.db.migrations.v028_session_source_identity import apply as apply_v028
 from agentlog.db.migrations.v029_legacy_continuation import apply as apply_v029
+from agentlog.db.migrations.v030_attention_signals import apply as apply_v030
 
 # Version 1 = base SCHEMA_SQL in schema.py (implicit).
 MIGRATIONS: list[tuple[int, Callable[[sqlite3.Connection], None]]] = [
@@ -63,6 +64,7 @@ MIGRATIONS: list[tuple[int, Callable[[sqlite3.Connection], None]]] = [
     (27, apply_v027),
     (28, apply_v028),
     (29, apply_v029),
+    (30, apply_v030),
 ]
 
 

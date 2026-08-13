@@ -4,9 +4,11 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   displaySessionIdentity,
   authoritativeParentNavigationId,
+  fetchSessionDetail,
   logicalHarness,
   runtimeHarness,
   type InheritedContext,
+  type PresenceEvent,
   type TreeNode,
   type TranscriptSource,
   type TimelineMessage,
@@ -30,6 +32,8 @@ import {
 } from "@/lib/sessionTree";
 import { formatDuration, formatDayTime, harnessColor } from "@/lib/utils";
 import {
+  createMatchingPresenceRefreshGate,
+  createSessionPresenceRefreshScheduler,
   refreshActiveSessionQueries,
   sessionDetailQueryOptions,
   sessionTreeQueryOptions,
@@ -37,6 +41,7 @@ import {
 import { useIngestStream } from "@/lib/useIngestStream";
 
 type Ctx = { range: string };
+type DetailSession = Awaited<ReturnType<typeof fetchSessionDetail>>["session"];
 
 export function SessionDetail() {
   useOutletContext<Ctx>();
@@ -44,13 +49,41 @@ export function SessionDetail() {
   const [params] = useSearchParams();
   const queryClient = useQueryClient();
   const focus = params.get("msg");
+  const currentDetailRef = useRef<{
+    sessionId: string;
+    session: DetailSession | undefined;
+  }>({ sessionId, session: undefined });
+  const presenceRefresh = useRef(
+    createSessionPresenceRefreshScheduler({
+      refresh: () => {
+        const current = currentDetailRef.current;
+        if (!current.sessionId) return;
+        return refreshActiveSessionQueries(queryClient, current.sessionId);
+      },
+    }),
+  );
+  const presenceRefreshGate = useRef(createMatchingPresenceRefreshGate());
 
   useIngestStream(({ events }) => {
     if (!events.length || !sessionId) return;
     void refreshActiveSessionQueries(queryClient, sessionId);
+  }, (data: PresenceEvent) => {
+    const current = currentDetailRef.current;
+    const session = current.session;
+    if (session && presenceRefreshGate.current.accept(data, session)) {
+      presenceRefresh.current.schedule();
+    }
   });
   const q = useQuery(sessionDetailQueryOptions(sessionId));
   const treeQuery = useQuery(sessionTreeQueryOptions(sessionId));
+  currentDetailRef.current = { sessionId, session: q.data?.session };
+  useEffect(
+    () => () => {
+      presenceRefresh.current.cancel();
+      presenceRefreshGate.current.reset();
+    },
+    [sessionId],
+  );
   const isChildSession = Boolean(
     q.data?.session && authoritativeParentNavigationId(q.data.session),
   );

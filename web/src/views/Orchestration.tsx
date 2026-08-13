@@ -13,6 +13,7 @@ import { Card, CardTitle, PanelCard } from "@/components/ui/card";
 import { Kpi } from "@/components/ui/kpi";
 import { HarnessTag, ModelBadge, RuntimeHarnessLabel } from "@/components/ui/badges";
 import { cn, formatDayTime, harnessColor } from "@/lib/utils";
+import { rangeViewQueryOptions } from "@/lib/viewQueries";
 
 type Ctx = { range: string };
 
@@ -22,13 +23,13 @@ export function Orchestration() {
   const navigate = useNavigate();
   const root = params.get("root");
 
-  const overview = useQuery({
+  const overview = useQuery(rangeViewQueryOptions({
     queryKey: ["orchestration", range],
-    queryFn: () => fetchOrchestration(range),
-  });
+    queryFn: (signal) => fetchOrchestration(range, signal),
+  }));
   const tree = useQuery({
     queryKey: ["tree", root],
-    queryFn: () => fetchSessionTree(root!),
+    queryFn: ({ signal }) => fetchSessionTree(root!, signal),
     enabled: Boolean(root),
   });
 

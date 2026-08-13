@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+from threading import Event
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
@@ -928,7 +929,11 @@ def list_sessions_v2(
     }
     metric_ids = sorted(set(metric_id_by_session.values()))
 
-    model_values = _model_values_by_session(conn, set(metric_ids))
+    model_values = (
+        _model_values_by_session(conn, set(metric_ids))
+        if model
+        else {}
+    )
 
     def node_matches(session_id: str) -> bool:
         row = topology.rows[session_id]
@@ -1056,6 +1061,9 @@ def list_sessions_v2(
                 ),
                 "matching_descendant_count": matching_descendant_count,
                 "parent_session_id": row["parent_session_id"],
+                "transcript_storage": (
+                    metric["transcript_storage"] or "legacy_materialized"
+                ),
                 "inherited_message_count": int(metric["inherited_message_count"] or 0),
                 "inherited_record_count": int(metric["inherited_record_count"] or 0),
                 "fork_context_status": metric["fork_context_status"],
@@ -1121,7 +1129,10 @@ def _with_display_model(row: sqlite3.Row) -> dict[str, Any]:
 
 
 def session_detail_v2(
-    conn: sqlite3.Connection, session_id: str
+    conn: sqlite3.Connection,
+    session_id: str,
+    *,
+    source_reader: SourceReader | None = None,
 ) -> dict[str, Any] | None:
     resolved = _resolve_session(conn, session_id)
     if resolved is None:
@@ -1169,7 +1180,7 @@ def session_detail_v2(
         """,
         (transcript_id,),
     ).fetchall()
-    source_read = read_source_transcript(conn, transcript_id)
+    source_read = (source_reader or read_source_transcript)(conn, transcript_id)
     if source_read.status != "legacy":
         messages = source_read.messages
     tools = conn.execute(
@@ -1386,6 +1397,7 @@ def search_messages(
     limit: int = 40,
     source_reader: SourceReader | None = None,
     source_scan_limit: int = 200,
+    cancelled: Event | None = None,
 ) -> dict[str, Any]:
     return _dual_search_messages(
         conn,
@@ -1398,6 +1410,7 @@ def search_messages(
         limit=limit,
         source_reader=source_reader,
         source_scan_limit=source_scan_limit,
+        cancelled=cancelled,
     )
 
 

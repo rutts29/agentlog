@@ -239,17 +239,27 @@ def redirect_cell(
     *,
     model: str | None = None,
     extra_flags: list[str] | None = None,
+    published_state: tuple[str | None, str] | None = None,
+    unavailable_session_ids: list[str] | None = None,
 ) -> AggregateCell:
     """Redirect/brake rate per 10 eligible windows, clustered by root task."""
     scope = "this model" if model is not None else "this range"
-    run_id, publish_block = _published_run_or_reason(conn)
+    run_id, publish_block = (
+        published_state
+        if published_state is not None
+        else _published_run_or_reason(conn)
+    )
     if run_id is None:
         return unavailable_cell(
             metric=METRIC,
             kind="continuous",
             message=_unavailable_message(publish_block),
             flags=["source_capability"],
-            session_ids=_recent_root_ids(conn, tr),
+            session_ids=(
+                unavailable_session_ids
+                if unavailable_session_ids is not None
+                else _recent_root_ids(conn, tr)
+            ),
         )
 
     eligible = eligible_windows(conn, tr, model=model)

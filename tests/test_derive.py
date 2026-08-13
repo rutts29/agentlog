@@ -8,6 +8,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from agentlog.analysis.derive import derived_freshness, run_derive
+from agentlog.analysis.extractors.deterministic import iter_window_input_rows
 from agentlog.analysis.extractors.models import WindowContext
 from agentlog.analysis.extractors.triage import triage_window
 from agentlog.analysis.extractors.taxonomy import Route
@@ -24,7 +25,12 @@ from agentlog.service.health import build_health
 from agentlog.watch.presence import atomic_write_json
 
 
-def _seed(conn, *, authored_by_agent: bool = False) -> str:
+def _seed(
+    conn,
+    *,
+    authored_by_agent: bool = False,
+    external_id: str = "derive-sess",
+) -> str:
     repo = Repository(conn)
     art_id = repo.upsert_artifact(
         harness="cursor",
@@ -38,7 +44,7 @@ def _seed(conn, *, authored_by_agent: bool = False) -> str:
     result = ParseResult(
         session=NormalizedSession(
             harness=Harness.CURSOR,
-            external_id="derive-sess",
+            external_id=external_id,
             model="grok-4.5",
         ),
         messages=[
@@ -102,6 +108,28 @@ class DeriveIdempotencyTests(unittest.TestCase):
                 "SELECT COUNT(*) AS c FROM window_det_classifications"
             ).fetchone()["c"]
             self.assertEqual(int(n), first.windows_total)
+
+    def test_targeted_derive_leaves_unrelated_stale_windows_cold(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "t.db"
+            conn = connect(db)
+            init_db(conn)
+            _seed(conn)
+            window_id = str(
+                conn.execute(
+                    "SELECT id FROM exchange_windows ORDER BY id LIMIT 1"
+                ).fetchone()["id"]
+            )
+
+            result = run_derive(
+                conn,
+                index_skill_inventory=False,
+                window_ids={window_id},
+            )
+
+            self.assertFalse(result.skipped)
+            self.assertEqual(result.windows_updated, 1)
+            self.assertTrue(derived_freshness(conn)["stale"])
 
 
 class AuthoredByAgentDeriveTests(unittest.TestCase):
@@ -195,6 +223,28 @@ class DerivedFreshnessHealthTests(unittest.TestCase):
         body = res.json()
         self.assertIn("derived", body)
         self.assertIn("windows_total", body["derived"])
+
+    def test_fingerprint_ignores_session_added_after_window_scan(self) -> None:
+        _seed(self.conn)
+        writer = connect(self.db)
+        injected = False
+
+        def inject_after_window_scan(statement: str) -> None:
+            nonlocal injected
+            if injected or "FROM messages m" not in statement:
+                return
+            injected = True
+            _seed(writer, external_id="added-during-fingerprint")
+
+        self.conn.set_trace_callback(inject_after_window_scan)
+        try:
+            rows = iter_window_input_rows(self.conn)
+        finally:
+            self.conn.set_trace_callback(None)
+            writer.close()
+
+        self.assertTrue(injected)
+        self.assertEqual(len(rows), 2)
 
 
 if __name__ == "__main__":

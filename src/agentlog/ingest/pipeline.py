@@ -32,16 +32,22 @@ from agentlog.ingest.checkpoint import (
 )
 from agentlog.ingest.claude import ClaudeAdapter
 from agentlog.ingest.codex import CodexAdapter
-from agentlog.ingest.cursor import CursorAdapter
+from agentlog.ingest.cursor import (
+    CursorAdapter,
+    canonical_external_id,
+    lookup_composer_metas,
+)
 from agentlog.ingest.hermes import HermesAdapter
 from agentlog.ingest.t3code import T3CodeAdapter
 from agentlog.ingest.warp import WarpAdapter
+from agentlog.normalize.effort import normalize_effort
 from agentlog.normalize.models import ParseResult
 
 log = logging.getLogger("agentlog.ingest")
 
 _STABLE_SOURCE_ATTEMPTS = 3
 _SQLITE_SIDECARS = ("-journal", "-wal", "-shm")
+_MAX_ATTENTION_TAIL_BACKFILLS = 20
 
 
 class FrozenLegacyTranscriptError(TranscriptStorageError):
@@ -73,6 +79,10 @@ class FrozenLegacyTranscriptError(TranscriptStorageError):
         self.transcript_storage = transcript_storage
 
 
+class FrozenSourceBackedTranscriptError(FrozenLegacyTranscriptError):
+    """A source-backed transcript no longer matches its persisted identity."""
+
+
 @dataclass
 class IngestStats:
     skipped: int = 0
@@ -84,6 +94,7 @@ class IngestStats:
     sessions_added: int = 0
     sessions_updated: int = 0
     messages_added: int = 0
+    changed_window_ids: set[str] = field(default_factory=set)
 
 
 def adapters() -> list[TranscriptAdapter]:
@@ -137,7 +148,12 @@ def _source_matches_snapshot(
     )
 
 
-def ingest_all(repo: Repository, console: Console | None = None) -> IngestStats:
+def ingest_all(
+    repo: Repository,
+    console: Console | None = None,
+    *,
+    catch_up_attention_tails: bool = False,
+) -> IngestStats:
     console = console or Console()
     stats = IngestStats()
     jobs: list[tuple[TranscriptAdapter, object]] = []
@@ -150,6 +166,18 @@ def ingest_all(repo: Repository, console: Console | None = None) -> IngestStats:
         console.print("No transcript files found.")
         return stats
 
+    tail_backfill_ids_by_harness: dict[str, set[int]] = {}
+    if catch_up_attention_tails:
+        for adapter, _path in jobs:
+            harness = adapter.harness.value
+            if harness not in tail_backfill_ids_by_harness:
+                tail_backfill_ids_by_harness[harness] = (
+                    repo.source_backed_artifacts_missing_attention_tail(
+                        harness,
+                        limit=_MAX_ATTENTION_TAIL_BACKFILLS,
+                    )
+                )
+
     with Progress(
         TextColumn("[bold]{task.description}"),
         BarColumn(),
@@ -161,7 +189,19 @@ def ingest_all(repo: Repository, console: Console | None = None) -> IngestStats:
         for adapter, path in jobs:
             progress.update(task_id, description=f"{adapter.harness.value}")
             try:
-                _ingest_one(repo, adapter, path, stats)
+                tail_backfill_ids = tail_backfill_ids_by_harness.get(
+                    adapter.harness.value, set()
+                )
+                if tail_backfill_ids:
+                    _ingest_one(
+                        repo,
+                        adapter,
+                        path,
+                        stats,
+                        attention_tail_backfill_artifact_ids=tail_backfill_ids,
+                    )
+                else:
+                    _ingest_one(repo, adapter, path, stats)
                 repo.conn.commit()
             except FrozenLegacyTranscriptError as exc:
                 repo.conn.rollback()
@@ -251,10 +291,44 @@ def _persist_frozen_legacy(
     repo.conn.commit()
 
 
+def _refresh_cursor_metadata(
+    repo: Repository,
+    state_db: Path,
+    stats: IngestStats,
+) -> None:
+    targets = repo.cursor_metadata_targets()
+    composer_ids = {
+        canonical_external_id(str(target["external_id"]))
+        for target in targets
+    }
+    metas = lookup_composer_metas(composer_ids, state_db=state_db)
+    for target in targets:
+        composer_id = canonical_external_id(str(target["external_id"]))
+        meta = metas.get(composer_id)
+        if meta is None:
+            stats.skipped += 1
+            continue
+        effort, effort_source = normalize_effort(meta.effort)
+        if repo.reconcile_cursor_metadata(
+            str(target["id"]),
+            model=meta.model,
+            effort=effort,
+            effort_source=effort_source,
+            branch=meta.branch,
+        ):
+            stats.sessions_upserted += 1
+            stats.sessions_updated += 1
+        else:
+            stats.skipped += 1
+
+
 def ingest_harness(
     repo: Repository,
     harness: str,
     changed_paths: Iterable[str | Path] | None = None,
+    *,
+    catch_up_attention_tails: bool = False,
+    cursor_metadata_state_db: str | Path | None = None,
 ) -> IngestStats:
     """Run incremental ingest for one harness, optionally scoped to changed files."""
     stats = IngestStats()
@@ -262,22 +336,47 @@ def ingest_harness(
     if adapter is None:
         stats.warnings.append(f"unknown harness: {harness}")
         return stats
+    if cursor_metadata_state_db is not None:
+        if adapter.harness.value != "cursor":
+            stats.warnings.append(
+                "Cursor metadata refresh requested for non-Cursor harness"
+            )
+            return stats
+        try:
+            _refresh_cursor_metadata(
+                repo, Path(cursor_metadata_state_db).expanduser(), stats
+            )
+            repo.conn.commit()
+        except Exception as exc:  # noqa: BLE001 - retain event for retry
+            repo.conn.rollback()
+            stats.failed += 1
+            stats.warnings.append(f"Cursor metadata refresh: {exc}")
+            log.exception("Cursor metadata refresh failed")
+            return stats
     if changed_paths is None:
         paths = adapter.discover()
     else:
         changed = [Path(path).expanduser() for path in changed_paths]
-        refresh_cursor_metadata = (
-            adapter.harness.value == "cursor"
-            and any(path.name == "state.vscdb" for path in changed)
+        paths = _changed_artifact_paths(adapter, changed)
+    tail_backfill_ids = (
+        repo.source_backed_artifacts_missing_attention_tail(
+            harness, limit=_MAX_ATTENTION_TAIL_BACKFILLS
         )
-        paths = (
-            adapter.discover()
-            if refresh_cursor_metadata
-            else _changed_artifact_paths(adapter, changed)
-        )
+        if catch_up_attention_tails and changed_paths is None
+        else set()
+    )
     for path in paths:
         try:
-            _ingest_one(repo, adapter, path, stats)
+            if tail_backfill_ids:
+                _ingest_one(
+                    repo,
+                    adapter,
+                    path,
+                    stats,
+                    attention_tail_backfill_artifact_ids=tail_backfill_ids,
+                )
+            else:
+                _ingest_one(repo, adapter, path, stats)
             repo.conn.commit()
         except FrozenLegacyTranscriptError as exc:
             repo.conn.rollback()
@@ -299,6 +398,16 @@ def _session_message_count(repo: Repository, session_id: str) -> int:
         (session_id,),
     ).fetchone()
     return int(row["c"]) if row else 0
+
+
+def _session_window_ids(repo: Repository, session_id: str) -> set[str]:
+    return {
+        str(row["id"])
+        for row in repo.conn.execute(
+            "SELECT id FROM exchange_windows WHERE session_id = ?",
+            (session_id,),
+        )
+    }
 
 
 def _windows_from_source_result(
@@ -362,6 +471,8 @@ def _ingest_one(
     adapter: TranscriptAdapter,
     path,
     stats: IngestStats,
+    *,
+    attention_tail_backfill_artifact_ids: set[int] | None = None,
 ) -> None:
     sqlite_source = is_sqlite_path(path)
     for attempt in range(_STABLE_SOURCE_ATTEMPTS):
@@ -371,8 +482,21 @@ def _ingest_one(
             if revision_before != (decision.size, decision.mtime_ns):
                 continue
             if decision.action == IngestAction.SKIP:
-                stats.skipped += 1
-                return
+                if (
+                    decision.artifact is not None
+                    and decision.artifact.id
+                    in (attention_tail_backfill_artifact_ids or set())
+                ):
+                    decision = CheckpointDecision(
+                        action=IngestAction.REPARSE,
+                        artifact=decision.artifact,
+                        size=decision.size,
+                        mtime_ns=decision.mtime_ns,
+                        start_offset=0,
+                    )
+                else:
+                    stats.skipped += 1
+                    return
 
             logical_snapshot = (
                 _sqlite_logical_snapshot(path) if sqlite_source else None
@@ -704,6 +828,7 @@ def _ingest_one(
         existed = prior >= 0
         msg_before = max(prior, 0)
         session_storage = session_storages[session_key]
+        prior_window_ids = _session_window_ids(repo, session_key)
 
         parser_upgrade_rewrite = (
             parser_upgrade
@@ -749,16 +874,37 @@ def _ingest_one(
                 current_parser_version=PARSER_VERSION,
             )
         else:
-            session_id = repo.save_parse_result(
-                artifact_id=artifact_id,
-                result=result,
-                append=append,
-                base_seq=base_seq,
-                base_tool_seq=base_tool,
-                base_token_seq=base_token,
-                transcript_storage=session_storage,
-                preserve_existing_legacy=True,
-            )
+            source_append = session_storage == SOURCE_BACKED and append
+            try:
+                session_id = repo.save_parse_result(
+                    artifact_id=artifact_id,
+                    result=(
+                        full_source_result(result.session.external_id)
+                        if source_append
+                        else result
+                    ),
+                    append=append and not source_append,
+                    base_seq=0 if source_append else base_seq,
+                    base_tool_seq=0 if source_append else base_tool,
+                    base_token_seq=0 if source_append else base_token,
+                    transcript_storage=session_storage,
+                    preserve_existing_legacy=True,
+                )
+            except TranscriptStorageError as exc:
+                if not source_append:
+                    raise
+                raise FrozenSourceBackedTranscriptError(
+                    str(exc),
+                    session_id=session_key,
+                    status="diverged",
+                    harness=adapter.harness.value,
+                    path=path,
+                    size=decision.size,
+                    mtime_ns=decision.mtime_ns,
+                    content_hash=content_hash,
+                    parsed_offset=parsed_offset,
+                    transcript_storage=session_storage,
+                ) from exc
 
         if (
             session_storage == SOURCE_BACKED
@@ -773,6 +919,9 @@ def _ingest_one(
             messages = repo.list_messages(session_id)
             windows = build_exchange_windows(messages)
             repo.replace_exchange_windows(session_id, windows)
+        stats.changed_window_ids.update(
+            prior_window_ids ^ _session_window_ids(repo, session_id)
+        )
         stats.sessions_upserted += 1
         if existed:
             stats.sessions_updated += 1

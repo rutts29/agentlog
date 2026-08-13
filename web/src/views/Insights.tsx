@@ -6,6 +6,7 @@ import { EmptyState } from "@/components/EmptyState";
 import { LoadingOrb } from "@/components/LoadingOrb";
 import { Card } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
+import { rangeViewQueryOptions } from "@/lib/viewQueries";
 
 type Ctx = { range: string };
 
@@ -260,10 +261,10 @@ function Section({
 
 export function Insights() {
   const { range } = useOutletContext<Ctx>();
-  const q = useQuery({
+  const q = useQuery(rangeViewQueryOptions({
     queryKey: ["insights", range],
-    queryFn: () => fetchInsights(range),
-  });
+    queryFn: (signal) => fetchInsights(range, signal),
+  }));
 
   if (q.isLoading) {
     return <LoadingOrb label="Reading insights" />;

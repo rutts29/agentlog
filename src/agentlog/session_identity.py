@@ -39,6 +39,7 @@ class IdentityContext:
         default_factory=dict
     )
     t3_origin_session_ids: set[str] = field(default_factory=set)
+    source_backed_session_ids: set[str] = field(default_factory=set)
 
 
 _PROVIDER_FAMILIES = {
@@ -186,6 +187,17 @@ def build_identity_context(conn: sqlite3.Connection) -> IdentityContext:
                 """
             )
         }
+    if _has_session_column(conn, "transcript_storage"):
+        context.source_backed_session_ids = {
+            str(row["id"])
+            for row in conn.execute(
+                """
+                SELECT id FROM sessions
+                WHERE transcript_storage = 'source_backed'
+                  AND artifact_id IS NOT NULL
+                """
+            )
+        }
     if context.owners_by_session or context.t3_origin_session_ids:
         parents = _physical_parent_ids(conn)
         harness_by_id = {
@@ -296,17 +308,7 @@ def logical_projection(
         target_id = str(roots[0]["target_session_id"])
         if identity.canonical_root_backing_by_source.get(session_id) == target_id:
             transcript = roots[0]
-    source_backed = False
-    if _has_session_column(conn, "transcript_storage"):
-        source = conn.execute(
-            "SELECT transcript_storage, artifact_id FROM sessions WHERE id = ?",
-            (session_id,),
-        ).fetchone()
-        source_backed = bool(
-            source is not None
-            and source["transcript_storage"] == "source_backed"
-            and source["artifact_id"] is not None
-        )
+    source_backed = session_id in identity.source_backed_session_ids
     transcript_id = (
         str(transcript["target_session_id"])
         if transcript and not source_backed
