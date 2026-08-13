@@ -32,7 +32,10 @@ propose_app = typer.Typer(
     invoke_without_command=True,
 )
 coach_app = typer.Typer(
-    help="Local-only, file-handoff harness coaching (Luna and Terra)."
+    help=(
+        "Local-only, file-handoff harness coaching (Luna and Terra). "
+        "Does not write owner Insights; use insights-extract on the packets."
+    )
 )
 app.add_typer(session_app, name="session")
 app.add_typer(extract_app, name="extract")
@@ -451,6 +454,76 @@ def claims_cmd(
     console.print(table)
     console.print(
         "Language: observational only. LLM-derived claims need adjudication."
+    )
+
+
+@app.command("insights-extract")
+def insights_extract_cmd(
+    packets: Path = typer.Option(
+        ...,
+        "--packets",
+        help="Directory of prepared coach packets (reuse coach prepare).",
+    ),
+    out: Path = typer.Option(
+        ...,
+        "--out",
+        help="Session-fact packet to write (insights-import input).",
+    ),
+    model: Optional[str] = typer.Option(
+        None,
+        "--model",
+        help="If set, call the configured chat client to fill items.",
+    ),
+    run_id: str = typer.Option(
+        "owner-extract",
+        "--run-id",
+        help="Run id stored on the written packet.",
+    ),
+) -> None:
+    """Extract owner-facing Insights from coach packets. Skips the 7-kind compiler."""
+    from agentlog.analysis.owner_notes import (
+        OWNER_NOTE_PROMPT,
+        collect_packet_dir_turns,
+        compact_turns,
+        write_owner_fact_packet,
+    )
+
+    packet_dir = packets.expanduser()
+    if not packet_dir.is_dir():
+        console.print(f"[red]Not a packet directory:[/red] {packet_dir}")
+        raise typer.Exit(code=1)
+    turns = collect_packet_dir_turns(packet_dir)
+    digest_path = out.expanduser().with_suffix(".turns.txt")
+    digest_path.parent.mkdir(parents=True, exist_ok=True)
+    digest = compact_turns(turns)
+    digest_path.write_text(digest + "\n", encoding="utf-8")
+    if not model:
+        write_owner_fact_packet(out.expanduser(), run_id=run_id, items=[])
+        console.print(
+            f"Wrote empty fact packet {out} and {len(turns)} owner turns to "
+            f"{digest_path}. Fill items (or pass --model) then insights-import."
+        )
+        return
+    from agentlog.analysis.extractors.llm_client import XAIChatClient
+
+    client = XAIChatClient()
+    result = client.complete_json(
+        system=OWNER_NOTE_PROMPT,
+        user=digest,
+        model=model,
+    )
+    items = result.get("items") if isinstance(result, dict) else None
+    if not isinstance(items, list):
+        console.print("[red]Model did not return an items list[/red]")
+        raise typer.Exit(code=1)
+    payload = write_owner_fact_packet(
+        out.expanduser(),
+        run_id=run_id,
+        items=items,
+    )
+    console.print(
+        f"Wrote {len(payload['items'])} owner notes to {out} "
+        f"from {len(turns)} turns ({model})."
     )
 
 
