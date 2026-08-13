@@ -105,9 +105,12 @@ def import_session_fact_packet(
     path: Path,
     *,
     model: str,
+    status: str = "candidate",
 ) -> dict[str, Any]:
     if not model.strip():
         raise ValueError("model is required for LLM-derived session facts")
+    if status not in {"candidate", "approved"}:
+        raise ValueError("status must be candidate or approved")
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -164,7 +167,7 @@ def import_session_fact_packet(
                 scope_type=scope_type,
                 scope_id=scope_id,
                 derivation="llm_derived",
-                status="candidate",
+                status=status,
                 support_status="ok",
                 sample_size=1,
                 denominator=1,

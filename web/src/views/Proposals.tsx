@@ -7,13 +7,10 @@ import {
   type ProposalClaim,
   type ProposalDecision,
   type ProposalRow,
-  type ProposalSupport,
 } from "@/lib/api";
 import { EmptyState } from "@/components/EmptyState";
 import { LoadingOrb } from "@/components/LoadingOrb";
-import { Card } from "@/components/ui/card";
 import { CopyPath } from "@/components/CopyPath";
-import { StatusDot } from "@/components/ui/badges";
 import { cn } from "@/lib/utils";
 
 const FILTERS = ["pending", "accepted", "deferred", "rejected", "all"] as const;
@@ -24,23 +21,6 @@ const DECISION_LABEL: Record<ProposalDecision, string> = {
   rejected: "Reject",
   deferred: "Defer",
 };
-
-const SUPPORT_TONE: Record<
-  ProposalSupport["tier"],
-  "ok" | "warn" | "error" | "info" | "neutral"
-> = {
-  ok: "ok",
-  insufficient: "warn",
-  abstain: "neutral",
-  unsupported: "neutral",
-};
-
-function shortTime(iso: string | null): string {
-  if (!iso) return "—";
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return "—";
-  return d.toISOString().slice(0, 16).replace("T", " ");
-}
 
 function CopyButton({
   label,
@@ -68,7 +48,7 @@ function CopyButton({
         }
       }}
       className={cn(
-        "rounded-control border border-border px-2 py-1 text-[11px]",
+        "rounded-control border border-border px-2.5 py-1.5 text-[12px]",
         inert
           ? "text-faint-foreground"
           : "text-muted-foreground hover:text-foreground",
@@ -118,139 +98,61 @@ function EvidenceList({ claims }: { claims: ProposalClaim[] }) {
       const identity = [ev.session_id, ev.window_id, ev.message_id, ev.quote].join("\0");
       if (seen.has(identity)) return [];
       seen.add(identity);
-      return [{ claim, ev, key: `${claim.id}:${idx}` }];
+      return [{ ev, key: `${claim.id}:${idx}` }];
     }),
   );
   if (rows.length === 0) {
     return (
-      <div className="text-[12px] text-faint-foreground">
-        No verbatim spans stored for the linked claims.
+      <div className="text-[13px] text-muted-foreground">
+        No quotes stored for this proposal.
       </div>
     );
   }
   return (
-    <ul className="flex flex-col gap-2">
-      {rows.slice(0, 12).map(({ claim, ev, key }) => (
+    <ul className="flex flex-col gap-3">
+      {rows.slice(0, 12).map(({ ev, key }) => (
         <li key={key} className="border-l border-border pl-3">
-          <div className="flex flex-wrap items-baseline gap-2 text-[11px] text-faint-foreground">
-            <span className="tabular">{shortTime(ev.timestamp)}</span>
-            {ev.harness ? <span>{ev.harness}</span> : null}
-            <span className="font-mono">{claim.kind}</span>
-            {ev.session_id ? (
-              <Link
-                to={{
-                  pathname: `/sessions/${encodeURIComponent(ev.session_id)}`,
-                  search: ev.message_id
-                    ? `?msg=${encodeURIComponent(ev.message_id)}`
-                    : "",
-                }}
-                className="text-muted-foreground underline decoration-border hover:text-foreground"
-              >
-                open transcript
-              </Link>
-            ) : null}
-            {ev.window_id ? (
-              <span className="font-mono">window {ev.window_id.slice(0, 12)}</span>
-            ) : null}
-          </div>
           {ev.quote ? (
-            <p className="mt-1 text-[12px] leading-relaxed text-muted-foreground">
+            <p className="text-[13px] leading-relaxed text-foreground/90">
               “{ev.quote}”
             </p>
           ) : null}
+          {ev.session_id ? (
+            <Link
+              to={{
+                pathname: `/sessions/${encodeURIComponent(ev.session_id)}`,
+                search: ev.message_id
+                  ? `?msg=${encodeURIComponent(ev.message_id)}`
+                  : "",
+              }}
+              className="mt-1 inline-flex text-[12px] text-speaker-human underline decoration-speaker-human/30 underline-offset-4 hover:decoration-speaker-human"
+            >
+              Open the session
+            </Link>
+          ) : null}
         </li>
       ))}
-      {rows.length > 12 ? (
-        <li className="text-[11px] text-faint-foreground">
-          {rows.length - 12} further citations not shown
-        </li>
-      ) : null}
     </ul>
   );
 }
 
-function SupportLine({ support }: { support: ProposalSupport }) {
+function proposalInstruction(proposal: ProposalRow): string {
   return (
-    <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
-      <StatusDot
-        tone={SUPPORT_TONE[support.tier]}
-        label={`support: ${support.tier}`}
-      />
-      <span className="tabular text-[11px] text-muted-foreground">
-        n={support.n} · processed={support.processed ?? "—"} · eligible={support.eligible ?? "—"} · citations={support.citations}
-      </span>
-      <span className="text-[12px] text-faint-foreground">
-        {support.derivations.join(", ") || "no derivation recorded"}
-      </span>
-    </div>
-  );
+    proposal.suggested_instruction ||
+    proposal.proposed_content ||
+    ""
+  ).trim();
 }
 
-function ProvenanceLine({ proposal }: { proposal: ProposalRow }) {
-  const source = proposal.provenance_summary;
+function Caveat({ text }: { text: string }) {
   return (
-    <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-faint-foreground">
-      <StatusDot
-        tone={source.kind === "llm_derived" ? "info" : source.kind === "legacy_unverified" ? "warn" : "neutral"}
-        label={source.kind === "llm_derived" ? "LLM-derived" : source.kind === "legacy_unverified" ? "legacy / unverified" : "deterministic"}
-      />
-      {source.synthesis_model || source.model ? (
-        <span className="font-mono">synthesis {source.synthesis_model || source.model}</span>
-      ) : null}
-      {source.review_model ? <span className="font-mono">review {source.review_model}</span> : null}
-      {source.run_id ? <span>run {source.run_id}</span> : null}
-      {source.packet_id ? <span>packet {source.packet_id}</span> : null}
-      {source.catalog_id ? <span>catalog {source.catalog_id}</span> : null}
-      {source.review_id ? <span>review {source.review_id}</span> : null}
-      <span>{source.review_state}</span>
-      {proposal.coalesced_duplicate_count > 1 ? (
-        <span className="text-muted-foreground">
-          {proposal.coalesced_duplicate_count} exact versions coalesced
-        </span>
-      ) : null}
-    </div>
-  );
-}
-
-function InstructionBlock({ proposal }: { proposal: ProposalRow }) {
-  const instruction = proposal.suggested_instruction;
-  return (
-    <div className="rounded-control border border-border-faint bg-stage px-3 py-2">
-      <div className="microlabel text-[10px] text-faint-foreground">
-        Atomic suggested instruction
+    <aside className="border-l-2 border-speaker-human bg-speaker-human-dim px-3.5 py-3">
+      <div className="text-[12px] font-medium text-speaker-human">
+        Hold this lightly
       </div>
-      <p className="mt-1 whitespace-pre-wrap text-[12px] leading-relaxed text-foreground">
-        {instruction || "See the proposed file content below; no atomic instruction was stored."}
-      </p>
-    </div>
+      <p className="mt-1 text-[13.5px] leading-relaxed text-foreground">{text}</p>
+    </aside>
   );
-}
-
-function TargetStateLine({ proposal }: { proposal: ProposalRow }) {
-  const st = proposal.target_state;
-  if (proposal.status !== "accepted") return null;
-  if (!st.exists) {
-    return (
-      <StatusDot tone="neutral" label="target file does not exist yet" />
-    );
-  }
-  if (st.matches_proposed) {
-    return (
-      <StatusDot
-        tone="ok"
-        label="file content now matches the proposed content"
-      />
-    );
-  }
-  if (st.changed_since_proposal) {
-    return (
-      <StatusDot
-        tone="warn"
-        label="file changed since the proposal, but does not match it"
-      />
-    );
-  }
-  return <StatusDot tone="neutral" label="file unchanged since the proposal" />;
 }
 
 function ProposalCard({
@@ -263,130 +165,89 @@ function ProposalCard({
   pending: boolean;
 }) {
   const [open, setOpen] = useState(false);
+  const instruction = proposalInstruction(proposal);
+  const detailsId = `proposal-${proposal.id}-details`;
+
   return (
-    <Card className="flex flex-col gap-3">
+    <article className="elev-card flex flex-col gap-4 rounded-card border border-border bg-card px-6 py-6">
       <div className="flex items-start justify-between gap-3">
-        <div className="min-w-0">
-          <button
-            type="button"
-            onClick={() => setOpen((v) => !v)}
-            aria-expanded={open}
-            aria-controls={`proposal-${proposal.id}-details`}
-            className="text-left text-[13px] font-medium text-foreground hover:underline"
-          >
-            {proposal.title}
-          </button>
-          <div className="mt-1 flex flex-wrap items-baseline gap-x-3 gap-y-1 text-[11px] text-faint-foreground">
-            <span className="microlabel">{proposal.action}</span>
-            <span className="microlabel">{proposal.target_kind}</span>
-            <span className="microlabel">{proposal.scope_type}</span>
-            <span className="tabular">created {shortTime(proposal.created_at)}</span>
-          </div>
-        </div>
-        <span className="microlabel shrink-0 text-[10px] text-muted-foreground">
-          {proposal.status}
+        <h2 className="min-w-0 text-[20px] font-semibold leading-[1.3] tracking-tight text-foreground">
+          {proposal.title}
+        </h2>
+        <span className="shrink-0 pt-1 text-[12px] text-muted-foreground">
+          {proposal.status === "pending" ? "Waiting for you" : proposal.status}
         </span>
       </div>
 
-      <ProvenanceLine proposal={proposal} />
-      <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-start">
-        <div className="min-w-0">
-          <CopyPath path={proposal.target_path} />
-          <div className="mt-1 text-[11px] text-faint-foreground">
-            target scope: {proposal.scope_type}{proposal.scope_id ? ` / ${proposal.scope_id}` : ""}
+      <p className="max-w-[62ch] whitespace-pre-wrap text-[15px] leading-[1.7] text-foreground/90">
+        {proposal.rationale}
+      </p>
+
+      {proposal.does_not_prove ? <Caveat text={proposal.does_not_prove} /> : null}
+
+      {instruction ? (
+        <div className="rounded-control border border-border bg-stage px-4 py-3.5">
+          <div className="text-[12px] font-medium text-muted-foreground">
+            Add this to the agent
           </div>
-        </div>
-        <TargetStateLine proposal={proposal} />
-      </div>
-      <InstructionBlock proposal={proposal} />
-      <SupportLine support={proposal.support} />
-
-      <div className="flex flex-wrap items-center gap-2">
-        <button
-          type="button"
-          onClick={() => setOpen((v) => !v)}
-          aria-expanded={open}
-          aria-controls={`proposal-${proposal.id}-details`}
-          className="rounded-control border border-border px-2.5 py-1 text-[11px] text-muted-foreground hover:text-foreground"
-        >
-          {open ? "Hide evidence & diff" : "Evidence & diff"}
-        </button>
-        <CopyButton label="Copy diff" value={proposal.unified_diff} />
-        <CopyButton
-          label="Copy proposed file"
-          value={proposal.proposed_content}
-        />
-        <span className="ml-auto flex items-center gap-2">
-          {(["accepted", "deferred", "rejected"] as ProposalDecision[]).map(
-            (decision) => (
-              <button
-                key={decision}
-                type="button"
-                disabled={pending || proposal.status === decision}
-                onClick={() => onDecide(decision)}
-                className={cn(
-                  "rounded-control border px-2.5 py-1 text-[11px]",
-                  proposal.status === decision
-                    ? "border-border bg-muted text-foreground"
-                    : "border-border text-muted-foreground hover:text-foreground",
-                  pending && "opacity-60",
-                )}
-              >
-                {DECISION_LABEL[decision]}
-              </button>
-            ),
-          )}
-        </span>
-      </div>
-
-      {proposal.decision_note ? (
-        <div className="text-[11px] text-faint-foreground">
-          {proposal.decision_note.startsWith("auto-")
-            ? `system-pruned, not your decision: ${proposal.decision_note}`
-            : `note: ${proposal.decision_note}`}
+          <p className="mt-1.5 whitespace-pre-wrap text-[14px] leading-[1.6] text-foreground">
+            {instruction}
+          </p>
         </div>
       ) : null}
+
+      <div className="min-w-0">
+        <div className="text-[12px] text-muted-foreground">Would write to</div>
+        <CopyPath path={proposal.target_path} className="mt-1" />
+      </div>
+
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+        aria-controls={detailsId}
+        className="flex w-full items-center justify-between rounded-control border border-border bg-muted/40 px-3.5 py-2.5 text-left text-[13px] text-foreground hover:bg-muted"
+      >
+        <span>{open ? "Hide the file change" : "Show the file change"}</span>
+        <span aria-hidden className="text-muted-foreground">{open ? "▴" : "▾"}</span>
+      </button>
 
       {open ? (
-        <div id={`proposal-${proposal.id}-details`} className="flex flex-col gap-3 border-t border-border pt-3">
+        <div id={detailsId} className="flex flex-col gap-4 border-t border-border pt-4">
+          <DiffBlock diff={proposal.unified_diff} />
           <div>
-            <div className="microlabel pb-1 text-[10px] text-faint-foreground">
-              Proposed diff
-            </div>
-            <DiffBlock diff={proposal.unified_diff} />
-          </div>
-          <div>
-            <div className="microlabel pb-1 text-[10px] text-faint-foreground">
-              Rationale
-            </div>
-            <pre className="max-w-full overflow-x-hidden whitespace-pre-wrap break-words font-sans text-[12px] leading-relaxed text-muted-foreground [overflow-wrap:anywhere]">
-              {proposal.rationale}
-            </pre>
-          </div>
-          <div>
-            <div className="microlabel pb-1 text-[10px] text-faint-foreground">
-              Evidence
-            </div>
+            <div className="pb-2 text-[12px] text-muted-foreground">From the session</div>
             <EvidenceList claims={proposal.claims} />
           </div>
-          {proposal.does_not_prove ? (
-            <div>
-              <div className="microlabel pb-1 text-[10px] text-faint-foreground">
-                What this does not prove
-              </div>
-              <p className="text-[12px] leading-relaxed text-muted-foreground">
-                {proposal.does_not_prove}
-              </p>
-            </div>
-          ) : null}
-          {proposal.support.language ? (
-            <p className="text-[11px] text-faint-foreground">
-              Caveat: {proposal.support.language}
-            </p>
-          ) : null}
+          <div className="flex flex-wrap gap-2">
+            <CopyButton label="Copy diff" value={proposal.unified_diff} />
+            <CopyButton label="Copy proposed text" value={proposal.proposed_content} />
+          </div>
         </div>
       ) : null}
-    </Card>
+
+      <div className="flex flex-wrap items-center gap-2 pt-1">
+        {(["accepted", "deferred", "rejected"] as ProposalDecision[]).map(
+          (decision) => (
+            <button
+              key={decision}
+              type="button"
+              disabled={pending || proposal.status === decision}
+              onClick={() => onDecide(decision)}
+              className={cn(
+                "rounded-control border px-3 py-1.5 text-[12px]",
+                proposal.status === decision
+                  ? "border-border bg-muted text-foreground"
+                  : "border-border text-muted-foreground hover:text-foreground",
+                pending && "opacity-60",
+              )}
+            >
+              {DECISION_LABEL[decision]}
+            </button>
+          ),
+        )}
+      </div>
+    </article>
   );
 }
 
@@ -423,37 +284,13 @@ export function Proposals() {
   );
 
   return (
-    <div className="space-y-3">
-      <div className="flex items-baseline justify-between gap-3">
-        <h1 className="text-[18px] font-semibold tracking-tight">Proposals</h1>
-        <span className="max-w-xl text-right text-[12px] text-faint-foreground">
-          agentlog proposes, you apply — nothing here edits your configuration
-        </span>
+    <div className="mx-auto max-w-[720px] space-y-5">
+      <div>
+        <h1 className="text-[22px] font-semibold tracking-tight">Proposals</h1>
+        <p className="mt-1 max-w-[58ch] text-[13px] leading-relaxed text-muted-foreground">
+          Standing rules for the agent. Nothing is written until you copy it in yourself.
+        </p>
       </div>
-
-      <Card className="grid grid-cols-2 gap-3 sm:grid-cols-5">
-        <div className="col-span-2 border-b border-border-faint pb-2 sm:col-span-5">
-          <div className="flex items-baseline justify-between gap-3">
-            <div className="text-[13px] font-medium text-foreground">Review queue</div>
-            <span className="microlabel text-[10px]" style={{ color: "var(--status-info)" }}>
-              manual application only
-            </span>
-          </div>
-          <p className="mt-1 text-[11px] text-muted-foreground">
-          Provenance identifies packet-derived, deterministic, and legacy records. Nothing here writes AGENTS.md or skill files.
-          </p>
-        </div>
-        {(["pending", "accepted", "deferred", "rejected"] as const).map((status) => (
-          <div key={status}>
-            <div className="microlabel text-[10px] text-faint-foreground">{status}</div>
-            <div className="mt-1 tabular text-[20px] font-semibold text-foreground">{counts[status] ?? 0}</div>
-          </div>
-        ))}
-        <div>
-          <div className="microlabel text-[10px] text-faint-foreground">visible total</div>
-          <div className="mt-1 tabular text-[20px] font-semibold text-foreground">{total}</div>
-        </div>
-      </Card>
 
       <div role="tablist" aria-label="Proposal status" className="flex flex-wrap items-center gap-1 rounded-control border border-border bg-card p-0.5">
         {FILTERS.map((f) => (
@@ -468,7 +305,7 @@ export function Proposals() {
               filter === f && "bg-muted text-foreground shadow-sm",
             )}
           >
-            {f}
+            {f === "pending" ? "waiting" : f}
             <span className="ml-1.5 text-faint-foreground">
               {f === "all" ? total : (counts[f] ?? 0)}
             </span>
@@ -493,16 +330,16 @@ export function Proposals() {
         />
       ) : q.data.items.length === 0 ? (
         <EmptyState
-          title={`No ${filter === "all" ? "" : filter} proposals`}
+          title={filter === "pending" ? "Nothing waiting" : `No ${filter} proposals`}
           body={
             filter === "pending"
-            ? "No proposals met evidence gates. Cards come from transcript evidence packets, with provenance shown per record; they are not static unused-skill or usage-profile templates."
-              : "Proposals appear after packet ingest clears evidence gates; provenance distinguishes reviewed packet records from legacy and deterministic records."
+              ? "When a standing agent rule turns up in a session, it lands here for you to accept or skip."
+              : "Switch the filter to see other decisions."
           }
           className="min-h-[180px]"
         />
       ) : (
-        <div className="flex flex-col gap-3">
+        <div className="flex flex-col gap-4">
           {q.data.items.map((p) => (
             <ProposalCard
               key={p.id}
