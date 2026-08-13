@@ -749,6 +749,18 @@ def _insights_clip(text: str | None, limit: int = 280) -> str:
     return cleaned[: max(0, limit - 1)] + "…"
 
 
+def _insights_body(text: str | None) -> str:
+    raw = str(text or "").replace("\r\n", "\n").strip()
+    if not raw:
+        return ""
+    paragraphs: list[str] = []
+    for block in raw.split("\n\n"):
+        cleaned = " ".join(block.split())
+        if cleaned:
+            paragraphs.append(cleaned)
+    return "\n\n".join(paragraphs)
+
+
 def _insight_provenance(
     *,
     derivation: str | None,
@@ -1096,7 +1108,7 @@ def _claim_insight_card(claim: Any) -> dict[str, Any] | None:
     value = dict(claim.value or {})
     basis = dict(claim.confidence_basis or {})
     phrasing = value.get("summary") or value.get("phrasing") or ""
-    body = _insights_clip(phrasing) or _insights_clip(
+    body = _insights_body(str(phrasing)) or (
         f"{claim.kind}: {claim.subject} ({claim.predicate})"
     )
 
@@ -1400,8 +1412,6 @@ def insights_feed(conn: sqlite3.Connection, tr: TimeRange) -> dict[str, Any]:
     """
     from agentlog.analysis.claims import list_claims, list_proposals
 
-    ux_n = count_ux_observations(conn, tr)
-
     claims = list_claims(conn, status=None, include_evidence=True, limit=200)
     proposals = _coalesce_pending_coach_proposals(
         list_proposals(conn, status="pending", include_claims=True, limit=100)
@@ -1444,13 +1454,11 @@ def insights_feed(conn: sqlite3.Connection, tr: TimeRange) -> dict[str, Any]:
     ]
 
     empty = {
-        "title": "No evidence-backed insights in range",
+        "title": "No notes in this range",
         "body": (
-            "No approved observations, published corpus patterns, or pending coach "
-            "proposals fall inside this range. Insights appear only after "
-            f"evidence-backed review. UX observations in range: {ux_n}."
+            "Nothing in this time window yet. Standing notes often live under All."
         ),
-        "missing": ["observed instances", "corpus patterns", "coach proposals"],
+        "missing": [],
     }
     return {"items": items, "empty": empty}
 

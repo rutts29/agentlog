@@ -207,10 +207,8 @@ class InsightsFeedTests(unittest.TestCase):
             ),
         )
         self.assertEqual(bounded["items"], [])
-        self.assertEqual(
-            bounded["empty"]["missing"],
-            ["observed instances", "corpus patterns", "coach proposals"],
-        )
+        self.assertEqual(bounded["empty"]["missing"], [])
+        self.assertIn("All", bounded["empty"]["body"])
 
     def test_feed_shows_pending_proposals_and_only_reviewed_ok_claims(self) -> None:
         upsert_claims(
@@ -812,6 +810,61 @@ class InsightsFeedTests(unittest.TestCase):
             import_session_fact_packet(
                 self.conn, packet, model="gpt-5.6-sol"
             )
+
+    def test_approved_session_fact_keeps_full_body(self) -> None:
+        session_id = "cursor:project/full-body"
+        long_body = (
+            "First paragraph explains the working rule in enough detail "
+            "that a 280-character clip would cut it off mid-sentence "
+            "and hide the next action.\n\n"
+            "Second paragraph is the part you must still be able to read."
+        )
+        self.conn.execute(
+            """
+            INSERT INTO sessions (id, harness, external_id, started_at, repo)
+            VALUES (?, 'cursor', 'project/full-body', '2026-08-09T12:00:00+00:00', 'demo')
+            """,
+            (session_id,),
+        )
+        self.conn.execute(
+            """
+            INSERT INTO messages (id, session_id, seq, role, timestamp, text)
+            VALUES ('m-full', ?, 1, 'user', '2026-08-09T12:01:00+00:00', ?)
+            """,
+            (session_id, "you taking up tasks slows down the work never do that unless asked for"),
+        )
+        packet = Path(self._tmp.name) / "full-body.json"
+        packet.write_text(
+            json.dumps(
+                {
+                    "run_id": "facts-full-body",
+                    "source": "session_llm_facts",
+                    "items": [
+                        {
+                            "session_id": session_id,
+                            "message_seq": 1,
+                            "kind": "how_you_run",
+                            "title": "Lead must not implement",
+                            "body": long_body,
+                            "quote": "you taking up tasks slows down the work never do that unless asked for",
+                            "does_not_prove": "That you never DIY.",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        import_session_fact_packet(
+            self.conn,
+            packet,
+            model="grok-4.6",
+            status="approved",
+        )
+        self.conn.commit()
+        card = insights_feed(self.conn, parse_range("all"))["items"][0]
+        self.assertIn("Second paragraph is the part you must still be able to read.", card["body"])
+        self.assertNotIn("…", card["body"])
+        self.assertEqual(card["review_state"], "approved")
 
 
 if __name__ == "__main__":

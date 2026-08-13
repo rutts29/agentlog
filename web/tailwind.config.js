@@ -32,6 +32,7 @@ export default {
         },
         speaker: {
           human: "var(--speaker-human)",
+          "human-dim": "var(--speaker-human-dim)",
           agent: "var(--speaker-agent)",
           tool: "var(--speaker-tool)",
           system: "var(--speaker-system)",

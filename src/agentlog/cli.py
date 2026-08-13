@@ -459,6 +459,11 @@ def insights_import_cmd(
     ctx: typer.Context,
     packet: Path = typer.Argument(..., help="Validated session-fact JSON packet"),
     model: str = typer.Option(..., "--model", help="Model that authored the facts"),
+    approve: bool = typer.Option(
+        False,
+        "--approve",
+        help="Mark imported facts approved so they appear on Insights",
+    ),
 ) -> None:
     """Import evidence-linked LLM session facts into the local claims ledger."""
     from agentlog.analysis.insights import import_session_fact_packet
@@ -469,7 +474,12 @@ def insights_import_cmd(
     init_db(conn)
     conn.execute("PRAGMA busy_timeout = 30000")
     try:
-        stats = import_session_fact_packet(conn, packet, model=model)
+        stats = import_session_fact_packet(
+            conn,
+            packet,
+            model=model,
+            status="approved" if approve else "candidate",
+        )
         conn.commit()
     except ValueError as exc:
         conn.rollback()
