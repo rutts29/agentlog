@@ -10,11 +10,11 @@ type Ctx = { range: string };
 
 function Caveat({ text }: { text: string }) {
   return (
-    <aside className="border-l-2 border-speaker-human bg-speaker-human-dim px-3.5 py-3">
+    <aside className="border-l-2 border-speaker-human bg-speaker-human-dim px-3 py-2.5">
       <div className="text-[12px] font-medium text-speaker-human">
         Hold this lightly
       </div>
-      <p className="mt-1 text-[13.5px] leading-relaxed text-foreground">{text}</p>
+      <p className="mt-1 text-[13px] leading-relaxed text-foreground">{text}</p>
     </aside>
   );
 }
@@ -29,26 +29,28 @@ function InsightCardView({ card }: { card: InsightCard }) {
       : "Open the session";
 
   return (
-    <article className="elev-card relative overflow-hidden rounded-card border border-border bg-card px-6 py-6">
-      <div
-        aria-hidden
-        className="absolute inset-y-0 left-0 w-[3px] bg-speaker-human/80"
-      />
-      <h2 className="text-[20px] font-semibold leading-[1.3] tracking-tight text-foreground">
-        {card.title}
-      </h2>
-      <p className="mt-3 max-w-[62ch] whitespace-pre-wrap text-[15px] leading-[1.7] text-foreground/90">
-        {card.body}
-      </p>
-      {card.does_not_prove ? <div className="mt-4"><Caveat text={card.does_not_prove} /></div> : null}
-      {href ? (
-        <Link
-          to={href}
-          className="mt-5 inline-flex text-[13px] text-speaker-human underline decoration-speaker-human/30 underline-offset-4 hover:decoration-speaker-human"
-        >
-          {linkLabel}
-        </Link>
-      ) : null}
+    <article className="insight-note elev-card overflow-hidden rounded-card border border-border bg-card">
+      <div className="px-5 py-5">
+        <h2 className="text-[18px] font-semibold leading-[1.28] tracking-tight text-foreground">
+          {card.title}
+        </h2>
+        <p className="mt-3 whitespace-pre-wrap text-[14px] leading-[1.65] text-foreground/90">
+          {card.body}
+        </p>
+        {card.does_not_prove ? (
+          <div className="mt-4">
+            <Caveat text={card.does_not_prove} />
+          </div>
+        ) : null}
+        {href ? (
+          <Link
+            to={href}
+            className="mt-4 inline-flex text-[13px] text-speaker-human underline decoration-speaker-human/30 underline-offset-4 hover:decoration-speaker-human"
+          >
+            {linkLabel}
+          </Link>
+        ) : null}
+      </div>
     </article>
   );
 }
@@ -64,8 +66,8 @@ function Section({
 }) {
   if (count === 0) return null;
   return (
-    <section className="space-y-4">
-      <h2 className="text-[12px] font-medium uppercase tracking-[0.08em] text-muted-foreground">
+    <section>
+      <h2 className="mb-3 text-[12px] font-medium uppercase tracking-[0.08em] text-muted-foreground">
         {title}
         <span className="ml-2 tabular text-faint-foreground">{count}</span>
       </h2>
@@ -98,7 +100,7 @@ export function Insights() {
   const forAgent = data.items.filter((c) => c.source === "proposal");
 
   return (
-    <div className="mx-auto max-w-[680px] space-y-8">
+    <div className="space-y-8">
       <div>
         <h1 className="text-[22px] font-semibold tracking-tight">Insights</h1>
         <p className="mt-1 max-w-[58ch] text-[13px] leading-relaxed text-muted-foreground">
@@ -125,14 +127,14 @@ export function Insights() {
       ) : (
         <>
           <Section title="For you" count={forYou.length}>
-            <div className="flex flex-col gap-4">
+            <div className="insight-board">
               {forYou.map((card) => (
                 <InsightCardView key={card.id} card={card} />
               ))}
             </div>
           </Section>
           <Section title="Also on the proposals board" count={forAgent.length}>
-            <div className="flex flex-col gap-4">
+            <div className="insight-board">
               {forAgent.map((card) => (
                 <InsightCardView key={card.id} card={card} />
               ))}
