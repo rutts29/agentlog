@@ -17,7 +17,7 @@ import { LoadingOrb } from "@/components/LoadingOrb";
 import { HarnessTag, ModelBadge, RuntimeHarnessLabel } from "@/components/ui/badges";
 import { cn, formatDuration, formatFullTime, harnessColor } from "@/lib/utils";
 import { useViewShortcuts } from "@/lib/keyboard";
-import { projectBranchTree } from "@/lib/sessionTree";
+import { isWorkerTreeNode, projectBranchTree, sessionTreeLabel } from "@/lib/sessionTree";
 import { LiveOrb } from "@/components/LiveOrb";
 import { useIngestStream } from "@/lib/useIngestStream";
 import { useLivePresence } from "@/lib/useLivePresence";
@@ -510,7 +510,7 @@ export function Sessions() {
                         <div className="flex min-w-0 flex-col items-start gap-0.5">
                           <div className="flex items-center gap-1.5">
                             <span className="inline-flex items-center rounded-[4px] border border-border px-1.5 py-[2px] text-[10px] leading-none text-muted-foreground">
-                              Main
+                              {sessionTreeLabel(s, 0)}
                             </span>
                             {live ? (
                               <span className="inline-flex items-center gap-1 text-[10px] text-accent-live">
@@ -701,7 +701,7 @@ function TreeRows({
           workflowGroupId && workflowGroupId !== lastWorkflowGroupId,
         );
         lastWorkflowGroupId = workflowGroupId;
-        const role = node.thread_source === "subagent" || node.relationship === "provider_worker" ? "Worker" : "Branch";
+        const role = isWorkerTreeNode(node) ? "Worker" : "Branch";
         return (
           <Fragment key={node.id}>
             {showWorkflowGroup ? (

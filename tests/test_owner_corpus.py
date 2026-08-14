@@ -9,7 +9,10 @@ from agentlog.analysis.owner_corpus import collect_owner_corpus
 from agentlog.analysis.owner_notes import prepare_owner_insight_messages
 from agentlog.db.schema import init_db
 from agentlog.source_reader import CachedSourceTranscriptReader, SourceReadResult
-from agentlog.session_identity import INTERNAL_APPROVAL_GUARDIAN_THREAD_SOURCE
+from agentlog.session_identity import (
+    GROK_AUTONOMOUS_AGENT_UNLINKED_THREAD_SOURCE,
+    INTERNAL_APPROVAL_GUARDIAN_THREAD_SOURCE,
+)
 
 
 class OwnerCorpusTests(unittest.TestCase):
@@ -23,10 +26,10 @@ class OwnerCorpusTests(unittest.TestCase):
         self.conn.close()
         self.facts_dir.cleanup()
 
-    def add_session(self, session_id: str, *, harness: str = "codex", parent: str | None = None, storage: str = "legacy_materialized", guardian: bool = False) -> None:
+    def add_session(self, session_id: str, *, harness: str = "codex", parent: str | None = None, storage: str = "legacy_materialized", guardian: bool = False, thread_source: str | None = None) -> None:
         self.conn.execute(
             "INSERT INTO sessions(id,harness,external_id,parent_session_id,repo,started_at,transcript_storage,thread_source) VALUES(?,?,?,?,?,?,?,?)",
-            (session_id, harness, session_id, parent, "repo", "2026-08-14T00:00:00+00:00", storage, INTERNAL_APPROVAL_GUARDIAN_THREAD_SOURCE if guardian else None),
+            (session_id, harness, session_id, parent, "repo", "2026-08-14T00:00:00+00:00", storage, thread_source or (INTERNAL_APPROVAL_GUARDIAN_THREAD_SOURCE if guardian else None)),
         )
 
     def add_message(self, session_id: str, seq: int, text: str, role: str = "user") -> None:
@@ -56,6 +59,20 @@ class OwnerCorpusTests(unittest.TestCase):
         backing = next(message for message in corpus.messages if message["session_id"] == "codex-backing")
         self.assertEqual(backing["source_snapshot"]["logical_session_id"], "t3-root")
         self.assertNotIn("guardian", corpus.session_ids)
+
+    def test_corpus_excludes_unlinked_autonomous_runs(self) -> None:
+        self.add_session(
+            "grok-autonomous",
+            harness="grok",
+            thread_source=GROK_AUTONOMOUS_AGENT_UNLINKED_THREAD_SOURCE,
+        )
+        self.add_message("grok-autonomous", 1, "workflow smoke check")
+        self.conn.commit()
+
+        corpus = collect_owner_corpus(self.conn)
+
+        self.assertNotIn("grok-autonomous", corpus.session_ids)
+        self.assertFalse(any(message["session_id"] == "grok-autonomous" for message in corpus.messages))
 
     def test_corpus_ignores_whitespace_only_records(self) -> None:
         self.add_session("one")

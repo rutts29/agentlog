@@ -148,6 +148,7 @@ export function displaySessionIdentity(
 export type SessionRow = SessionIdentityFields & {
   id: string;
   navigation_id?: string;
+  thread_source?: string | null;
   harness: string;
   model: string;
   effort: string | null;

@@ -695,6 +695,18 @@ class SessionsTreeBrowsingTests(unittest.TestCase):
         assert tree is not None
         self.assertEqual(tree["tree"]["children"][0]["thread_source"], "subagent")
 
+    def test_session_list_exposes_root_thread_source(self) -> None:
+        self.session(
+            "grok:autonomous-root",
+            harness="grok",
+            thread_source="autonomous_agent_unlinked",
+        )
+        self.conn.commit()
+
+        listed = list_sessions_v2(self.conn, _range())
+
+        self.assertEqual(listed["items"][0]["thread_source"], "autonomous_agent_unlinked")
+
     def test_internal_approval_guardian_is_hidden_from_tree(self) -> None:
         self.session("codex:guardian-root", external_id="guardian-root")
         self.session(

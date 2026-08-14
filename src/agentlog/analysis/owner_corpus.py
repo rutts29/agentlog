@@ -18,6 +18,7 @@ from typing import Any, Callable, Iterable
 from agentlog.api.identity_aggregates import visible_logical_sessions
 from agentlog.safety.redaction import REDACTION_VERSION, RedactionReport, redact_text
 from agentlog.source_reader import CachedSourceTranscriptReader, SourceReadResult
+from agentlog.session_identity import GROK_AUTONOMOUS_AGENT_UNLINKED_THREAD_SOURCE
 
 
 @dataclass(frozen=True)
@@ -149,10 +150,19 @@ def collect_owner_corpus(
     """Read the complete selected visible logical corpus with source verification."""
     requested = {value for value in (session_ids or ()) if value}
     rows = conn.execute("SELECT * FROM sessions ORDER BY COALESCE(ended_at, started_at), id").fetchall()
+    rows_by_id = {str(row["id"]): row for row in rows}
     visible = visible_logical_sessions(conn, rows)
     selected = []
     for item in visible:
         row = item.row
+        metric_row = rows_by_id.get(str(item.metric_session_id))
+        if any(
+            str(candidate["thread_source"] or "")
+            == GROK_AUTONOMOUS_AGENT_UNLINKED_THREAD_SOURCE
+            for candidate in (row, metric_row)
+            if candidate is not None
+        ):
+            continue
         if requested and item.session_id not in requested and item.metric_session_id not in requested:
             continue
         activity = str(row["ended_at"] or row["started_at"] or "")

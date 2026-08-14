@@ -9,7 +9,10 @@ from unittest import mock
 from agentlog.ingest.grok import GrokAdapter, is_bootstrap_only_artifact
 from agentlog.normalize.models import Harness
 from agentlog.registry.harnesses import get_harness
-from agentlog.session_identity import GROK_BOOTSTRAP_ONLY_THREAD_SOURCE
+from agentlog.session_identity import (
+    GROK_AUTONOMOUS_AGENT_UNLINKED_THREAD_SOURCE,
+    GROK_BOOTSTRAP_ONLY_THREAD_SOURCE,
+)
 
 
 def _line(value: dict, *, newline: bool = True) -> bytes:
@@ -121,7 +124,102 @@ def _bootstrap_summary(**overrides: object) -> dict[str, object]:
     }
 
 
+def _autonomous_fixture(*, system_prefix: str | None = None, query: str = "inspect the workflow") -> bytes:
+    return b"".join(
+        [
+            _line({
+                "type": "system",
+                "content": system_prefix
+                or "You are Grok 4.6 released by xAI. You are an autonomous agent that completes software engineering tasks. There is no human operator in this session.\n\n<work_policy>",
+            }),
+            _line({"type": "user", "content": "<user_info>workspace</user_info>"}),
+            _line({"type": "user", "synthetic_reason": "system_reminder", "content": "<system-reminder>skills"}),
+            _line({"type": "user", "content": f"<user_query>{query}</user_query>"}),
+            _line({"type": "assistant", "content": "validated"}),
+        ]
+    )
+
+
 class GrokAdapterTests(unittest.TestCase):
+    def test_classifies_exact_unlinked_autonomous_run_and_marks_query(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "sessions"
+            path = root / "%2Ftmp%2Fagentlog" / "autonomous" / "chat_history.jsonl"
+            path.parent.mkdir(parents=True)
+            data = _autonomous_fixture()
+            path.write_bytes(data)
+            (path.parent / "summary.json").write_text(
+                json.dumps({"agent_name": "grok-build-plan"}), encoding="utf-8"
+            )
+            with mock.patch("agentlog.ingest.grok.GROK_SESSIONS_DIR", root):
+                result = GrokAdapter().parse_chunk(path, data, start_offset=0)
+
+        self.assertEqual(
+            result.session.thread_source,
+            GROK_AUTONOMOUS_AGENT_UNLINKED_THREAD_SOURCE,
+        )
+        query = next(message for message in result.messages if message.text == "inspect the workflow")
+        self.assertTrue(query.authored_by_agent)
+        self.assertFalse(query.is_tool_plumbing)
+        self.assertEqual(result.messages[-1].text, "validated")
+
+    def test_autonomous_near_misses_remain_unclassified(self) -> None:
+        cases = {
+            "wrong-model": "You are Grok 4.5 released by xAI. You are an autonomous agent that completes software engineering tasks. There is no human operator in this session.",
+            "human-present": "You are Grok 4.6 released by xAI. You are an autonomous agent that completes software engineering tasks. A human operator is present in this session.",
+        }
+        for name, prefix in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "sessions"
+                path = root / "%2Ftmp%2Fagentlog" / name / "chat_history.jsonl"
+                path.parent.mkdir(parents=True)
+                data = _autonomous_fixture(system_prefix=prefix)
+                path.write_bytes(data)
+                (path.parent / "summary.json").write_text(
+                    json.dumps({"agent_name": "grok-build-plan"}), encoding="utf-8"
+                )
+                with mock.patch("agentlog.ingest.grok.GROK_SESSIONS_DIR", root):
+                    result = GrokAdapter().parse_chunk(path, data, start_offset=0)
+                self.assertIsNone(result.session.thread_source)
+
+    def test_parent_metadata_preserves_workflow_semantics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "sessions"
+            path = root / "%2Ftmp%2Fagentlog" / "child" / "chat_history.jsonl"
+            path.parent.mkdir(parents=True)
+            data = _autonomous_fixture()
+            path.write_bytes(data)
+            (path.parent / "summary.json").write_text(
+                json.dumps({"agent_name": "grok-build-plan"}), encoding="utf-8"
+            )
+            meta = root / "%2Ftmp%2Fagentlog" / "parent" / "subagents" / "child"
+            meta.mkdir(parents=True)
+            (meta / "meta.json").write_text(
+                json.dumps({"child_session_id": "child", "parent_session_id": "parent"}),
+                encoding="utf-8",
+            )
+            (meta / "output.json").write_text("{}", encoding="utf-8")
+            with mock.patch("agentlog.ingest.grok.GROK_SESSIONS_DIR", root):
+                result = GrokAdapter().parse_source_snapshot(path, GrokAdapter().capture_source(path))[0]
+        self.assertEqual(result.session.parent_session_id, "grok:parent")
+        self.assertEqual(result.session.thread_source, "workflow_subagent")
+
+    def test_summary_parent_preserves_parent_semantics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "sessions"
+            path = root / "%2Ftmp%2Fagentlog" / "summary-parent" / "chat_history.jsonl"
+            path.parent.mkdir(parents=True)
+            data = _autonomous_fixture()
+            path.write_bytes(data)
+            (path.parent / "summary.json").write_text(
+                json.dumps({"agent_name": "grok-build-plan", "parent_session_id": "parent"}),
+                encoding="utf-8",
+            )
+            with mock.patch("agentlog.ingest.grok.GROK_SESSIONS_DIR", root):
+                result = GrokAdapter().parse_chunk(path, data, start_offset=0)
+        self.assertEqual(result.session.parent_session_id, "grok:parent")
+        self.assertIsNone(result.session.thread_source)
+
     def test_suppresses_exact_two_record_grok_bootstrap_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "sessions"
@@ -141,6 +239,51 @@ class GrokAdapterTests(unittest.TestCase):
         self.assertEqual(result.tool_events, [])
         self.assertEqual(result.token_usages, [])
         self.assertEqual(result.extras["activity_suppressed"], "grok_bootstrap_only")
+
+    def test_suppresses_verified_counter_variant(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "sessions"
+            path = root / "%2Ftmp%2Fagentlog" / "counter-one" / "chat_history.jsonl"
+            path.parent.mkdir(parents=True)
+            data = _bootstrap_fixture()
+            path.write_bytes(data)
+            (path.parent / "summary.json").write_text(
+                json.dumps(_bootstrap_summary(num_messages=1)), encoding="utf-8"
+            )
+            with mock.patch("agentlog.ingest.grok.GROK_SESSIONS_DIR", root):
+                result = GrokAdapter().parse_chunk(path, data, start_offset=0)
+                self.assertTrue(is_bootstrap_only_artifact(path))
+
+        self.assertEqual(result.session.thread_source, GROK_BOOTSTRAP_ONLY_THREAD_SOURCE)
+        self.assertEqual(result.messages, [])
+
+    def test_does_not_suppress_wrong_system_reminder(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "sessions"
+            path = root / "%2Ftmp%2Fagentlog" / "wrong-reminder" / "chat_history.jsonl"
+            path.parent.mkdir(parents=True)
+            rows = [
+                _line({
+                    "type": "system",
+                    "content": "You are Grok 4.6 released by xAI. You are an interactive CLI tool.",
+                }),
+                _line({
+                    "type": "user",
+                    "synthetic_reason": "system_reminder",
+                    "content": "<system-reminder>Only this reminder is unrelated.",
+                }),
+            ]
+            data = b"".join(rows)
+            path.write_bytes(data)
+            (path.parent / "summary.json").write_text(
+                json.dumps(_bootstrap_summary(num_messages=1)), encoding="utf-8"
+            )
+            with mock.patch("agentlog.ingest.grok.GROK_SESSIONS_DIR", root):
+                result = GrokAdapter().parse_chunk(path, data, start_offset=0)
+                self.assertFalse(is_bootstrap_only_artifact(path))
+
+        self.assertIsNone(result.session.thread_source)
+        self.assertEqual([message.role for message in result.messages], ["system", "user"])
 
     def test_does_not_suppress_system_first_grok_conversations(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
