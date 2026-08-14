@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest import mock
 
 from agentlog.db.migrations.v036_grok_bootstrap_only import apply as apply_v036
+from agentlog.db.migrations.v037_grok_bootstrap_counter_variant import apply as apply_v037
 from agentlog.db.schema import connect, init_db
 from agentlog.ingest.grok import GrokAdapter
 from agentlog.session_identity import GROK_BOOTSTRAP_ONLY_THREAD_SOURCE
@@ -23,7 +24,15 @@ class GrokBootstrapOnlyMigrationTests(unittest.TestCase):
         self._tmp.cleanup()
 
     def _add_source(
-        self, session_id: str, *, bootstrap: bool, ancillary: bool = False
+        self,
+        session_id: str,
+        *,
+        bootstrap: bool,
+        ancillary: bool = False,
+        summary_num_messages: int | None = None,
+        summary_num_chat_messages: int | None = None,
+        reminder_text: str | None = None,
+        extra_rows: list[dict[str, object]] | None = None,
     ) -> int:
         root = Path(self._tmp.name) / "sources" / session_id.removeprefix("grok:")
         path = root / "chat_history.jsonl"
@@ -36,16 +45,24 @@ class GrokBootstrapOnlyMigrationTests(unittest.TestCase):
             {
                 "type": "user",
                 "synthetic_reason": "system_reminder" if bootstrap else None,
-                "content": "<system-reminder>The following skills are available for use:",
+                "content": reminder_text
+                or "<system-reminder>The following skills are available for use:",
             },
         ]
+        rows.extend(extra_rows or [])
+        num_messages = summary_num_messages
+        if num_messages is None:
+            num_messages = 0 if bootstrap else 1
+        num_chat_messages = summary_num_chat_messages
+        if num_chat_messages is None:
+            num_chat_messages = 2 if bootstrap else 3
         path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
         (root / "summary.json").write_text(
             json.dumps(
                 {
                     "agent_name": "grok-build-plan",
-                    "num_messages": 0 if bootstrap else 1,
-                    "num_chat_messages": 2 if bootstrap else 3,
+                    "num_messages": num_messages,
+                    "num_chat_messages": num_chat_messages,
                 }
             ),
             encoding="utf-8",
@@ -79,9 +96,19 @@ class GrokBootstrapOnlyMigrationTests(unittest.TestCase):
         message_count: int = 2,
         bootstrap_source: bool = True,
         ancillary_source: bool = False,
+        summary_num_messages: int | None = None,
+        summary_num_chat_messages: int | None = None,
+        reminder_text: str | None = None,
+        extra_rows: list[dict[str, object]] | None = None,
     ) -> None:
         artifact_id = self._add_source(
-            session_id, bootstrap=bootstrap_source, ancillary=ancillary_source
+            session_id,
+            bootstrap=bootstrap_source,
+            ancillary=ancillary_source,
+            summary_num_messages=summary_num_messages,
+            summary_num_chat_messages=summary_num_chat_messages,
+            reminder_text=reminder_text,
+            extra_rows=extra_rows,
         )
         self.conn.execute(
             """
@@ -166,6 +193,57 @@ class GrokBootstrapOnlyMigrationTests(unittest.TestCase):
             2,
         )
         self.assertEqual(self.conn.execute("PRAGMA foreign_key_check").fetchall(), [])
+
+    def test_v037_clears_counter_variant_and_preserves_near_misses(self) -> None:
+        self._add_session(
+            "grok:counter-one",
+            summary_num_messages=1,
+        )
+        self._add_session(
+            "grok:real-third-record",
+            message_count=3,
+            summary_num_messages=1,
+            summary_num_chat_messages=3,
+            extra_rows=[{"type": "user", "content": "Inspect this repository."}],
+        )
+        self._add_session(
+            "grok:wrong-reminder",
+            summary_num_messages=1,
+            reminder_text="<system-reminder>This is not a skills reminder.",
+        )
+        self.conn.commit()
+
+        apply_v037(self.conn)
+        apply_v037(self.conn)
+        self.conn.commit()
+
+        suppressed = self.conn.execute(
+            "SELECT thread_source FROM sessions WHERE id = 'grok:counter-one'"
+        ).fetchone()
+        self.assertIsNotNone(suppressed)
+        self.assertEqual(suppressed["thread_source"], GROK_BOOTSTRAP_ONLY_THREAD_SOURCE)
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM messages WHERE session_id = 'grok:counter-one'"
+            ).fetchone()[0],
+            0,
+        )
+        for session_id, count in (
+            ("grok:real-third-record", 3),
+            ("grok:wrong-reminder", 2),
+        ):
+            with self.subTest(session_id=session_id):
+                self.assertIsNone(
+                    self.conn.execute(
+                        "SELECT thread_source FROM sessions WHERE id = ?", (session_id,)
+                    ).fetchone()["thread_source"]
+                )
+                self.assertEqual(
+                    self.conn.execute(
+                        "SELECT COUNT(*) FROM messages WHERE session_id = ?", (session_id,)
+                    ).fetchone()[0],
+                    count,
+                )
 
     def test_preserves_bootstrap_shape_with_relationship_or_cluster(self) -> None:
         self._add_session("grok:linked")

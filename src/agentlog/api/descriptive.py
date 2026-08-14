@@ -1078,6 +1078,7 @@ def list_sessions_v2(
                 ),
                 "matching_descendant_count": matching_descendant_count,
                 "parent_session_id": row["parent_session_id"],
+                "thread_source": row["thread_source"],
                 "transcript_storage": (
                     metric["transcript_storage"] or "legacy_materialized"
                 ),

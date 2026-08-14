@@ -15,6 +15,24 @@ export type BranchTreeProjection = {
   truncated: boolean;
 };
 
+export function isWorkerTreeNode(node: Pick<TreeNode, "thread_source" | "relationship">): boolean {
+  return (
+    node.relationship === "provider_worker" ||
+    node.thread_source === "subagent" ||
+    node.thread_source === "workflow_subagent"
+  );
+}
+
+export function sessionTreeLabel(
+  node: Pick<TreeNode, "thread_source" | "relationship">,
+  depth: number,
+): "Agent run" | "Main" | "Worker" | "Branch" {
+  if (depth === 0) {
+    return node.thread_source === "autonomous_agent_unlinked" ? "Agent run" : "Main";
+  }
+  return isWorkerTreeNode(node) ? "Worker" : "Branch";
+}
+
 function nonnegativeInteger(value: unknown): number | null {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
     ? value

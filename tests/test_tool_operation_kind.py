@@ -231,7 +231,7 @@ class ToolOperationKindTests(unittest.TestCase):
         )
 
     def test_v026_adds_column_to_legacy_tool_events(self) -> None:
-        self.assertEqual(MIGRATIONS[-1][0], 36)
+        self.assertEqual(MIGRATIONS[-1][0], 38)
         conn = sqlite3.connect(":memory:")
         conn.executescript(
             """

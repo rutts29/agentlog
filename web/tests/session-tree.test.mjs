@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { findBranchPath, projectBranchTree } from "../src/lib/sessionTree.ts";
+import {
+  findBranchPath,
+  isWorkerTreeNode,
+  projectBranchTree,
+  sessionTreeLabel,
+} from "../src/lib/sessionTree.ts";
 
 function node(id, children = [], descendantCount = children.length) {
   return {
@@ -18,6 +23,22 @@ function node(id, children = [], descendantCount = children.length) {
     children,
   };
 }
+
+test("worker tree nodes include workflow and provider workers but not ordinary branches", () => {
+  assert.equal(isWorkerTreeNode({ thread_source: "subagent", relationship: null }), true);
+  assert.equal(isWorkerTreeNode({ thread_source: "workflow_subagent", relationship: null }), true);
+  assert.equal(isWorkerTreeNode({ thread_source: null, relationship: "provider_worker" }), true);
+  assert.equal(isWorkerTreeNode({ thread_source: null, relationship: "child" }), false);
+});
+
+test("tree labels distinguish autonomous roots from main roots and workers", () => {
+  assert.equal(sessionTreeLabel({ thread_source: "autonomous_agent_unlinked", relationship: null }, 0), "Agent run");
+  assert.equal(sessionTreeLabel({ thread_source: null, relationship: null }, 0), "Main");
+  assert.equal(sessionTreeLabel({ thread_source: "subagent", relationship: null }, 1), "Worker");
+  assert.equal(sessionTreeLabel({ thread_source: "workflow_subagent", relationship: null }, 1), "Worker");
+  assert.equal(sessionTreeLabel({ thread_source: null, relationship: "provider_worker" }, 1), "Worker");
+  assert.equal(sessionTreeLabel({ thread_source: null, relationship: "child" }, 1), "Branch");
+});
 
 test("deep branch projection stops at the client depth budget", () => {
   let root = node("deep-79");

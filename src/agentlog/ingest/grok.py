@@ -30,7 +30,10 @@ from agentlog.normalize.models import (
 )
 from agentlog.normalize.synthetic import classify_synthetic_user_text
 from agentlog.normalize.tool_ops import classify_operation
-from agentlog.session_identity import GROK_BOOTSTRAP_ONLY_THREAD_SOURCE
+from agentlog.session_identity import (
+    GROK_AUTONOMOUS_AGENT_UNLINKED_THREAD_SOURCE,
+    GROK_BOOTSTRAP_ONLY_THREAD_SOURCE,
+)
 
 
 _USER_QUERY_RE = re.compile(
@@ -41,6 +44,11 @@ _GROK_BOOTSTRAP_PROMPT = re.compile(
     r"^you are grok 4\.[56] released by xai\.", re.IGNORECASE
 )
 _GROK_SKILL_REMINDER = "the following skills are available for use:"
+_GROK_AUTONOMOUS_PROMPT_PREFIX = (
+    "You are Grok 4.6 released by xAI. You are an autonomous agent that "
+    "completes software engineering tasks. There is no human operator in "
+    "this session."
+)
 
 
 def _workspace(path: Path) -> tuple[str | None, str | None]:
@@ -115,7 +123,7 @@ def is_bootstrap_only_session(
     """Recognize Grok's two-record CLI setup artifact and nothing broader."""
     if (
         _field(summary, "agent_name", "agent") != "grok-build-plan"
-        or _summary_count(summary, "num_messages") != 0
+        or _summary_count(summary, "num_messages") not in {0, 1}
         or _summary_count(summary, "num_chat_messages") != 2
         or not isinstance(records, list)
         or len(records) != 2
@@ -201,6 +209,44 @@ def is_bootstrap_only_artifact(
     except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
         return False
     return True
+
+
+def autonomous_user_query_index(
+    summary: dict[str, Any], records: list[dict[str, Any]] | None
+) -> int | None:
+    """Return the first real user-query record in an exact autonomous run."""
+    if (
+        _field(summary, "agent_name", "agent") != "grok-build-plan"
+        or not isinstance(records, list)
+        or not records
+    ):
+        return None
+    first = records[0]
+    if str(first.get("type") or "") != "system":
+        return None
+    system_text = extract_text(first.get("content"))
+    if not system_text.startswith(_GROK_AUTONOMOUS_PROMPT_PREFIX):
+        return None
+    for index, record in enumerate(records):
+        if str(record.get("type") or "") != "user":
+            continue
+        if str(record.get("synthetic_reason") or "").strip():
+            continue
+        raw_text = extract_text(record.get("content"))
+        match = _USER_QUERY_RE.search(raw_text)
+        if match and match.group(1).strip():
+            return index
+    return None
+
+
+def is_autonomous_agent_session(
+    summary: dict[str, Any],
+    records: list[dict[str, Any]] | None,
+    *,
+    has_parent: bool = False,
+) -> bool:
+    """Recognize an unlinked autonomous run without inferring from metadata."""
+    return not has_parent and autonomous_user_query_index(summary, records) is not None
 
 
 def _git_fields(obj: dict[str, Any]) -> tuple[str | None, str | None, str | None]:
@@ -722,6 +768,11 @@ class GrokAdapter(TranscriptAdapter):
             _field(child_meta, "parent_session_id", "parentSessionId", "parent_id")
             or ""
         ) or parent
+        summary_parent = _field(
+            summary, "parent_session_id", "parentSessionId", "parent_id"
+        )
+        if summary_parent and str(summary_parent) != external_id and not parent:
+            parent = str(summary_parent)
         if parent and not parent.startswith(f"{Harness.GROK.value}:"):
             parent = f"{Harness.GROK.value}:{parent}"
         child_model = _field(child_meta, "effective_model_id", "model_id", "model")
@@ -749,12 +800,32 @@ class GrokAdapter(TranscriptAdapter):
         checkpoint_blocked = records is None
         if records is None:
             records = []
+        record_parent = next(
+            (
+                str(_field(record, "parent_session_id", "parentSessionId", "parent_id"))
+                for record in records
+                if _field(record, "parent_session_id", "parentSessionId", "parent_id")
+                and str(_field(record, "parent_session_id", "parentSessionId", "parent_id"))
+                != external_id
+            ),
+            None,
+        )
+        if record_parent and not parent:
+            parent = record_parent
+            if not parent.startswith(f"{Harness.GROK.value}:"):
+                parent = f"{Harness.GROK.value}:{parent}"
+        autonomous_query_index = autonomous_user_query_index(summary, records)
+        autonomous = is_autonomous_agent_session(
+            summary,
+            records,
+            has_parent=bool(child_meta or parent),
+        )
         record_iter = (
             ((0, len(data), obj, None) for obj in records)
             if not checkpoint_blocked
             else iter_jsonl_bytes(data, source=str(path))
         )
-        for _start, end, obj, err in record_iter:
+        for record_index, (_start, end, obj, err) in enumerate(record_iter):
             safe_consumed = max(safe_consumed, end)
             if err:
                 warnings.append(err)
@@ -836,7 +907,13 @@ class GrokAdapter(TranscriptAdapter):
                         content_hash=content_hash_text(text),
                         is_tool_plumbing=synthetic or flags.is_tool_plumbing,
                         authored_by_agent=(
-                            synthetic or flags.authored_by_agent or parent_authored_prompt
+                            synthetic
+                            or flags.authored_by_agent
+                            or parent_authored_prompt
+                            or (
+                                autonomous
+                                and record_index == autonomous_query_index
+                            )
                         ),
                     )
                 )
@@ -920,6 +997,8 @@ class GrokAdapter(TranscriptAdapter):
             thread_source=(
                 GROK_BOOTSTRAP_ONLY_THREAD_SOURCE
                 if bootstrap_only
+                else GROK_AUTONOMOUS_AGENT_UNLINKED_THREAD_SOURCE
+                if autonomous
                 else "workflow_subagent" if child_meta else None
             ),
             started_at=started_at,
@@ -960,6 +1039,11 @@ class GrokAdapter(TranscriptAdapter):
                 **(
                     {"activity_suppressed": "grok_bootstrap_only"}
                     if bootstrap_only
+                    else {}
+                ),
+                **(
+                    {"autonomous_agent_unlinked": True}
+                    if autonomous
                     else {}
                 ),
                 "source_dependencies": _source_dependencies_override or [str(path)],

@@ -28,6 +28,7 @@ import { classifySpeaker, SPEAKER_LEGEND, type SpeakerKind } from "@/lib/speaker
 import {
   findBranchPath,
   projectBranchTree,
+  sessionTreeLabel,
   type BranchTreeRow,
 } from "@/lib/sessionTree";
 import { formatDuration, formatDayTime, harnessColor } from "@/lib/utils";
@@ -583,14 +584,14 @@ function BranchBreadcrumb({
             {index > 0 ? <span aria-hidden>›</span> : null}
             {current ? (
               <span aria-current="page" className="max-w-40 truncate font-mono text-muted-foreground">
-                {index === 0 ? "Main" : shortSessionId(node.id)}
+                {index === 0 ? sessionTreeLabel(node, 0) : shortSessionId(node.id)}
               </span>
             ) : (
               <Link
                 to={sessionHref(navigationId, search)}
                 className="max-w-40 truncate font-mono hover:text-foreground"
               >
-                {index === 0 ? "Main" : shortSessionId(node.id)}
+                {index === 0 ? sessionTreeLabel(node, 0) : shortSessionId(node.id)}
               </Link>
             )}
           </span>
@@ -692,7 +693,7 @@ function BranchTree({
             >
               <div className="flex min-w-0 items-baseline gap-2">
                 <span className="shrink-0 text-[11px] text-foreground/90">
-                  {depth === 0 ? "Main" : "Worker"}
+                  {sessionTreeLabel(node, depth)}
                 </span>
                 <span
                   className="min-w-0 truncate font-mono text-[10px] text-faint-foreground"
