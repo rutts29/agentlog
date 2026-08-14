@@ -31,6 +31,10 @@ from agentlog.normalize.model_identity import (
     display_model,
     sql_coalesce_model,
 )
+from agentlog.session_identity import (
+    SUPPRESSED_ACTIVITY_THREAD_SOURCES,
+    is_suppressed_activity_session,
+)
 
 
 def _project_label(repo: str | None, cwd: str | None) -> str:
@@ -82,13 +86,16 @@ def _metric_rows(
 
 
 def ingest_freshness(conn: sqlite3.Connection) -> dict[str, Any]:
+    sources = sorted(SUPPRESSED_ACTIVITY_THREAD_SOURCES)
+    placeholders = ", ".join("?" for _ in sources)
     row = conn.execute(
-        """
-        SELECT
-            COUNT(*) AS sessions,
-            MAX(COALESCE(ended_at, started_at)) AS last_at
+        f"""
+        SELECT COUNT(*) AS sessions,
+               MAX(COALESCE(ended_at, started_at)) AS last_at
         FROM sessions
-        """
+        WHERE COALESCE(thread_source, '') NOT IN ({placeholders})
+        """,
+        sources,
     ).fetchone()
     return {
         "sessions": int(row["sessions"]) if row else 0,
@@ -462,6 +469,13 @@ def list_sessions(
 ) -> dict[str, Any]:
     where, params = _session_time_clause(tr)
     clauses = [where]
+    suppressed_sources = sorted(SUPPRESSED_ACTIVITY_THREAD_SOURCES)
+    placeholders = ",".join(
+        f":suppressed{i}" for i in range(len(suppressed_sources))
+    )
+    clauses.append(f"COALESCE(s.thread_source, '') NOT IN ({placeholders})")
+    for i, source in enumerate(suppressed_sources):
+        params[f"suppressed{i}"] = source
     if harness:
         placeholders = ",".join(f":h{i}" for i in range(len(harness)))
         clauses.append(f"s.harness IN ({placeholders})")
@@ -544,7 +558,7 @@ def list_sessions(
 
 def session_detail(conn: sqlite3.Connection, session_id: str) -> dict[str, Any] | None:
     s = conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
-    if s is None:
+    if s is None or is_suppressed_activity_session(s):
         return None
     messages = conn.execute(
         """

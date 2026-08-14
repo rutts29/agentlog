@@ -22,7 +22,11 @@ from agentlog.api.model_rollup import (
 from agentlog.api.ranges import TimeRange, session_time_clause as _session_time_clause
 from agentlog.normalize.model_identity import display_model
 from agentlog.pricing import estimate_cost, get_pricing
-from agentlog.session_identity import build_identity_context, logical_projection
+from agentlog.session_identity import (
+    build_identity_context,
+    is_suppressed_activity_session,
+    logical_projection,
+)
 
 _USAGE_GROUP_BY = frozenset(
     {"harness", "model", "day", "repo", "agent_profile"}
@@ -856,6 +860,8 @@ def session_tokens(conn: sqlite3.Connection, session_id: str) -> dict[str, Any] 
         "SELECT * FROM sessions WHERE id = ?", (session_id,)
     ).fetchone()
     if session is None:
+        return None
+    if is_suppressed_activity_session(session):
         return None
     identity = build_identity_context(conn)
     projection = logical_projection(

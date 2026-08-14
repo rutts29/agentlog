@@ -27,6 +27,7 @@ from agentlog.ingest import claude as claude_adapter
 from agentlog.ingest import codex as codex_adapter
 from agentlog.ingest import cursor as cursor_adapter
 from agentlog.ingest import grok as grok_adapter
+from agentlog.normalize.synthetic import is_system_reminder_record
 from agentlog.safety.write_guard import assert_writable
 
 log = logging.getLogger("agentlog.watch.presence")
@@ -83,6 +84,8 @@ def session_id_for(harness: str, external_id: str) -> str:
 
 def _classify_obj(obj: dict[str, Any]) -> PresenceState | None:
     """Map one transcript object to a presence state, or None to keep scanning."""
+    if is_system_reminder_record(obj):
+        return None
     role = obj.get("role")
     typ = obj.get("type")
     payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
@@ -206,6 +209,8 @@ def peek_title_hint(path: Path) -> str | None:
 
 
 def _user_text_from_obj(obj: dict[str, Any]) -> str | None:
+    if is_system_reminder_record(obj):
+        return None
     role = obj.get("role")
     typ = obj.get("type")
     payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}

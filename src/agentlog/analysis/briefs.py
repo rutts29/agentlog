@@ -20,6 +20,7 @@ from agentlog.analysis.attention_signals import (
 from agentlog.session_identity import (
     explicit_worker_parent_ids,
     implicit_parent_ids,
+    is_suppressed_activity_session,
 )
 from agentlog.source_reader import CachedSourceTranscriptReader
 
@@ -112,11 +113,14 @@ def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
 def resolve_session(
     conn: sqlite3.Connection, session_id: str
 ) -> sqlite3.Row | None:
+    def visible(row: sqlite3.Row | None) -> sqlite3.Row | None:
+        return None if row is not None and is_suppressed_activity_session(row) else row
+
     row = conn.execute(
         "SELECT * FROM sessions WHERE id = ?", (session_id,)
     ).fetchone()
     if row is not None:
-        return row
+        return visible(row)
     if ":" not in session_id:
         for prefix in ("codex:", "claude:", "cursor:", "warp:", "hermes:", "grok:"):
             row = conn.execute(
@@ -124,8 +128,8 @@ def resolve_session(
                 (prefix + session_id,),
             ).fetchone()
             if row is not None:
-                return row
-    return conn.execute(
+                return visible(row)
+    return visible(conn.execute(
         """
         SELECT * FROM sessions
         WHERE external_id = ?
@@ -134,7 +138,7 @@ def resolve_session(
         LIMIT 1
         """,
         (session_id, session_id, session_id),
-    ).fetchone()
+    ).fetchone())
 
 
 def _parent_keys(row: sqlite3.Row) -> tuple[str, ...]:

@@ -26,11 +26,13 @@ from agentlog.config import (
     PRESENCE_WORKING_GRACE_SECONDS,
     presence_path_for_db,
 )
+from agentlog.ingest.grok import is_bootstrap_only_artifact
 from agentlog.registry.harnesses import get_harness
 from agentlog.session_identity import (
     build_identity_context,
     lineage_parent_ids,
     logical_orchestrator_id,
+    is_suppressed_activity_session,
 )
 from agentlog.watch.presence import external_id_for_path, read_presence_file, session_id_for
 from agentlog.watch.scan import (
@@ -106,6 +108,10 @@ def _activity_text(state: str, peek: Peek, worker: bool) -> str:
     return "no recent output"
 
 
+def _grok_has_substantive_activity(peek: Peek) -> bool:
+    return peek.state != "unknown" and (peek.mid_turn or bool(peek.brief))
+
+
 def _load_db_meta(db_path: Path, ids: list[str]) -> dict[str, dict]:
     """Batch-resolve session rows + first user message for the scanned keys."""
     if not ids:
@@ -122,7 +128,7 @@ def _load_db_meta(db_path: Path, ids: list[str]) -> dict[str, dict]:
         placeholders = ",".join("?" for _ in ids)
         rows = conn.execute(
             f"""
-            SELECT s.id, s.repo, s.cwd, s.parent_session_id,
+            SELECT s.id, s.repo, s.cwd, s.parent_session_id, s.thread_source,
                    s.transcript_storage, s.source_sync_status,
                    a.path AS artifact_path
             FROM sessions s
@@ -148,6 +154,7 @@ def _load_db_meta(db_path: Path, ids: list[str]) -> dict[str, dict]:
                 ),
                 "repo": row["repo"] or row["cwd"],
                 "parent_session_id": resolved_parents.get(str(row["id"])),
+                "thread_source": row["thread_source"],
                 "title": None,
                 "transcript_storage": row["transcript_storage"],
                 "source_sync_status": row["source_sync_status"],
@@ -334,6 +341,23 @@ def live_payload(
         )
 
         row = meta.get(key)
+        grok_bootstrap = (
+            harness == "grok"
+            and file_path is not None
+            and is_bootstrap_only_artifact(file_path)
+        )
+        if grok_bootstrap:
+            continue
+        if (
+            row is not None
+            and is_suppressed_activity_session(row)
+            and not (
+                harness == "grok"
+                and file_path is not None
+                and _grok_has_substantive_activity(peek)
+            )
+        ):
+            continue
         worker = _is_worker(
             source_path, external_id, row["parent_session_id"] if row else None
         )

@@ -31,7 +31,7 @@ from agentlog.session_identity import (
     logical_projection,
     provider_root_shadow_ids,
     resolve_implicit_parent_ids,
-    is_internal_approval_guardian,
+    is_suppressed_activity_session,
 )
 from agentlog.normalize.model_identity import display_model
 from agentlog.source_reader import read_source_transcript
@@ -536,7 +536,7 @@ def _session_topology(
     hidden_ids = provider_root_shadow_ids(conn, context=identity) | {
         session_id
         for session_id, row in rows.items()
-        if is_internal_approval_guardian(row)
+        if is_suppressed_activity_session(row)
     }
     visible_ids = set(rows).difference(hidden_ids)
     parent_by_id: dict[str, str] = {}
@@ -1154,6 +1154,8 @@ def session_detail_v2(
     resolved = _resolve_session(conn, session_id)
     if resolved is None:
         return None
+    if is_suppressed_activity_session(resolved):
+        return None
     # Aliases are a lookup-boundary concern only; every dependent query below
     # binds the canonical id or the row is internally inconsistent.
     resolved_id = str(resolved["id"])
@@ -1491,11 +1493,18 @@ def orchestration_overview(
         """,
         params,
     ).fetchall()
+    candidate_rows = [
+        row for row in candidate_rows if not is_suppressed_activity_session(row)
+    ]
     candidates_by_id = {str(row["id"]): row for row in candidate_rows}
+    parent_rows = conn.execute(
+        "SELECT id, harness, external_id, parent_session_id, thread_source FROM sessions"
+    ).fetchall()
+    parent_rows = [
+        row for row in parent_rows if not is_suppressed_activity_session(row)
+    ]
     implicit_parents = resolve_implicit_parent_ids(
-        conn.execute(
-            "SELECT id, harness, external_id, parent_session_id FROM sessions"
-        ).fetchall()
+        parent_rows
     )
     children_by_root: dict[str, set[str]] = {}
     for child_id, parent_id in implicit_parents.items():

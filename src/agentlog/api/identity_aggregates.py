@@ -8,8 +8,9 @@ from typing import Iterable
 
 from agentlog.session_identity import (
     IdentityContext,
+    SUPPRESSED_ACTIVITY_THREAD_SOURCES,
     build_identity_context,
-    is_internal_approval_guardian,
+    is_suppressed_activity_session,
     logical_projection,
     provider_root_shadow_ids,
 )
@@ -33,11 +34,24 @@ def visible_logical_sessions(
 ) -> list[VisibleLogicalSession]:
     identity = context or build_identity_context(conn)
     root_shadows = provider_root_shadow_ids(conn, context=identity)
+    suppressed_sources = sorted(SUPPRESSED_ACTIVITY_THREAD_SOURCES)
+    placeholders = ", ".join("?" for _ in suppressed_sources)
+    suppressed_ids = {
+        str(row["id"])
+        for row in conn.execute(
+            f"SELECT id FROM sessions WHERE thread_source IN ({placeholders})",
+            suppressed_sources,
+        )
+    }
     seen_metrics: set[str] = set()
     visible: list[VisibleLogicalSession] = []
     for row in rows:
         session_id = str(row["id"])
-        if session_id in root_shadows or is_internal_approval_guardian(row):
+        if (
+            session_id in root_shadows
+            or session_id in suppressed_ids
+            or is_suppressed_activity_session(row)
+        ):
             continue
         projection = logical_projection(
             conn, session_id, str(row["harness"]), context=identity

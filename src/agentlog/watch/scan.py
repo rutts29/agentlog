@@ -27,6 +27,7 @@ from agentlog.config import (
     PRESENCE_SCAN_WINDOW_SECONDS,
 )
 from agentlog.registry.harnesses import list_harnesses
+from agentlog.normalize.synthetic import is_system_reminder_record
 
 _TAIL_BYTES = 65_536
 _MAX_PEEK_FILES = 60
@@ -177,6 +178,8 @@ def _codex_peek(objs: list[dict[str, Any]]) -> Peek | None:
     peek = Peek()
     saw_codex = False
     for obj in reversed(objs):
+        if is_system_reminder_record(obj):
+            continue
         typ = obj.get("type")
         payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
         if typ not in {"event_msg", "response_item"}:
@@ -212,6 +215,8 @@ def _codex_peek(objs: list[dict[str, Any]]) -> Peek | None:
     if not saw_codex:
         return None
     for obj in objs:
+        if is_system_reminder_record(obj):
+            continue
         payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
         if obj.get("type") == "event_msg" and payload.get("type") == "user_message":
             message = payload.get("message")
@@ -233,6 +238,8 @@ def peek_transcript(path: Path, size: int) -> Peek:
     peek = Peek()
     pending_tool = False
     for obj in reversed(objs):
+        if is_system_reminder_record(obj):
+            continue
         role = obj.get("role")
         typ = obj.get("type")
         blocks = _blocks(obj)
@@ -280,6 +287,8 @@ def peek_transcript(path: Path, size: int) -> Peek:
     if pending_tool:
         peek.mid_turn = True
     for obj in objs:
+        if is_system_reminder_record(obj):
+            continue
         if obj.get("role") == "user" or obj.get("type") in {"user", "user_message"}:
             text = _text_of(obj)
             if text.strip():
