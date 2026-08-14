@@ -423,20 +423,23 @@ def implicit_parent_ids(conn: sqlite3.Connection) -> dict[str, str]:
     return resolve_implicit_parent_ids(rows)
 
 
-def explicit_worker_parent_ids(conn: sqlite3.Connection) -> dict[str, str]:
+def _unique_link_parent_ids(
+    conn: sqlite3.Connection, *, link_type: str
+) -> dict[str, str]:
     if not _has_links_table(conn):
         return {}
     candidates: dict[str, set[str]] = {}
     for row in conn.execute(
         """
-        SELECT link.source_session_id, link.target_session_id
-        FROM session_links link
-        JOIN sessions source ON source.id = link.source_session_id
-        JOIN sessions target ON target.id = link.target_session_id
-        WHERE link.link_type = 'provider_backing'
-          AND link.link_role = 'worker'
-          AND link.target_session_id IS NOT NULL
-        """
+        SELECT a.source_session_id, a.target_session_id
+        FROM session_links a
+        JOIN sessions source ON source.id = a.source_session_id
+        JOIN sessions target ON target.id = a.target_session_id
+        WHERE a.link_type = ?
+          AND a.link_role = 'worker'
+          AND a.target_session_id IS NOT NULL
+        """,
+        (link_type,),
     ):
         child_id = str(row["target_session_id"])
         candidates.setdefault(child_id, set()).add(str(row["source_session_id"]))
@@ -447,9 +450,20 @@ def explicit_worker_parent_ids(conn: sqlite3.Connection) -> dict[str, str]:
     }
 
 
+def explicit_worker_parent_ids(conn: sqlite3.Connection) -> dict[str, str]:
+    return _unique_link_parent_ids(conn, link_type="provider_backing")
+
+
+def explicit_agent_launch_parent_ids(conn: sqlite3.Connection) -> dict[str, str]:
+    """Resolve only unambiguous, explicit worker-launch relationships."""
+    return _unique_link_parent_ids(conn, link_type="agent_launch")
+
+
 def lineage_parent_ids(conn: sqlite3.Connection) -> dict[str, str]:
     parents = implicit_parent_ids(conn)
     parents.update(explicit_worker_parent_ids(conn))
+    for child_id, parent_id in explicit_agent_launch_parent_ids(conn).items():
+        parents.setdefault(child_id, parent_id)
     return parents
 
 

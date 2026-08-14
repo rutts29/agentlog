@@ -41,6 +41,7 @@ from agentlog.db.migrations.v035_parser_upgrade_freezes import apply as apply_v0
 from agentlog.db.migrations.v036_grok_bootstrap_only import apply as apply_v036
 from agentlog.db.migrations.v037_grok_bootstrap_counter_variant import apply as apply_v037
 from agentlog.db.migrations.v038_grok_autonomous_agent_unlinked import apply as apply_v038
+from agentlog.db.migrations.v039_grok_launch_observations import apply as apply_v039
 
 # Version 1 = base SCHEMA_SQL in schema.py (implicit).
 MIGRATIONS: list[tuple[int, Callable[[sqlite3.Connection], None]]] = [
@@ -81,6 +82,7 @@ MIGRATIONS: list[tuple[int, Callable[[sqlite3.Connection], None]]] = [
     (36, apply_v036),
     (37, apply_v037),
     (38, apply_v038),
+    (39, apply_v039),
 ]
 
 

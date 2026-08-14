@@ -230,6 +230,11 @@ export function SessionDetail() {
             logicalHarness={logicalHarness(session)}
             runtimeHarness={runtimeHarness(session)}
           />
+          {session.relationship === "agent_worker" ? (
+            <span className="inline-flex items-center rounded-[4px] border border-border px-1.5 py-[2px] text-[10px] leading-none text-muted-foreground">
+              Worker
+            </span>
+          ) : null}
           <ModelBadge
             model={session.model}
             harness={runtimeHarness(session)}

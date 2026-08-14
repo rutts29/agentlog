@@ -558,6 +558,35 @@ class PresenceApiTests(unittest.TestCase):
         self.assertEqual(body["sessions"][0]["logical_session_id"], "t3code:owner")
         self.assertEqual(body["sessions"][0]["logical_harness"], "t3code")
 
+    def test_agent_launch_marks_cross_harness_session_as_worker_without_projection(self) -> None:
+        conn = connect(self.db)
+        conn.executescript(
+            """
+            INSERT INTO sessions (id, harness, external_id, repo)
+            VALUES ('codex:owner', 'codex', 'owner', '/tmp/project'),
+                   ('cursor:proj/live-1', 'cursor', 'proj/live-1', '/tmp/project');
+            INSERT INTO session_links
+              (source_session_id, target_session_id, link_type, target_harness,
+               target_external_id, link_role)
+            VALUES ('codex:owner', 'cursor:proj/live-1', 'agent_launch',
+                    'cursor', 'proj/live-1', 'worker');
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        body = live_payload(
+            self.db,
+            presence_path=self.presence,
+            now=self.now,
+            scan=False,
+        )
+        self.assertEqual(body["counts"]["workers"], 1)
+        worker = body["sessions"][0]
+        self.assertEqual(worker["parent_session_id"], "codex:owner")
+        self.assertEqual(worker["logical_session_id"], "cursor:proj/live-1")
+        self.assertIsNone(worker["logical_harness"])
+
     def test_sse_emits_presence_on_change(self) -> None:
         data = json.loads(self.presence.read_text(encoding="utf-8"))
         gen = iter_event_sse(

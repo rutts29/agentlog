@@ -14,6 +14,7 @@ from agentlog.normalize.model_identity import ModelIdentity, resolve_model_ident
 from agentlog.normalize.models import ParseResult
 from agentlog.session_identity import (
     GROK_BOOTSTRAP_ONLY_THREAD_SOURCE,
+    GROK_AUTONOMOUS_AGENT_UNLINKED_THREAD_SOURCE,
     INTERNAL_APPROVAL_GUARDIAN_THREAD_SOURCE,
     SUPPRESSED_ACTIVITY_THREAD_SOURCES,
     is_suppressed_activity_session,
@@ -473,6 +474,240 @@ class Repository:
             """,
             (target_id, target_harness, target_external_id),
         )
+
+    def replace_grok_launch_observations(
+        self,
+        caller_session_id: str,
+        artifact_id: int,
+        launches: Iterable[dict[str, Any]],
+    ) -> None:
+        """Replace source-derived, prompt-hash-only Grok launch observations."""
+        caller = self.conn.execute(
+            "SELECT harness, transcript_storage FROM sessions WHERE id = ?",
+            (caller_session_id,),
+        ).fetchone()
+        if (
+            caller is None
+            or caller["harness"] != "codex"
+            or caller["transcript_storage"] != SOURCE_BACKED
+        ):
+            return
+        artifact = self.conn.execute(
+            "SELECT content_hash FROM artifacts WHERE id = ?", (artifact_id,)
+        ).fetchone()
+        if artifact is None:
+            return
+        self.conn.execute(
+            "DELETE FROM grok_launch_observations WHERE caller_session_id = ?",
+            (caller_session_id,),
+        )
+        self.conn.execute(
+            """
+            DELETE FROM session_links
+            WHERE source_session_id = ? AND link_type = 'agent_launch'
+              AND evidence_json LIKE '%\"schema\":\"grok_agent_launch.v1\"%'
+            """,
+            (caller_session_id,),
+        )
+        for launch in launches:
+            if not isinstance(launch, dict):
+                continue
+            call_id = _optional_text(launch.get("call_id"))
+            timestamp = _optional_text(launch.get("timestamp"))
+            prompt_hash = _optional_text(launch.get("prompt_hash"))
+            if call_id is None or timestamp is None or prompt_hash is None:
+                continue
+            self.conn.execute(
+                """
+                INSERT INTO grok_launch_observations (
+                    caller_session_id, caller_artifact_id, caller_artifact_hash,
+                    call_id, call_timestamp, cwd, requested_model, prompt_hash
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    caller_session_id,
+                    artifact_id,
+                    str(artifact["content_hash"]),
+                    call_id,
+                    timestamp,
+                    _optional_text(launch.get("cwd")),
+                    _optional_text(launch.get("requested_model")),
+                    prompt_hash,
+                ),
+            )
+        self.resolve_grok_launch_links()
+
+    def resolve_grok_launch_links(self) -> None:
+        """Derive only unambiguous, source-fingerprinted cross-harness links."""
+        self.conn.execute(
+            """
+            DELETE FROM session_links
+            WHERE link_type = 'agent_launch'
+              AND evidence_json LIKE '%\"schema\":\"grok_agent_launch.v1\"%'
+            """
+        )
+        observations = self.conn.execute(
+            """
+            SELECT o.id, o.caller_session_id, o.caller_artifact_id,
+                   o.caller_artifact_hash, o.call_id, o.call_timestamp,
+                   o.cwd, o.requested_model, o.prompt_hash
+            FROM grok_launch_observations o
+            JOIN sessions caller ON caller.id = o.caller_session_id
+            JOIN artifacts caller_artifact ON caller_artifact.id = caller.artifact_id
+            WHERE caller.transcript_storage = 'source_backed'
+              AND caller_artifact.content_hash = o.caller_artifact_hash
+            ORDER BY o.call_timestamp, o.id
+            """
+        ).fetchall()
+        targets = self.conn.execute(
+            """
+            SELECT s.id, s.external_id, s.cwd, s.model, s.started_at,
+                   s.artifact_id, a.content_hash AS artifact_hash,
+                   m.content_hash AS prompt_hash
+            FROM sessions s
+            JOIN artifacts a ON a.id = s.artifact_id
+            JOIN messages m ON m.session_id = s.id
+            WHERE s.harness = 'grok'
+              AND s.parent_session_id IS NULL
+              AND s.thread_source = ?
+              AND s.transcript_storage = 'source_backed'
+              AND m.role = 'user'
+              AND m.authored_by_agent = 1
+              AND m.is_tool_plumbing = 0
+            ORDER BY s.started_at, s.id
+            """,
+            (GROK_AUTONOMOUS_AGENT_UNLINKED_THREAD_SOURCE,),
+        ).fetchall()
+        groups: dict[tuple[str, str, str], list[sqlite3.Row]] = {}
+        for observation in observations:
+            cwd = _optional_text(observation["cwd"])
+            model = _optional_text(observation["requested_model"])
+            if cwd is None or model is None:
+                continue
+            groups.setdefault((str(observation["prompt_hash"]), cwd, model), []).append(
+                observation
+            )
+        for (prompt_hash, cwd, model), group in groups.items():
+            candidates = [
+                target
+                for target in targets
+                if str(target["prompt_hash"]) == prompt_hash
+                and str(target["cwd"] or "") == cwd
+                and (
+                    str(target["model"] or "") == model
+                    or str(target["model"] or "").startswith(model + "-")
+                )
+                and target["started_at"]
+            ]
+            if not candidates:
+                continue
+            compatible: list[tuple[sqlite3.Row, list[sqlite3.Row]]] = []
+            for observation in group:
+                try:
+                    launched = datetime.fromisoformat(
+                        str(observation["call_timestamp"]).replace("Z", "+00:00")
+                    )
+                except ValueError:
+                    compatible = []
+                    break
+                matched: list[sqlite3.Row] = []
+                for target in candidates:
+                    try:
+                        started = datetime.fromisoformat(
+                            str(target["started_at"]).replace("Z", "+00:00")
+                        )
+                    except ValueError:
+                        continue
+                    age = (started - launched).total_seconds()
+                    if 0 <= age <= 300:
+                        matched.append(target)
+                compatible.append((observation, matched))
+            if not compatible:
+                continue
+            pairs: list[tuple[sqlite3.Row, sqlite3.Row]] = []
+            if all(len(items) == 1 for _, items in compatible):
+                selected = [items[0] for _, items in compatible]
+                if len({str(item["id"]) for item in selected}) == len(selected):
+                    pairs = list(zip((item[0] for item in compatible), selected))
+            else:
+                eligible_targets = {
+                    str(target["id"]): target
+                    for _, items in compatible
+                    for target in items
+                }
+                candidates = list(eligible_targets.values())
+            if (
+                not pairs
+                and len(group) == len(candidates)
+                and len(group) > 1
+                and len({str(item["caller_session_id"]) for item in group}) == 1
+            ):
+                ordered_observations = sorted(
+                    group, key=lambda item: (str(item["call_timestamp"]), int(item["id"]))
+                )
+                ordered_targets = sorted(
+                    candidates, key=lambda item: (str(item["started_at"]), str(item["id"])))
+                call_times = [str(item["call_timestamp"]) for item in ordered_observations]
+                start_times = [str(item["started_at"]) for item in ordered_targets]
+                if len(set(call_times)) == len(call_times) and len(set(start_times)) == len(start_times):
+                    allowed = {
+                        (int(observation["id"]), str(target["id"]))
+                        for observation, items in compatible
+                        for target in items
+                    }
+                    proposed = list(zip(ordered_observations, ordered_targets))
+                    ordered_calls = [
+                        datetime.fromisoformat(
+                            str(item["call_timestamp"]).replace("Z", "+00:00")
+                        )
+                        for item in ordered_observations
+                    ]
+                    ordered_starts = [
+                        datetime.fromisoformat(
+                            str(item["started_at"]).replace("Z", "+00:00")
+                        )
+                        for item in ordered_targets
+                    ]
+                    sequential = all(
+                        started > ordered_calls[index]
+                        and (
+                            index == len(ordered_calls) - 1
+                            or started < ordered_calls[index + 1]
+                        )
+                        for index, started in enumerate(ordered_starts)
+                    )
+                    if sequential and all((int(o["id"]), str(t["id"])) in allowed for o, t in proposed):
+                        pairs = proposed
+            for observation, target in pairs:
+                evidence = {
+                    "schema": "grok_agent_launch.v1",
+                    "caller": {
+                        "artifact_id": int(observation["caller_artifact_id"]),
+                        "artifact_hash": str(observation["caller_artifact_hash"]),
+                        "call_id": str(observation["call_id"]),
+                        "call_timestamp": str(observation["call_timestamp"]),
+                    },
+                    "target": {
+                        "artifact_id": int(target["artifact_id"]),
+                        "artifact_hash": str(target["artifact_hash"]),
+                    },
+                    "match": {"harness": "grok", "cwd": cwd, "model": model, "prompt_hash": prompt_hash},
+                }
+                self.conn.execute(
+                    """
+                    INSERT INTO session_links (
+                        source_session_id, target_session_id, link_type,
+                        target_harness, target_external_id, link_role,
+                        confidence, evidence_json
+                    ) VALUES (?, ?, 'agent_launch', 'grok', ?, 'worker', 'high', ?)
+                    """,
+                    (
+                        str(observation["caller_session_id"]),
+                        str(target["id"]),
+                        str(target["external_id"]),
+                        json.dumps(evidence, separators=(",", ":")),
+                    ),
+                )
 
     def _merge_session_metadata(
         self,
@@ -957,6 +1192,9 @@ class Repository:
                 self.resolve_session_links(
                     session.harness.value, session.external_id
                 )
+                self.replace_grok_launch_observations(
+                    session_id, artifact_id, result.extras.get("grok_launches", [])
+                )
             return session_id
 
         if (
@@ -1001,6 +1239,9 @@ class Repository:
                     )
                     self.resolve_session_links(
                         session.harness.value, session.external_id
+                    )
+                    self.replace_grok_launch_observations(
+                        session_id, artifact_id, result.extras.get("grok_launches", [])
                     )
                     return session_id
                 self.conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
@@ -1307,6 +1548,13 @@ class Repository:
                 session_id,
             ),
         )
+
+        if session.harness.value == "codex":
+            self.replace_grok_launch_observations(
+                session_id, artifact_id, result.extras.get("grok_launches", [])
+            )
+        elif session.harness.value == "grok":
+            self.resolve_grok_launch_links()
 
         return session_id
 

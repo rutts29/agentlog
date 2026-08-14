@@ -219,7 +219,7 @@ class SessionIdentityProjectionTests(unittest.TestCase):
         self.assertIn("t3code:source-root", listed)
         self.assertNotIn("codex:source-backing", listed)
 
-    def test_typed_worker_parent_wins_over_native_runtime_parent(self) -> None:
+    def test_typed_provider_worker_parent_wins_over_native_runtime_parent(self) -> None:
         self.conn.execute(
             """
             INSERT INTO session_links
@@ -233,6 +233,85 @@ class SessionIdentityProjectionTests(unittest.TestCase):
 
         self.assertEqual(
             lineage_parent_ids(self.conn)["codex:worker"], "t3code:root"
+        )
+
+    def test_agent_launch_worker_is_explicit_without_identity_projection(self) -> None:
+        self.conn.executescript(
+            """
+            INSERT INTO sessions
+              (id, harness, external_id, started_at, thread_source)
+            VALUES ('grok:launched', 'grok', 'launched',
+                    '2026-08-10T10:06:00+00:00', 'autonomous_agent_unlinked');
+            INSERT INTO session_links
+              (source_session_id, target_session_id, link_type,
+               target_harness, target_external_id, link_role)
+            VALUES ('t3code:root', 'grok:launched', 'agent_launch',
+                    'grok', 'launched', 'worker');
+            """
+        )
+        self.conn.commit()
+
+        self.assertEqual(lineage_parent_ids(self.conn)["grok:launched"], "t3code:root")
+        tree = orchestration_tree(self.conn, "grok:launched")
+        assert tree is not None
+        worker = next(
+            child for child in tree["tree"]["children"] if child["id"] == "grok:launched"
+        )
+        self.assertEqual(worker["relationship"], "agent_worker")
+        self.assertEqual(worker["logical_harness"], "grok")
+        self.assertEqual(worker["runtime_harness"], "grok")
+        self.assertEqual(worker["transcript_session_id"], "grok:launched")
+        self.assertNotIn("grok:launched", provider_backing_shadow_ids(self.conn))
+        narrow = TimeRange(
+            key="custom",
+            start=datetime(2026, 8, 10, 10, 5, tzinfo=timezone.utc),
+            end=datetime(2026, 8, 10, 10, 7, tzinfo=timezone.utc),
+            prev_start=None,
+            prev_end=None,
+        )
+        listed = list_sessions_v2(self.conn, narrow)
+        self.assertEqual([item["id"] for item in listed["items"]], ["t3code:root"])
+        overview = orchestration_overview(self.conn, narrow)
+        row = next(item for item in overview["items"] if item["id"] == "t3code:root")
+        self.assertGreaterEqual(row["child_count"], 1)
+
+    def test_ambiguous_agent_launch_links_remain_roots(self) -> None:
+        self.conn.executescript(
+            """
+            INSERT INTO sessions (id, harness, external_id, started_at)
+            VALUES ('grok:ambiguous', 'grok', 'ambiguous', '2026-08-10T10:06:00+00:00');
+            INSERT INTO session_links
+              (source_session_id, target_session_id, link_type,
+               target_harness, target_external_id, link_role)
+            VALUES ('t3code:root', 'grok:ambiguous', 'agent_launch', 'grok', 'ambiguous', 'worker'),
+                   ('t3code:child', 'grok:ambiguous', 'agent_launch', 'grok', 'ambiguous', 'worker');
+            """
+        )
+        self.conn.commit()
+
+        self.assertNotIn("grok:ambiguous", lineage_parent_ids(self.conn))
+        tree = orchestration_tree(self.conn, "grok:ambiguous")
+        assert tree is not None
+        self.assertEqual(tree["root_id"], "grok:ambiguous")
+
+    def test_same_harness_parent_wins_over_agent_launch(self) -> None:
+        self.conn.executescript(
+            """
+            INSERT INTO sessions (id, harness, external_id, parent_session_id, started_at)
+            VALUES ('grok:physical-parent', 'grok', 'physical-parent', NULL, '2026-08-10T10:06:00+00:00'),
+                   ('grok:physical-child', 'grok', 'physical-child', 'physical-parent', '2026-08-10T10:07:00+00:00');
+            INSERT INTO session_links
+              (source_session_id, target_session_id, link_type,
+               target_harness, target_external_id, link_role)
+            VALUES ('t3code:root', 'grok:physical-child', 'agent_launch',
+                    'grok', 'physical-child', 'worker');
+            """
+        )
+        self.conn.commit()
+
+        self.assertEqual(
+            lineage_parent_ids(self.conn)["grok:physical-child"],
+            "grok:physical-parent",
         )
 
     def test_tree_keeps_backing_as_provenance_and_flattens_its_children(self) -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,7 @@ from agentlog.ingest.base import (
     iter_jsonl_bytes,
     parse_ts,
 )
+from agentlog.ingest.grok_launch import completed_grok_launch
 from agentlog.normalize.effort import normalize_effort
 from agentlog.normalize.models import (
     Harness,
@@ -247,6 +249,68 @@ def _resolved_success(payload: dict[str, Any]) -> bool | None:
     explicit = _explicit_success(payload)
     mcp_success = _mcp_result_success(payload)
     return explicit if explicit is not None else mcp_success
+
+
+def _output_texts(value: object) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [text for item in value for text in _output_texts(item)]
+    if isinstance(value, dict):
+        texts: list[str] = []
+        for key in ("text", "output", "content"):
+            if key in value:
+                texts.extend(_output_texts(value[key]))
+        return texts
+    return []
+
+
+def _output_exit_success(payload: dict[str, Any]) -> bool | None:
+    codes: set[int] = set()
+    for text in _output_texts(payload.get("output")):
+        stripped = text.strip()
+        if not stripped.startswith("{"):
+            continue
+        try:
+            decoded = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        value = decoded.get("exit_code") if isinstance(decoded, dict) else None
+        try:
+            codes.add(int(value))
+        except (TypeError, ValueError):
+            continue
+    if len(codes) != 1:
+        return None
+    return next(iter(codes)) == 0
+
+
+def _completion_success(payload: dict[str, Any]) -> bool | None:
+    explicit = _resolved_success(payload)
+    embedded = _output_exit_success(payload)
+    if explicit is not None and embedded is not None and explicit != embedded:
+        return None
+    return explicit if explicit is not None else embedded
+
+
+def _running_cell_id(payload: dict[str, Any]) -> str | None:
+    for text in _output_texts(payload.get("output")):
+        match = re.fullmatch(r"Script running with cell ID ([A-Za-z0-9_-]+)\s*.*", text, re.DOTALL)
+        if match:
+            return match.group(1)
+    return None
+
+
+def _wait_cell_id(payload: dict[str, Any]) -> str | None:
+    arguments = payload.get("arguments")
+    if not isinstance(arguments, str):
+        return None
+    try:
+        decoded = json.loads(arguments)
+    except json.JSONDecodeError:
+        return None
+    value = decoded.get("cell_id") if isinstance(decoded, dict) else None
+    return str(value) if isinstance(value, (str, int)) else None
 
 
 def _terminal_tool_name(
@@ -666,6 +730,10 @@ class CodexAdapter(TranscriptAdapter):
         result_indices: dict[str, int] = {}
         terminal_indices: dict[str, int] = {}
         conflicted_call_ids: set[str] = set()
+        grok_launch_calls: dict[str, tuple[object, object]] = {}
+        call_successes: dict[str, bool | None] = {}
+        launch_cells: dict[str, str] = {}
+        wait_cells: dict[str, str] = {}
         session_id_locked = False
         for record_index, obj in enumerate(parsed_records):
             ts = parse_ts(obj.get("timestamp"))
@@ -888,6 +956,14 @@ class CodexAdapter(TranscriptAdapter):
                     or payload_type
                 )
                 call_names[call_id] = name
+                if name.casefold() == "wait":
+                    cell_id = _wait_cell_id(payload)
+                    if cell_id is not None:
+                        wait_cells[call_id] = cell_id
+                if name.casefold() in {"exec", "exec_command"}:
+                    launch = completed_grok_launch(payload, cwd=cwd)
+                    if launch is not None:
+                        grok_launch_calls[call_id] = (ts, launch)
                 call_operations[call_id] = str(
                     classify_operation(
                         name,
@@ -919,6 +995,26 @@ class CodexAdapter(TranscriptAdapter):
                 "tool_search_output",
             ):
                 call_id = _tool_call_id(payload)
+                output_success = _completion_success(payload)
+                if call_id:
+                    call_successes[call_id] = _merge_success(
+                        call_successes.get(call_id),
+                        output_success,
+                        call_id=call_id,
+                        conflicted_call_ids=conflicted_call_ids,
+                    )
+                    cell_id = _running_cell_id(payload)
+                    if cell_id is not None and call_id in grok_launch_calls:
+                        launch_cells[cell_id] = call_id
+                    waited_cell = wait_cells.get(call_id)
+                    launch_call = launch_cells.get(waited_cell or "")
+                    if launch_call is not None:
+                        call_successes[launch_call] = _merge_success(
+                            call_successes.get(launch_call),
+                            output_success,
+                            call_id=launch_call,
+                            conflicted_call_ids=conflicted_call_ids,
+                        )
                 if call_id and call_id in terminal_indices:
                     terminal = tools[terminal_indices[call_id]]
                     if _success_conflicts(payload):
@@ -976,6 +1072,13 @@ class CodexAdapter(TranscriptAdapter):
             ):
                 call_id = _tool_call_id(payload)
                 success = _resolved_success(payload)
+                if call_id:
+                    call_successes[call_id] = _merge_success(
+                        call_successes.get(call_id),
+                        success,
+                        call_id=call_id,
+                        conflicted_call_ids=conflicted_call_ids,
+                    )
                 existing_index = (
                     result_indices.get(call_id)
                     if call_id
@@ -1102,6 +1205,21 @@ class CodexAdapter(TranscriptAdapter):
             effort=effort,
             effort_source=effort_source,
         )
+        grok_launches = []
+        for call_id, (call_timestamp, launch) in grok_launch_calls.items():
+            if call_successes.get(call_id) is not True:
+                continue
+            if call_timestamp is None:
+                continue
+            grok_launches.append(
+                {
+                    "call_id": call_id,
+                    "timestamp": call_timestamp.isoformat(),
+                    "prompt_hash": launch.prompt_hash,
+                    "requested_model": launch.requested_model,
+                    "cwd": launch.cwd,
+                }
+            )
         return ParseResult(
             session=session,
             messages=messages,
@@ -1117,6 +1235,7 @@ class CodexAdapter(TranscriptAdapter):
                 "fork_context_status": fork_boundary.status,
                 "fork_context_boundary": fork_boundary.turn_id,
                 "checkpoint_blocked": fork_boundary.status == "ambiguous",
+                **({"grok_launches": grok_launches} if grok_launches else {}),
                 **(
                     {"activity_suppressed": "internal_approval_guardian"}
                     if internal_approval_guardian
