@@ -691,20 +691,37 @@ function TreeRows({
   depth: number;
   parentHarness: string;
 }) {
+  let lastWorkflowGroupId: string | null = null;
   return (
     <>
       {nodes.map((node) => {
         if (!visibleIds.has(node.id)) return null;
+        const workflowGroupId = node.workflow_group_id ?? null;
+        const showWorkflowGroup = Boolean(
+          workflowGroupId && workflowGroupId !== lastWorkflowGroupId,
+        );
+        lastWorkflowGroupId = workflowGroupId;
         const role = node.thread_source === "subagent" || node.relationship === "provider_worker" ? "Worker" : "Branch";
         return (
-          <div
-            key={node.id}
-            className="min-w-0 border-l-2 pl-3"
-            style={{
-              marginLeft: `${Math.min(depth - 1, 63) * 12}px`,
-              borderLeftColor: `color-mix(in srgb, ${harnessColor(parentHarness)} 45%, transparent)`,
-            }}
-          >
+          <Fragment key={node.id}>
+            {showWorkflowGroup ? (
+              <div
+                className="mb-1 mt-2 border-l-2 pl-3 text-[10px] font-medium uppercase tracking-[0.12em] text-faint-foreground"
+                style={{
+                  marginLeft: `${Math.min(depth - 1, 63) * 12}px`,
+                  borderLeftColor: `color-mix(in srgb, ${harnessColor(parentHarness)} 45%, transparent)`,
+                }}
+              >
+                {node.workflow_group_label ?? workflowGroupId}
+              </div>
+            ) : null}
+            <div
+              className="min-w-0 border-l-2 pl-3"
+              style={{
+                marginLeft: `${Math.min(depth - 1, 63) * 12}px`,
+                borderLeftColor: `color-mix(in srgb, ${harnessColor(parentHarness)} 45%, transparent)`,
+              }}
+            >
             <Link
               to={detailHref(node.navigation_id ?? node.id, params)}
               className="group block min-w-0 rounded-control border border-border-faint px-3 py-2 hover:border-border hover:bg-muted/30"
@@ -730,7 +747,8 @@ function TreeRows({
               </div>
             </Link>
             <TreeRows nodes={node.children} visibleIds={visibleIds} params={params} depth={depth + 1} parentHarness={logicalHarness(node)} />
-          </div>
+            </div>
+          </Fragment>
         );
       })}
     </>

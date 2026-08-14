@@ -56,6 +56,9 @@ class SessionsTreeBrowsingTests(unittest.TestCase):
         branch: str | None = None,
         originator: str | None = None,
         thread_source: str | None = None,
+        workflow_group_id: str | None = None,
+        workflow_group_label: str | None = None,
+        workflow_group_position: int | None = None,
         transcript_storage: str = "legacy_materialized",
     ) -> None:
         self.conn.execute(
@@ -63,8 +66,9 @@ class SessionsTreeBrowsingTests(unittest.TestCase):
             INSERT INTO sessions
               (id, harness, external_id, parent_session_id, started_at,
                ended_at, model, model_canonical, effort, repo, branch,
-               originator, thread_source, transcript_storage)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               originator, thread_source, workflow_group_id,
+               workflow_group_label, workflow_group_position, transcript_storage)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 session_id,
@@ -80,6 +84,9 @@ class SessionsTreeBrowsingTests(unittest.TestCase):
                 branch,
                 originator,
                 thread_source,
+                workflow_group_id,
+                workflow_group_label,
+                workflow_group_position,
                 transcript_storage,
             ),
         )
@@ -193,6 +200,62 @@ class SessionsTreeBrowsingTests(unittest.TestCase):
         self.assertEqual(facet_values["effort"], {"high"})
         self.assertEqual(facet_values["branch"], {"new-branch"})
         self.assertEqual(facet_values["project"], {"child-only-project"})
+
+    def test_workflow_groups_sort_real_children_without_changing_counts(self) -> None:
+        self.session("grok:root", harness="grok", external_id="root")
+        self.session(
+            "grok:reviewer",
+            harness="grok",
+            external_id="reviewer",
+            parent="root",
+            thread_source="subagent",
+            started_at="2026-08-10T10:01:00+00:00",
+        )
+        self.session(
+            "grok:second",
+            harness="grok",
+            external_id="second",
+            parent="root",
+            thread_source="subagent",
+            workflow_group_id="later",
+            workflow_group_label="Later sweep",
+            workflow_group_position=20,
+            started_at="2026-08-10T10:02:00+00:00",
+        )
+        self.session(
+            "grok:first",
+            harness="grok",
+            external_id="first",
+            parent="root",
+            thread_source="subagent",
+            workflow_group_id="early",
+            workflow_group_label="Early sweep",
+            workflow_group_position=10,
+            started_at="2026-08-10T10:03:00+00:00",
+        )
+        self.conn.commit()
+
+        tree = orchestration_tree(self.conn, "grok:root")
+        assert tree is not None
+        self.assertEqual(
+            [node["id"] for node in tree["tree"]["children"]],
+            ["grok:first", "grok:second", "grok:reviewer"],
+        )
+        self.assertEqual(tree["tree"]["descendant_count"], 3)
+        self.assertEqual(tree["bounds"]["total_node_count"], 4)
+        self.assertEqual(
+            tree["tree"]["children"][0]["workflow_group_label"],
+            "Early sweep",
+        )
+        self.assertIsNone(tree["tree"]["children"][2]["workflow_group_id"])
+
+        detail = session_detail_v2(self.conn, "grok:root")
+        assert detail is not None
+        self.assertEqual(detail["anatomy"]["child_count"], 3)
+        self.assertEqual(
+            [child["id"] for child in detail["children"]],
+            ["grok:first", "grok:second", "grok:reviewer"],
+        )
 
     def test_mixed_offsets_use_instant_range_for_roots_children_and_facets(self) -> None:
         self.session(

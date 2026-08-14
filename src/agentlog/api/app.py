@@ -32,7 +32,6 @@ from agentlog.api import (
     usage as usage_api,
 )
 from agentlog.api.deps import WRITE_BUSY_TIMEOUT_MS, get_conn
-from agentlog.api.local_token import inject_spa_token
 from agentlog.api.overview_cache import OverviewResponseCache
 from agentlog.api.ranges import (
     DEFAULT_RANGE_KEY,
@@ -40,7 +39,13 @@ from agentlog.api.ranges import (
     parse_global_range,
     range_params,
 )
-from agentlog.api.security import SecurityConfig, install_security
+from agentlog.api.security import (
+    BROWSER_SESSION_COOKIE,
+    SecurityConfig,
+    browser_session_token,
+    install_security,
+    is_loopback_host,
+)
 from agentlog.api.search import DEFAULT_SOURCE_SCAN_LIMIT
 from agentlog.config import DEFAULT_DB_PATH
 from agentlog.normalize.model_identity import repair_null_model_identity
@@ -131,7 +136,7 @@ def create_app(
     # Security first (inner), CORS last (outer). Deny responses from the
     # trust boundary must still receive ACAO headers; otherwise a browser
     # on an allowed dashboard origin sees TypeError "Failed to fetch"
-    # instead of the 401/403 body when the Bearer token is missing.
+    # instead of the 401/403 body when authentication is missing.
     install_security(app, sec)
     app.add_middleware(
         CORSMiddleware,
@@ -528,8 +533,9 @@ def create_app(
         Path(__file__).resolve().parents[3] / "web" / "dist"
     )
     if dist.is_dir():
+        dist_root = dist.resolve()
         assets = dist / "assets"
-        if assets.is_dir():
+        if assets.is_dir() and assets.resolve().is_relative_to(dist_root):
             app.mount("/assets", StaticFiles(directory=assets), name="assets")
 
         @app.get("/{full_path:path}")
@@ -537,18 +543,35 @@ def create_app(
             if full_path.startswith("api/"):
                 raise HTTPException(status_code=404)
             index = dist / "index.html"
+            resolved_index = index.resolve()
+            if (
+                not resolved_index.is_file()
+                or not resolved_index.is_relative_to(dist_root)
+            ):
+                raise HTTPException(status_code=404)
             candidate = dist / full_path
+            resolved_candidate = candidate.resolve()
+            if not resolved_candidate.is_relative_to(dist_root):
+                raise HTTPException(status_code=404)
             if (
                 full_path
-                and candidate.is_file()
-                and candidate.resolve() != index.resolve()
+                and resolved_candidate.is_file()
+                and resolved_candidate != resolved_index
             ):
-                return FileResponse(candidate)
-            html = index.read_text(encoding="utf-8")
+                return FileResponse(resolved_candidate)
+            html = resolved_index.read_text(encoding="utf-8")
+            response = HTMLResponse(html)
             sec = getattr(request.app.state, "security", None)
             token_value = getattr(sec, "token", None) if sec is not None else None
-            if token_value:
-                html = inject_spa_token(html, token_value)
-            return HTMLResponse(html)
+            if token_value and is_loopback_host(sec.bind_host):
+                response.set_cookie(
+                    BROWSER_SESSION_COOKIE,
+                    browser_session_token(token_value),
+                    httponly=True,
+                    samesite="strict",
+                    path="/api",
+                    secure=False,
+                )
+            return response
 
     return app

@@ -16,6 +16,7 @@ class Harness(str, Enum):
     WARP = "warp"
     HERMES = "hermes"
     T3CODE = "t3code"
+    GROK = "grok"
 
 
 class NormalizedMessage(BaseModel):

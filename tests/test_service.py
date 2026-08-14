@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import inspect
 import tempfile
 import time
 import unittest
@@ -11,6 +12,7 @@ from unittest import mock
 from fastapi.testclient import TestClient
 
 from agentlog.api.app import create_app
+from agentlog.cli import serve_cmd
 from agentlog.config import LOG_BACKUP_COUNT, LOG_MAX_BYTES
 from agentlog.db.schema import connect, init_db
 from agentlog.service.health import build_health
@@ -55,6 +57,10 @@ def _codex_jsonl(session_id: str) -> str:
 
 
 class PlistTests(unittest.TestCase):
+    def test_serve_uses_fixed_api_port_by_default(self) -> None:
+        option = inspect.signature(serve_cmd).parameters["port"].default
+        self.assertEqual(option.default, 3000)
+
     def test_render_contains_keepalive_and_absolute_python(self) -> None:
         body = render_daemon_plist(
             label="com.agentlog.watch",
@@ -87,7 +93,7 @@ class PlistTests(unittest.TestCase):
             self.assertIn("<string>-m</string>", watch)
             self.assertIn("agentlog.watch", watch)
             self.assertIn(API_LABEL, api)
-            self.assertIn("<string>8787</string>", api)
+            self.assertIn("<string>3000</string>", api)
             self.assertIn(str(paths.python), watch)
             self.assertIn(str(paths.python), api)
 

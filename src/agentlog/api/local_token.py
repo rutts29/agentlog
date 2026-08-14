@@ -7,7 +7,6 @@ dev proxy) carries it. MCP stays on stdio and never uses this HTTP token.
 
 from __future__ import annotations
 
-import json
 import os
 import stat
 from dataclasses import dataclass
@@ -18,8 +17,6 @@ from agentlog.config import DEFAULT_DB_PATH
 from agentlog.safety.write_guard import assert_writable
 
 TOKEN_FILENAME = "api_token"
-TOKEN_QUERY_PARAM = "token"
-SPA_TOKEN_GLOBAL = "__AGENTLOG_TOKEN__"
 
 
 def default_token_path(home: Path | None = None) -> Path:
@@ -106,18 +103,3 @@ def resolve_serve_token(
         path=path,
         source="generated" if created else "file",
     )
-
-
-def inject_spa_token(html: str, token: str) -> str:
-    """Embed the API token for the same-origin dashboard bundle."""
-    snippet = (
-        f"<script>window.{SPA_TOKEN_GLOBAL}={json.dumps(token)};</script>\n"
-    )
-    lower = html.lower()
-    idx = lower.find("</head>")
-    if idx >= 0:
-        return html[:idx] + snippet + html[idx:]
-    idx = lower.find("<body")
-    if idx >= 0:
-        return html[:idx] + snippet + html[idx:]
-    return snippet + html

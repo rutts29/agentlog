@@ -84,6 +84,7 @@ export function harnessColor(harness: string): string {
   if (key === "cursor") return "var(--harness-cursor)";
   if (key === "warp") return "var(--harness-warp)";
   if (key === "t3code") return "var(--harness-t3code)";
+  if (key === "grok") return "var(--harness-grok)";
   return "var(--harness-other)";
 }
 

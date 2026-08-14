@@ -24,6 +24,7 @@ from agentlog.ingest.claude import ClaudeAdapter
 from agentlog.ingest.codex import CodexAdapter
 from agentlog.ingest.cursor import CursorAdapter
 from agentlog.ingest.hermes import HermesAdapter
+from agentlog.ingest.grok import GrokAdapter
 from agentlog.ingest.t3code import T3CodeAdapter
 from agentlog.ingest.warp import WarpAdapter
 from agentlog.normalize.model_identity import resolve_model_identity
@@ -330,8 +331,18 @@ class CachedSourceTranscriptReader:
                 path = Path(artifact_path)
                 if not path.is_file():
                     return False
+                adapter_type = _ADAPTERS.get(key[0])
+                if adapter_type is not None:
+                    adapter = adapter_type()
+                    if adapter.uses_composite_source:
+                        if not isinstance(cached.revision, tuple) or not adapter.composite_snapshot_matches(
+                            path,
+                            revision=cached.revision,
+                            content_hash=cached.source_hash,
+                        ):
+                            return False
+                        continue
                 if cached.verification_unit is not None:
-                    adapter_type = _ADAPTERS.get(key[0])
                     if adapter_type is None:
                         return False
                     external_id = cached.verification_unit.split(":", 1)[1]
@@ -397,6 +408,7 @@ _ADAPTERS: dict[str, type[TranscriptAdapter]] = {
     Harness.T3CODE.value: T3CodeAdapter,
     Harness.WARP.value: WarpAdapter,
     Harness.HERMES.value: HermesAdapter,
+    Harness.GROK.value: GrokAdapter,
 }
 
 
@@ -437,7 +449,22 @@ def _source_locator(row: sqlite3.Row) -> tuple[SourceLocator | None, str | None]
     )
 
 
-def _checkpoint_is_current(row: sqlite3.Row, path: Path) -> bool:
+def _checkpoint_is_current(
+    row: sqlite3.Row, path: Path, adapter: TranscriptAdapter | None = None
+) -> bool:
+    if adapter is not None and adapter.uses_composite_source:
+        expected = str(row["artifact_content_hash"] or "")
+        if not expected:
+            return False
+        try:
+            snapshot = adapter.capture_source(path)
+        except OSError:
+            return False
+        return (
+            snapshot.content_hash == expected
+            and snapshot.revision
+            == (int(row["artifact_size"] or 0), int(row["artifact_mtime_ns"] or 0))
+        )
     if is_sqlite_path(path):
         return True
     checkpoint = int(row["parsed_offset"] or 0)
@@ -459,6 +486,17 @@ def _current_hash(path: Path) -> str:
 def _parse_current(
     adapter: TranscriptAdapter, path: Path
 ) -> tuple[list[ParseResult], str] | None:
+    if adapter.uses_composite_source:
+        for _attempt in range(3):
+            snapshot = adapter.capture_source(path)
+            results = adapter.parse_source_snapshot(path, snapshot)
+            if adapter.composite_snapshot_matches(
+                path,
+                revision=snapshot.revision,
+                content_hash=snapshot.content_hash,
+            ):
+                return results, snapshot.content_hash
+        return None
     for _attempt in range(3):
         before = file_stat(path)
         sqlite_source = is_sqlite_path(path)
@@ -648,7 +686,8 @@ def _read_source_transcript(
         """
         SELECT s.*, a.path AS artifact_path, a.harness AS artifact_harness,
                a.content_hash AS artifact_content_hash, a.parsed_offset,
-               a.parser_version
+               a.parser_version, a.size AS artifact_size,
+               a.mtime_ns AS artifact_mtime_ns
         FROM sessions s
         LEFT JOIN artifacts a ON a.id = s.artifact_id
         WHERE s.id = ?
@@ -666,14 +705,14 @@ def _read_source_transcript(
     path = Path(locator.artifact_path)
     if not path.is_file():
         return SourceReadResult("source_unavailable", [], locator, locator.unit_id, warning="canonical source is missing")
-    if not _checkpoint_is_current(row, path):
-        return SourceReadResult(
-            "source_changed", [], locator, locator.unit_id, warning="canonical source changed before its checkpoint"
-        )
-
     adapter_type = _ADAPTERS.get(str(row["harness"]))
     if adapter_type is None:
         return SourceReadResult("source_unavailable", [], locator, locator.unit_id, warning="unsupported source harness")
+    adapter = adapter_type()
+    if not _checkpoint_is_current(row, path, adapter):
+        return SourceReadResult(
+            "source_changed", [], locator, locator.unit_id, warning="canonical source changed before its checkpoint"
+        )
     targeted = is_sqlite_path(path) and hasattr(adapter_type, "parse_session")
     cache_key = _artifact_cache_key(row, locator, targeted=targeted)
     if reader is not None and not flight_owned:
@@ -701,7 +740,6 @@ def _read_source_transcript(
     cached = stored_cached or shared_parse
     try:
         if targeted:
-            adapter = adapter_type()
             external_id = str(row["external_id"])
             targeted_read = _read_targeted_t3(
                 adapter, path, external_id, cached, reader
@@ -717,18 +755,35 @@ def _read_source_transcript(
             parsed, revision, artifact_observation = targeted_read
         else:
             artifact_observation = None
-            revision = file_stat(path)
+            revision = (
+                adapter.capture_source(path).revision
+                if adapter.uses_composite_source
+                else file_stat(path)
+            )
             if cached is not None and revision == cached.revision:
-                if _current_hash(path) == cached.source_hash:
+                current_hash = (
+                    adapter.capture_source(path).content_hash
+                    if adapter.uses_composite_source
+                    else _current_hash(path)
+                )
+                if current_hash == cached.source_hash:
                     parsed = (cached.results, cached.source_hash)
                 else:
                     cached = None
-                    parsed = _parse_current(adapter_type(), path)
-                    revision = file_stat(path)
+                    parsed = _parse_current(adapter, path)
+                    revision = (
+                        adapter.capture_source(path).revision
+                        if adapter.uses_composite_source
+                        else file_stat(path)
+                    )
             else:
                 cached = None
-                parsed = _parse_current(adapter_type(), path)
-                revision = file_stat(path)
+                parsed = _parse_current(adapter, path)
+                revision = (
+                    adapter.capture_source(path).revision
+                    if adapter.uses_composite_source
+                    else file_stat(path)
+                )
     except (OSError, sqlite3.Error, ValueError) as exc:
         return SourceReadResult("source_unavailable", [], locator, locator.unit_id, warning=f"could not read canonical source: {exc}")
     if parsed is None:
@@ -742,7 +797,7 @@ def _read_source_transcript(
         verification_unit=(locator.unit_id if targeted else None),
         artifact_observation=artifact_observation,
     )
-    if not _checkpoint_is_current(row, path):
+    if not _checkpoint_is_current(row, path, adapter):
         if reader is not None:
             reader._drop_artifact(cache_key)
         return SourceReadResult(

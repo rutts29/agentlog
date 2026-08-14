@@ -26,6 +26,7 @@ from agentlog.config import (
 from agentlog.ingest import claude as claude_adapter
 from agentlog.ingest import codex as codex_adapter
 from agentlog.ingest import cursor as cursor_adapter
+from agentlog.ingest import grok as grok_adapter
 from agentlog.safety.write_guard import assert_writable
 
 log = logging.getLogger("agentlog.watch.presence")
@@ -67,6 +68,8 @@ def external_id_for_path(harness: str, path: Path) -> str | None:
             return claude_adapter.external_id_from_path(path)
         if harness == "cursor":
             return cursor_adapter.external_id_from_path(path)
+        if harness == "grok":
+            return grok_adapter.external_id_from_path(path)
     except Exception:  # noqa: BLE001 - never break the daemon
         log.debug("external_id derivation failed for %s %s", harness, path, exc_info=True)
         return path.stem or None

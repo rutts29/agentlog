@@ -43,6 +43,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     attention_incomplete_todo INTEGER,
     attention_last_plan_open INTEGER,
     attention_tail_revision INTEGER,
+    workflow_group_id TEXT,
+    workflow_group_label TEXT,
+    workflow_group_position INTEGER,
     artifact_id INTEGER REFERENCES artifacts(id) ON DELETE CASCADE,
     started_at TEXT,
     ended_at TEXT,
@@ -196,9 +199,13 @@ def migrate_db(conn: sqlite3.Connection) -> None:
             "thread_source",
             "fork_context_status",
             "fork_context_boundary",
+            "workflow_group_id",
+            "workflow_group_label",
         ):
             if col not in cols:
                 conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} TEXT")
+        if "workflow_group_position" not in cols:
+            conn.execute("ALTER TABLE sessions ADD COLUMN workflow_group_position INTEGER")
         for col in ("inherited_message_count", "inherited_record_count"):
             if col not in cols:
                 conn.execute(

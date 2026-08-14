@@ -231,6 +231,35 @@ HARNESSES: dict[str, HarnessRecord] = {
             ),
         },
     },
+    "grok": {
+        "id": "grok",
+        "display_name": "Grok Build",
+        "vendor": "xAI",
+        "ingest_status": "active",
+        "transcript_locations": [
+            "~/.grok/sessions/*/*/chat_history.jsonl",
+        ],
+        "capabilities": {
+            "per_message_model": "supported",
+            "per_message_tokens": "partial",
+            "effort": "supported",
+            "branch": "partial",
+            "commit_sha": "partial",
+            "ended_at": "partial",
+            "tool_events": "supported",
+            "skill_exposures": "absent",
+            "subagent_links": "partial",
+        },
+        "notes": {
+            "_": (
+                "Grok Build stores one chat_history.jsonl per session under a "
+                "percent-encoded workspace directory. System reminders and "
+                "compaction context are excluded from conversational counts."
+            ),
+            "per_message_tokens": "Imported when a usage block is present; not present in every transcript.",
+            "ended_at": "Source records may omit timestamps, so this is partial.",
+        },
+    },
 }
 
 

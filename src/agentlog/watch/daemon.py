@@ -339,7 +339,11 @@ class WatchDaemon:
                 ):
                     accepted.add(str(base))
                 continue
-            if base is None and not path.is_file():
+            if (
+                base is None
+                and not path.is_file()
+                and not adapter.uses_composite_source
+            ):
                 continue
             for root, src in zip(roots, sources):
                 source_is_file = src.path.expanduser().is_file()

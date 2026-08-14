@@ -118,7 +118,7 @@ def resolve_session(
     if row is not None:
         return row
     if ":" not in session_id:
-        for prefix in ("codex:", "claude:", "cursor:", "warp:", "hermes:"):
+        for prefix in ("codex:", "claude:", "cursor:", "warp:", "hermes:", "grok:"):
             row = conn.execute(
                 "SELECT * FROM sessions WHERE id = ?",
                 (prefix + session_id,),

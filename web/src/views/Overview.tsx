@@ -49,7 +49,7 @@ import {
 
 type Ctx = { range: string };
 
-const HARNESSES = ["codex", "claude", "cursor", "warp"] as const;
+const HARNESSES = ["codex", "claude", "cursor", "warp", "grok"] as const;
 
 const ConstellationGraph = lazy(() =>
   import("@/components/ConstellationGraph").then(({ ConstellationGraph: Graph }) => ({

@@ -152,6 +152,71 @@ class McpToolsFixture(unittest.TestCase):
         by_model = tools.usage_stats(self.conn, "model", since="2026-08-09")
         self.assertEqual(by_model["total_sessions"], 1)
 
+    def test_usage_stats_uses_logical_t3_sessions(self) -> None:
+        self.conn.executescript(
+            """
+            INSERT INTO sessions (
+                id, harness, external_id, started_at, ended_at, repo, model,
+                model_canonical
+            ) VALUES
+              ('t3code:root', 't3code', 'root', '2026-08-10T10:00:00+00:00',
+               '2026-08-10T11:00:00+00:00', '/tmp/plugin', 'grok-4.6', 'grok-4.6'),
+              ('codex:backing', 'codex', 'backing', '2026-08-10T10:00:01+00:00',
+               '2026-08-10T10:59:00+00:00', '/tmp/plugin', 'grok-4.6', 'grok-4.6');
+            INSERT INTO session_links (
+                source_session_id, target_session_id, link_type,
+                target_harness, target_external_id, link_role
+            ) VALUES ('t3code:root', 'codex:backing', 'provider_backing',
+                      'codex', 'backing', 'root');
+            INSERT INTO messages (id, session_id, seq, role, text)
+            VALUES ('t3-u', 't3code:root', 1, 'user', 'owner stub'),
+                   ('cx-u', 'codex:backing', 1, 'user', 'canonical request'),
+                   ('cx-a', 'codex:backing', 2, 'assistant', 'canonical response');
+            """
+        )
+        self.conn.commit()
+
+        by_harness = tools.usage_stats(self.conn, "harness")
+        groups = {group["key"]: group for group in by_harness["groups"]}
+        self.assertEqual(by_harness["total_sessions"], 3)
+        self.assertEqual(groups["t3code"]["session_count"], 1)
+        self.assertEqual(groups["t3code"]["message_count"], 2)
+        self.assertEqual(groups["codex"]["session_count"], 1)
+        self.assertEqual(groups["codex"]["message_count"], 2)
+
+    def test_search_and_get_session_project_backing_to_t3_owner(self) -> None:
+        self.conn.executescript(
+            """
+            INSERT INTO sessions (
+                id, harness, external_id, started_at, ended_at, repo, model,
+                model_canonical
+            ) VALUES
+              ('t3code:root', 't3code', 'root', '2026-08-10T10:00:00+00:00',
+               '2026-08-10T11:00:00+00:00', '/tmp/plugin', 'grok-4.6', 'grok-4.6'),
+              ('codex:backing', 'codex', 'backing', '2026-08-10T10:00:01+00:00',
+               '2026-08-10T10:59:00+00:00', '/tmp/plugin', 'grok-4.6', 'grok-4.6');
+            INSERT INTO session_links (
+                source_session_id, target_session_id, link_type,
+                target_harness, target_external_id, link_role
+            ) VALUES ('t3code:root', 'codex:backing', 'provider_backing',
+                      'codex', 'backing', 'root');
+            INSERT INTO messages (id, session_id, seq, role, text)
+            VALUES ('cx-u', 'codex:backing', 1, 'user', 'unique canonical phrase'),
+                   ('cx-a', 'codex:backing', 2, 'assistant', 'canonical response');
+            """
+        )
+        self.conn.commit()
+
+        result = tools.search_sessions(self.conn, "unique canonical phrase")
+        self.assertEqual(result["total"], 1)
+        self.assertEqual(result["sessions"][0]["id"], "t3code:root")
+        self.assertEqual(result["sessions"][0]["transcript_session_id"], "codex:backing")
+
+        detail = tools.get_session(self.conn, "codex:backing")
+        self.assertEqual(detail["session"]["id"], "t3code:root")
+        self.assertEqual(detail["session"]["logical_harness"], "t3code")
+        self.assertEqual(detail["session"]["transcript_session_id"], "codex:backing")
+
     def test_attention_inbox(self) -> None:
         result = tools.attention_inbox(self.conn)
         self.assertIn("items", result)

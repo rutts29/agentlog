@@ -7,6 +7,7 @@ import sqlite3
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -146,6 +147,15 @@ def file_stat(path: Path) -> tuple[int, int]:
         st = path.stat()
         return st.st_size, st.st_mtime_ns
     return _sqlite_revision(path)
+
+
+@dataclass(frozen=True)
+class SourceSnapshot:
+    """A stable, adapter-defined view of a multi-file transcript source."""
+
+    data: bytes
+    revision: tuple[int, int]
+    content_hash: str
 
 
 _CURSOR_TS_RE = re.compile(
@@ -352,6 +362,39 @@ class TranscriptAdapter(ABC):
     harness: Harness
     # Byte-offset append is for line-oriented JSONL. SQLite sources always reparse.
     supports_byte_append: bool = True
+    uses_composite_source: bool = False
+
+    def checkpoint_revision(self, path: Path) -> tuple[int, int]:
+        return file_stat(path)
+
+    def checkpoint_fingerprint(self, path: Path, parsed_offset: int) -> str:
+        return hash_prefix(path, parsed_offset)
+
+    def canonical_artifact_path(self, path: Path) -> Path:
+        return path
+
+    def capture_source(self, path: Path) -> SourceSnapshot:
+        """Capture a stable composite source. Only composite adapters override this."""
+        raise NotImplementedError("adapter does not define a composite source")
+
+    def composite_snapshot_matches(
+        self,
+        path: Path,
+        *,
+        revision: tuple[int, int],
+        content_hash: str,
+    ) -> bool:
+        snapshot = self.capture_source(path)
+        return (
+            snapshot.revision == revision
+            and snapshot.content_hash == content_hash
+        )
+
+    def parse_source_snapshot(
+        self, path: Path, snapshot: SourceSnapshot
+    ) -> list[ParseResult]:
+        """Parse captured bytes without rereading its dependencies."""
+        return self.parse_path(path, snapshot.data, start_offset=0)
 
     @abstractmethod
     def discover(self) -> list[Path]:

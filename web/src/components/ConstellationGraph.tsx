@@ -240,6 +240,7 @@ export function ConstellationGraph({
         cursor: cssColor("--harness-cursor") || "#2dd4bf",
         warp: cssColor("--harness-warp") || "#e45cc3",
         t3code: cssColor("--harness-t3code") || "#a78bfa",
+        grok: cssColor("--harness-grok") || "#f97316",
         other: cssColor("--harness-other") || "#66718a",
       } as Record<string, string>,
       anchor: cssColor("--graph-anchor") || "#3a3a3a",

@@ -504,6 +504,21 @@ class _SessionTopology:
     descendant_counts: dict[str, int]
 
 
+def _workflow_child_sort_key(row: sqlite3.Row, session_id: str) -> tuple[Any, ...]:
+    group_id = row["workflow_group_id"]
+    if group_id:
+        position = row["workflow_group_position"]
+        return (
+            0,
+            int(position) if isinstance(position, int) else 2**31 - 1,
+            str(row["workflow_group_label"] or group_id).casefold(),
+            str(group_id),
+            str(row["started_at"] or ""),
+            session_id,
+        )
+    return (1, 0, "", "", str(row["started_at"] or ""), session_id)
+
+
 def _session_topology(
     conn: sqlite3.Connection, identity: IdentityContext
 ) -> _SessionTopology:
@@ -598,9 +613,8 @@ def _session_topology(
         children_by_id[parent_id].append(child_id)
     for child_ids in children_by_id.values():
         child_ids.sort(
-            key=lambda child_id: (
-                str(rows[child_id]["started_at"] or ""),
-                child_id,
+            key=lambda child_id: _workflow_child_sort_key(
+                rows[child_id], child_id
             )
         )
 
@@ -706,6 +720,9 @@ def _session_node_bases(
             "inherited_record_count": int(metric["inherited_record_count"] or 0),
             "fork_context_status": metric["fork_context_status"],
             "fork_context_boundary": metric["fork_context_boundary"],
+            "workflow_group_id": row["workflow_group_id"],
+            "workflow_group_label": row["workflow_group_label"],
+            "workflow_group_position": row["workflow_group_position"],
         }
         relationship = topology.relationship_by_id.get(session_id)
         if relationship:
@@ -1350,6 +1367,9 @@ def session_detail_v2(
             ),
             "fork_context_status": transcript["fork_context_status"],
             "fork_context_boundary": transcript["fork_context_boundary"],
+            "workflow_group_id": s["workflow_group_id"],
+            "workflow_group_label": s["workflow_group_label"],
+            "workflow_group_position": s["workflow_group_position"],
             "artifact_id": s["artifact_id"],
             "artifact_path": s["artifact_path"],
             "external_id": s["external_id"],
