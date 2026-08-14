@@ -32,6 +32,8 @@ CREATE INDEX IF NOT EXISTS idx_token_usage_granularity
 ON token_usage(granularity);
 CREATE INDEX IF NOT EXISTS idx_token_usage_source
 ON token_usage(usage_source);
+CREATE INDEX IF NOT EXISTS idx_token_usage_message
+ON token_usage(message_id);
 """
 
 

@@ -24,6 +24,7 @@ from agentlog.api.ranges import (
 )
 from agentlog.session_identity import (
     build_identity_context,
+    is_suppressed_activity_session,
     lineage_parent_ids,
     logical_projection,
     provider_root_shadow_ids,
@@ -46,7 +47,7 @@ def _harness_rank(name: str) -> tuple[int, str]:
 
 _SESSION_SQL = """
 SELECT
-    s.id, s.harness, s.external_id, s.parent_session_id,
+    s.id, s.harness, s.external_id, s.parent_session_id, s.thread_source,
     s.started_at, s.ended_at, s.repo, s.cwd,
     COALESCE(NULLIF(s.model_canonical, ''), '(unknown)') AS model,
     CASE
@@ -81,18 +82,25 @@ def _time_clause(tr: TimeRange) -> tuple[str, dict[str, Any]]:
 
 def graph_payload(conn: sqlite3.Connection, tr: TimeRange) -> dict[str, Any]:
     where, params = _time_clause(tr)
-    total = int(
-        conn.execute(
-            f"SELECT COUNT(*) AS c FROM sessions s WHERE {where}", params
-        ).fetchone()["c"]
-    )
+    physical_rows = [
+        row
+        for row in conn.execute(
+            f"{_SESSION_SQL} WHERE {where}", params
+        ).fetchall()
+        if not is_suppressed_activity_session(row)
+    ]
+    total = len(physical_rows)
 
     truncated: dict[str, Any] | None = None
     if total > NODE_CAP:
         where = f"({where} AND COALESCE(s.started_at, '') >= datetime(:end, '-90 days'))"
-        physical_rows = conn.execute(
-            f"{_SESSION_SQL} WHERE {where}", params
-        ).fetchall()
+        physical_rows = [
+            row
+            for row in conn.execute(
+                f"{_SESSION_SQL} WHERE {where}", params
+            ).fetchall()
+            if not is_suppressed_activity_session(row)
+        ]
         shown_ids = {str(row["id"]) for row in physical_rows}
         supervisor_ids = set(lineage_parent_ids(conn).values()) - shown_ids
         if supervisor_ids:
@@ -103,16 +111,17 @@ def graph_payload(conn: sqlite3.Connection, tr: TimeRange) -> dict[str, Any]:
                     sorted(supervisor_ids),
                 ).fetchall()
             )
+            physical_rows = [
+                row
+                for row in physical_rows
+                if not is_suppressed_activity_session(row)
+            ]
         hidden = max(0, total - len(physical_rows))
         truncated = {
             "shown": len(physical_rows),
             "hidden": hidden,
             "note": f"showing 90d · {hidden} older sessions hidden",
         }
-    else:
-        physical_rows = conn.execute(
-            f"{_SESSION_SQL} WHERE {where}", params
-        ).fetchall()
 
     identity = build_identity_context(conn)
     root_shadows = provider_root_shadow_ids(conn, context=identity)

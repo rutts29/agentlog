@@ -6,9 +6,10 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from agentlog.ingest.grok import GrokAdapter
+from agentlog.ingest.grok import GrokAdapter, is_bootstrap_only_artifact
 from agentlog.normalize.models import Harness
 from agentlog.registry.harnesses import get_harness
+from agentlog.session_identity import GROK_BOOTSTRAP_ONLY_THREAD_SOURCE
 
 
 def _line(value: dict, *, newline: bool = True) -> bytes:
@@ -90,7 +91,112 @@ def _fixture() -> bytes:
     )
 
 
+def _bootstrap_fixture() -> bytes:
+    return b"".join(
+        [
+            _line(
+                {
+                    "type": "system",
+                    "content": "You are Grok 4.6 released by xAI. You are an interactive CLI tool.",
+                }
+            ),
+            _line(
+                {
+                    "type": "user",
+                    "synthetic_reason": "system_reminder",
+                    "content": "<system-reminder>\nThe following skills are available for use:\n- test-skill",
+                }
+            ),
+        ]
+    )
+
+
+def _bootstrap_summary(**overrides: object) -> dict[str, object]:
+    return {
+        "agent_name": "grok-build-plan",
+        "num_messages": 0,
+        "num_chat_messages": 2,
+        "current_model_id": "grok-4.6",
+        **overrides,
+    }
+
+
 class GrokAdapterTests(unittest.TestCase):
+    def test_suppresses_exact_two_record_grok_bootstrap_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "sessions"
+            path = root / "%2Ftmp%2Fagentlog" / "bootstrap" / "chat_history.jsonl"
+            path.parent.mkdir(parents=True)
+            data = _bootstrap_fixture()
+            path.write_bytes(data)
+            (path.parent / "summary.json").write_text(
+                json.dumps(_bootstrap_summary()), encoding="utf-8"
+            )
+            with mock.patch("agentlog.ingest.grok.GROK_SESSIONS_DIR", root):
+                result = GrokAdapter().parse_chunk(path, data, start_offset=0)
+                self.assertTrue(is_bootstrap_only_artifact(path))
+
+        self.assertEqual(result.session.thread_source, GROK_BOOTSTRAP_ONLY_THREAD_SOURCE)
+        self.assertEqual(result.messages, [])
+        self.assertEqual(result.tool_events, [])
+        self.assertEqual(result.token_usages, [])
+        self.assertEqual(result.extras["activity_suppressed"], "grok_bootstrap_only")
+
+    def test_does_not_suppress_system_first_grok_conversations(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "sessions"
+            path = root / "%2Ftmp%2Fagentlog" / "real-chat" / "chat_history.jsonl"
+            path.parent.mkdir(parents=True)
+            data = _bootstrap_fixture() + _line(
+                {"type": "user", "content": "Please inspect this regression."}
+            )
+            path.write_bytes(data)
+            (path.parent / "summary.json").write_text(
+                json.dumps(_bootstrap_summary(num_messages=1, num_chat_messages=3)),
+                encoding="utf-8",
+            )
+            with mock.patch("agentlog.ingest.grok.GROK_SESSIONS_DIR", root):
+                result = GrokAdapter().parse_chunk(path, data, start_offset=0)
+                self.assertFalse(is_bootstrap_only_artifact(path))
+
+        self.assertIsNone(result.session.thread_source)
+        self.assertEqual(
+            [(message.role, message.text) for message in result.messages],
+            [
+                ("system", "You are Grok 4.6 released by xAI. You are an interactive CLI tool."),
+                ("user", "<system-reminder>\nThe following skills are available for use:\n- test-skill"),
+                ("user", "Please inspect this regression."),
+            ],
+        )
+
+    def test_requires_grok_system_reminder_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "sessions"
+            path = root / "%2Ftmp%2Fagentlog" / "near-miss" / "chat_history.jsonl"
+            path.parent.mkdir(parents=True)
+            rows = [
+                {
+                    "type": "system",
+                    "content": "You are Grok 4.5 released by xAI. You are an interactive CLI tool.",
+                },
+                {
+                    "type": "user",
+                    "content": "<system-reminder>The following skills are available for use:",
+                },
+            ]
+            data = b"".join(_line(row) for row in rows)
+            path.write_bytes(data)
+            (path.parent / "summary.json").write_text(
+                json.dumps(_bootstrap_summary()), encoding="utf-8"
+            )
+            with mock.patch("agentlog.ingest.grok.GROK_SESSIONS_DIR", root):
+                result = GrokAdapter().parse_chunk(path, data, start_offset=0)
+                self.assertFalse(is_bootstrap_only_artifact(path))
+
+        self.assertIsNone(result.session.thread_source)
+        self.assertEqual([message.role for message in result.messages], ["system", "user"])
+
+
     def test_discovers_safe_session_paths_and_decodes_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "sessions"

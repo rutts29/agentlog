@@ -26,7 +26,23 @@ from agentlog.api.ranges import (
     session_time_clause as _session_time_clause,
 )
 from agentlog.api import tokens as token_metrics
+from agentlog.session_identity import SUPPRESSED_ACTIVITY_THREAD_SOURCES
+
 router = APIRouter(tags=["activity"])
+
+
+def _activity_time_clause(
+    tr: TimeRange, *, alias: str = "s"
+) -> tuple[str, dict[str, Any]]:
+    time_sql, params = _session_time_clause(tr, alias=alias)
+    sources = sorted(SUPPRESSED_ACTIVITY_THREAD_SOURCES)
+    names = [f"suppressed_activity_{index}" for index in range(len(sources))]
+    return (
+        f"({time_sql}) AND COALESCE({alias}.thread_source, '') "
+        f"NOT IN ({', '.join(f':{name}' for name in names)})",
+        {**params, **dict(zip(names, sources))},
+    )
+
 
 def _parse_range_dep(
     range: str = Query(DEFAULT_RANGE_KEY, alias="range"),
@@ -269,7 +285,7 @@ def _model_switch_counts(
     conn: sqlite3.Connection, tr: TimeRange
 ) -> tuple[dict[str, int], dict[tuple[str, str], int]]:
     """Count mid-session model changes; keyed by harness and (harness, model)."""
-    time_sql, params = _session_time_clause(tr)
+    time_sql, params = _activity_time_clause(tr)
     rows = conn.execute(
         f"""
         WITH ordered AS (
@@ -304,7 +320,7 @@ def _model_switch_counts(
 
 def activity_rollup(conn: sqlite3.Connection, tr: TimeRange) -> dict[str, Any]:
     """Per-harness and per-model descriptive activity rollup."""
-    time_sql, params = _session_time_clause(tr)
+    time_sql, params = _activity_time_clause(tr)
     dur_sql = _duration_seconds_sql()
 
     harness_base = list(

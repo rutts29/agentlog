@@ -38,6 +38,7 @@ from agentlog.db.migrations.v032_owner_insight_history import apply as apply_v03
 from agentlog.db.migrations.v033_workflow_groups import apply as apply_v033
 from agentlog.db.migrations.v034_owner_insight_targets import apply as apply_v034
 from agentlog.db.migrations.v035_parser_upgrade_freezes import apply as apply_v035
+from agentlog.db.migrations.v036_grok_bootstrap_only import apply as apply_v036
 
 # Version 1 = base SCHEMA_SQL in schema.py (implicit).
 MIGRATIONS: list[tuple[int, Callable[[sqlite3.Connection], None]]] = [
@@ -75,6 +76,7 @@ MIGRATIONS: list[tuple[int, Callable[[sqlite3.Connection], None]]] = [
     (33, apply_v033),
     (34, apply_v034),
     (35, apply_v035),
+    (36, apply_v036),
 ]
 
 

@@ -101,6 +101,10 @@ CREATE INDEX IF NOT EXISTS idx_exp_excl_experiment
 ON performance_experiment_exclusions(experiment_id);
 CREATE INDEX IF NOT EXISTS idx_outcome_cluster
 ON outcome_observations(task_cluster_id);
+CREATE INDEX IF NOT EXISTS idx_task_clusters_segment_start
+ON task_clusters(segment_start_message_id);
+CREATE INDEX IF NOT EXISTS idx_task_clusters_segment_end
+ON task_clusters(segment_end_message_id);
 """
 
 

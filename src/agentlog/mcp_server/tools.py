@@ -21,6 +21,7 @@ from agentlog.session_identity import (
     build_identity_context,
     logical_projection,
     provider_root_shadow_ids,
+    is_suppressed_activity_session,
 )
 from agentlog.api.model_rollup import (
     GRAIN_DESCRIPTIONS,
@@ -133,7 +134,8 @@ def _session_meta(
             s.id, s.harness, s.external_id, s.parent_session_id,
             s.started_at, s.ended_at, s.repo, s.cwd, s.branch,
             s.commit_sha, s.model_canonical, s.model AS model_raw,
-            s.provider, s.agent_profile, s.effort, s.transcript_storage,
+            s.provider, s.agent_profile, s.effort, s.thread_source,
+            s.transcript_storage,
             {_duration_seconds_sql()} AS duration_seconds,
             (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id)
                 AS message_count,
@@ -145,6 +147,8 @@ def _session_meta(
         (session_id,),
     ).fetchone()
     if row is None:
+        return None
+    if is_suppressed_activity_session(row):
         return None
     dur = row["duration_seconds"]
     projection = logical_projection(

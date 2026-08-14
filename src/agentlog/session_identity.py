@@ -8,14 +8,32 @@ from typing import Any
 
 
 INTERNAL_APPROVAL_GUARDIAN_THREAD_SOURCE = "internal_approval_guardian"
+GROK_BOOTSTRAP_ONLY_THREAD_SOURCE = "grok_bootstrap_only"
+SUPPRESSED_ACTIVITY_THREAD_SOURCES = frozenset(
+    {
+        INTERNAL_APPROVAL_GUARDIAN_THREAD_SOURCE,
+        GROK_BOOTSTRAP_ONLY_THREAD_SOURCE,
+    }
+)
 
 
-def is_internal_approval_guardian(row: sqlite3.Row | Any) -> bool:
+def is_suppressed_activity_session(row: sqlite3.Row | Any) -> bool:
+    """Whether a physical session is harness setup rather than user activity."""
     try:
         thread_source = row["thread_source"]
     except (IndexError, KeyError, TypeError):
         return False
-    return str(thread_source or "") == INTERNAL_APPROVAL_GUARDIAN_THREAD_SOURCE
+    return str(thread_source or "") in SUPPRESSED_ACTIVITY_THREAD_SOURCES
+
+
+def is_internal_approval_guardian(row: sqlite3.Row | Any) -> bool:
+    try:
+        return (
+            str(row["thread_source"] or "")
+            == INTERNAL_APPROVAL_GUARDIAN_THREAD_SOURCE
+        )
+    except (IndexError, KeyError, TypeError):
+        return False
 
 
 def _has_links_table(conn: sqlite3.Connection) -> bool:

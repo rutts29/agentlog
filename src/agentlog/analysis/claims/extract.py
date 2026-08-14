@@ -31,6 +31,7 @@ from agentlog.analysis.skills import skill_aliases
 from agentlog.source_reader import CachedSourceTranscriptReader
 from agentlog.session_identity import (
     build_identity_context,
+    is_suppressed_activity_session,
     logical_projection,
     logical_session_root_ids,
 )
@@ -214,8 +215,9 @@ def _eligible_logical_root_ids(conn: sqlite3.Connection) -> set[str]:
     return {
         roots[str(row["id"])]
         for row in conn.execute(
-            "SELECT id FROM sessions WHERE COALESCE(external_id, '') NOT LIKE 'skills:%'"
+            "SELECT id, thread_source FROM sessions WHERE COALESCE(external_id, '') NOT LIKE 'skills:%'"
         )
+        if not is_suppressed_activity_session(row)
     }
 
 
@@ -227,8 +229,9 @@ def _extract_skill_claims(conn: sqlite3.Connection, now: str) -> list[Claim]:
     eligible_session_ids = {
         str(row["id"])
         for row in conn.execute(
-            "SELECT id FROM sessions WHERE COALESCE(external_id, '') NOT LIKE 'skills:%'"
+            "SELECT id, thread_source FROM sessions WHERE COALESCE(external_id, '') NOT LIKE 'skills:%'"
         )
+        if not is_suppressed_activity_session(row)
     }
     eligible_roots = _eligible_logical_root_ids(conn)
     total_sessions = _root_session_count(conn)
@@ -240,11 +243,15 @@ def _extract_skill_claims(conn: sqlite3.Connection, now: str) -> list[Claim]:
     ).fetchall()
     exposures = conn.execute(
         """
-        SELECT se.skill_name, se.session_id, s.started_at, s.repo, s.cwd
+        SELECT se.skill_name, se.session_id, s.started_at, s.repo, s.cwd,
+               s.thread_source
         FROM skill_exposures se
         JOIN sessions s ON s.id = se.session_id
         """
     ).fetchall()
+    exposures = [
+        row for row in exposures if not is_suppressed_activity_session(row)
+    ]
     by_name: dict[str, list[Any]] = defaultdict(list)
     for r in exposures:
         by_name[str(r["skill_name"])].append(r)
@@ -398,11 +405,15 @@ def _extract_skill_claims(conn: sqlite3.Connection, now: str) -> list[Claim]:
 def _extract_harness_model_claims(conn: sqlite3.Connection, now: str) -> list[Claim]:
     session_rows = conn.execute(
         """
-        SELECT id, harness, external_id, repo, cwd, model, model_canonical
+        SELECT id, harness, external_id, repo, cwd, model, model_canonical,
+               thread_source
         FROM sessions
         WHERE COALESCE(external_id, '') NOT LIKE 'skills:%'
         """
     ).fetchall()
+    session_rows = [
+        row for row in session_rows if not is_suppressed_activity_session(row)
+    ]
     rows_by_id = {str(row["id"]): row for row in session_rows}
     logical_roots = logical_session_root_ids(conn)
     identity = build_identity_context(conn)
@@ -609,7 +620,8 @@ def _extract_theme_claims(
             m.text,
             s.repo,
             s.cwd,
-            s.started_at
+            s.started_at,
+            s.thread_source
         FROM ux_observations u
         JOIN exchange_windows w ON w.id = u.window_id
         JOIN sessions s ON s.id = w.session_id
@@ -623,6 +635,7 @@ def _extract_theme_claims(
           )
         """
     ).fetchall()
+    rows = [row for row in rows if not is_suppressed_activity_session(row)]
 
     source_text: dict[str, str] = {}
     source_ids = {
@@ -678,14 +691,16 @@ def _extract_theme_claims(
                 theme_sessions[theme].add(str(r["session_id"]))
                 theme_projects[theme][project_label(r["repo"], r["cwd"])] += 1
 
-    labeled_sessions = int(
-        conn.execute(
-            """
-            SELECT COUNT(DISTINCT w.session_id) AS c
-            FROM ux_observations u
-            JOIN exchange_windows w ON w.id = u.window_id
-            """
-        ).fetchone()["c"]
+    labeled_rows = conn.execute(
+        """
+        SELECT DISTINCT w.session_id, s.thread_source
+        FROM ux_observations u
+        JOIN exchange_windows w ON w.id = u.window_id
+        JOIN sessions s ON s.id = w.session_id
+        """
+    ).fetchall()
+    labeled_sessions = sum(
+        1 for row in labeled_rows if not is_suppressed_activity_session(row)
     )
 
     claims: list[Claim] = []

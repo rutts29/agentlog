@@ -30,12 +30,17 @@ from agentlog.normalize.models import (
 )
 from agentlog.normalize.synthetic import classify_synthetic_user_text
 from agentlog.normalize.tool_ops import classify_operation
+from agentlog.session_identity import GROK_BOOTSTRAP_ONLY_THREAD_SOURCE
 
 
 _USER_QUERY_RE = re.compile(
     r"<user_query>\s*(.*?)\s*</user_query>", re.IGNORECASE | re.DOTALL
 )
 _WORKSPACE_SESSION_RE = re.compile(r"^[^/]+/[^/]+/chat_history\.jsonl$")
+_GROK_BOOTSTRAP_PROMPT = re.compile(
+    r"^you are grok 4\.[56] released by xai\.", re.IGNORECASE
+)
+_GROK_SKILL_REMINDER = "the following skills are available for use:"
 
 
 def _workspace(path: Path) -> tuple[str | None, str | None]:
@@ -92,6 +97,110 @@ def _field(obj: dict[str, Any], *names: str) -> Any:
         if name in obj and obj[name] not in (None, ""):
             return obj[name]
     return None
+
+
+def _summary_count(summary: dict[str, Any], name: str) -> int | None:
+    value = summary.get(name)
+    if isinstance(value, bool):
+        return None
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def is_bootstrap_only_session(
+    summary: dict[str, Any], records: list[dict[str, Any]] | None
+) -> bool:
+    """Recognize Grok's two-record CLI setup artifact and nothing broader."""
+    if (
+        _field(summary, "agent_name", "agent") != "grok-build-plan"
+        or _summary_count(summary, "num_messages") != 0
+        or _summary_count(summary, "num_chat_messages") != 2
+        or not isinstance(records, list)
+        or len(records) != 2
+    ):
+        return False
+    first, second = records
+    if str(first.get("type") or "").casefold() != "system":
+        return False
+    if (
+        str(second.get("type") or "").casefold() != "user"
+        or str(second.get("synthetic_reason") or "").casefold()
+        != "system_reminder"
+    ):
+        return False
+    first_text = extract_text(first.get("content")).lstrip()
+    second_text = extract_text(second.get("content")).casefold()
+    return (
+        _GROK_BOOTSTRAP_PROMPT.match(first_text) is not None
+        and _GROK_SKILL_REMINDER in second_text
+    )
+
+
+def is_bootstrap_only_artifact(
+    path: Path,
+    *,
+    expected_revision: tuple[int, int] | None = None,
+    expected_content_hash: str | None = None,
+    verify_current_dependencies: bool = True,
+) -> bool:
+    """Verify a stable two-record Grok setup artifact without retaining text."""
+    try:
+        summary_path = _summary_path(path)
+        if (
+            path.is_symlink()
+            or summary_path.is_symlink()
+            or not path.is_file()
+            or not summary_path.is_file()
+        ):
+            return False
+        main_before = file_stat(path)
+        summary_before = file_stat(summary_path)
+        main = path.read_bytes()
+        summary_bytes = summary_path.read_bytes()
+        if main_before != file_stat(path) or summary_before != file_stat(summary_path):
+            return False
+        summary = json.loads(summary_bytes.decode("utf-8"))
+        records: list[dict[str, Any]] = []
+        for _start, _end, obj, error in iter_jsonl_bytes(main, source=str(path)):
+            if error is not None or not isinstance(obj, dict):
+                return False
+            records.append(obj)
+        if not isinstance(summary, dict) or not is_bootstrap_only_session(summary, records):
+            return False
+        dependency_pairs = [(path, summary_path)]
+        resolved_summary = summary_path.resolve(strict=False)
+        if str(resolved_summary) != str(summary_path):
+            dependency_pairs.append((path, resolved_summary))
+        snapshots = []
+        for main_path, metadata_path in dependency_pairs:
+            states = (
+                str(main_path).encode() + b"\0" + main + b"\0"
+                + str(metadata_path).encode() + b"\0" + summary_bytes + b"\0"
+            )
+            digest = hash_bytes(b"agentlog-grok-composite-v2\0" + states)
+            snapshots.append((
+                (len(main), int(digest, 16) & ((1 << 63) - 1)),
+                digest,
+            ))
+        if main_before != file_stat(path) or summary_before != file_stat(summary_path):
+            return False
+        if expected_revision is not None or expected_content_hash is not None:
+            if expected_revision is None or expected_content_hash is None:
+                return False
+            if (expected_revision, expected_content_hash) not in snapshots:
+                return False
+        if verify_current_dependencies:
+            dependencies = GrokAdapter()._dependency_paths(path)
+            if len(dependencies) != 2 or {item.name for item in dependencies} != {
+                "chat_history.jsonl",
+                "summary.json",
+            }:
+                return False
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+        return False
+    return True
 
 
 def _git_fields(obj: dict[str, Any]) -> tuple[str | None, str | None, str | None]:
@@ -516,6 +625,16 @@ class GrokAdapter(TranscriptAdapter):
             return []
         warnings: list[str] = []
         summary_raw = dependencies.get(str(_summary_path(path)))
+        if summary_raw is None:
+            summary_raw = next(
+                (
+                    raw
+                    for candidate, raw in dependencies.items()
+                    if Path(candidate).name == "summary.json"
+                    and Path(candidate).parent.name == _session_id(path)
+                ),
+                None,
+            )
         try:
             summary = json.loads(summary_raw.decode("utf-8")) if summary_raw else {}
         except (UnicodeError, json.JSONDecodeError):
@@ -788,11 +907,21 @@ class GrokAdapter(TranscriptAdapter):
         if child_meta and not parent_prompt_marked:
             flag_parent_authored_prompt(messages)
 
+        bootstrap_only = is_bootstrap_only_session(summary, records)
+        if bootstrap_only:
+            messages = []
+            tools = []
+            usages = []
+
         session = NormalizedSession(
             harness=Harness.GROK,
             external_id=external_id,
             parent_session_id=parent,
-            thread_source="workflow_subagent" if child_meta else None,
+            thread_source=(
+                GROK_BOOTSTRAP_ONLY_THREAD_SOURCE
+                if bootstrap_only
+                else "workflow_subagent" if child_meta else None
+            ),
             started_at=started_at,
             ended_at=ended_at,
             repo=repo,
@@ -828,6 +957,11 @@ class GrokAdapter(TranscriptAdapter):
                     else None
                 ),
                 "subagent_type": child_type,
+                **(
+                    {"activity_suppressed": "grok_bootstrap_only"}
+                    if bootstrap_only
+                    else {}
+                ),
                 "source_dependencies": _source_dependencies_override or [str(path)],
             },
         )

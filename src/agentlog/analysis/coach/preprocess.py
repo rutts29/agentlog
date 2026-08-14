@@ -24,7 +24,7 @@ from agentlog.session_identity import (
     provider_canonical_root_backing_ids,
     provider_root_shadow_ids,
     resolve_implicit_parent_ids,
-    is_internal_approval_guardian,
+    is_suppressed_activity_session,
 )
 from agentlog.source_reader import CachedSourceTranscriptReader
 from agentlog.analysis.coach.proof import (
@@ -664,7 +664,7 @@ def _window_rows(
     excluded_synthetic_by_kind: dict[str, int] = {}
     for sid, row in by_id.items():
         root = roots[sid]
-        if is_internal_approval_guardian(row):
+        if is_suppressed_activity_session(row):
             excluded_sessions.add(sid)
             if sid == root:
                 excluded_roots.add(root)

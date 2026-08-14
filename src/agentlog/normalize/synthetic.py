@@ -108,6 +108,13 @@ _SKILL_NAME_ELEMENT_RE = re.compile(
 _SKILL_HEADING_RE = re.compile(r"^\s*#{1,3}\s+([A-Za-z0-9][A-Za-z0-9_.-]*)\s*$", re.MULTILINE)
 
 
+def is_system_reminder_record(record: dict[str, object]) -> bool:
+    """Identify harness-injected reminders that are not human turns."""
+    return str(record.get("synthetic_reason") or "").strip().casefold() == (
+        "system_reminder"
+    )
+
+
 @dataclass(frozen=True)
 class SyntheticFlags:
     authored_by_agent: bool = False

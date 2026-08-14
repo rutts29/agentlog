@@ -21,6 +21,7 @@ from agentlog.watch.presence import (
     atomic_write_json,
     enrich_presence_sessions,
     external_id_for_path,
+    peek_title_hint,
     peek_transcript_state,
     read_presence_file,
 )
@@ -109,6 +110,40 @@ class TailPeekTests(unittest.TestCase):
         empty.write_text("", encoding="utf-8")
         self.assertEqual(peek_transcript_state(empty), "unknown")
         self.assertEqual(peek_transcript_state(self.root / "nope.jsonl"), "unknown")
+
+    def test_system_reminder_is_not_a_prompt_or_active_turn(self) -> None:
+        path = self.root / "system-reminder.jsonl"
+        _write_jsonl(
+            path,
+            [
+                {
+                    "type": "user",
+                    "synthetic_reason": "system_reminder",
+                    "content": "<system-reminder>skills available</system-reminder>",
+                }
+            ],
+        )
+        self.assertEqual(peek_transcript_state(path), "unknown")
+        self.assertIsNone(peek_title_hint(path))
+
+    def test_grok_two_record_bootstrap_has_no_prompt_or_active_turn(self) -> None:
+        path = self.root / "grok-bootstrap.jsonl"
+        _write_jsonl(
+            path,
+            [
+                {
+                    "type": "system",
+                    "content": "You are Grok 4.6 released by xAI.",
+                },
+                {
+                    "type": "user",
+                    "synthetic_reason": "system_reminder",
+                    "content": "<system-reminder>\nThe following skills are available for use:",
+                },
+            ],
+        )
+        self.assertEqual(peek_transcript_state(path), "unknown")
+        self.assertIsNone(peek_title_hint(path))
 
 
 class PresenceMapTests(unittest.TestCase):
@@ -349,6 +384,126 @@ class PresenceApiTests(unittest.TestCase):
         self.assertEqual(body["sessions"][0]["state"], "streaming")
         self.assertEqual(body["epoch"], "daemon-a")
         self.assertIn("presence.json", body["path"])
+
+    def test_live_hides_uningested_grok_bootstrap_artifact(self) -> None:
+        session = self.root / "grok" / "bootstrap"
+        path = session / "chat_history.jsonl"
+        _write_jsonl(
+            path,
+            [
+                {
+                    "type": "system",
+                    "content": "You are Grok 4.6 released by xAI. You are an interactive CLI tool.",
+                },
+                {
+                    "type": "user",
+                    "synthetic_reason": "system_reminder",
+                    "content": "<system-reminder>The following skills are available for use:",
+                },
+            ],
+        )
+        (session / "summary.json").write_text(
+            json.dumps(
+                {
+                    "agent_name": "grok-build-plan",
+                    "num_messages": 0,
+                    "num_chat_messages": 2,
+                }
+            ),
+            encoding="utf-8",
+        )
+        data = json.loads(self.presence.read_text(encoding="utf-8"))
+        data["sessions"] = [
+            {
+                "harness": "grok",
+                "external_id": "bootstrap",
+                "source_path": str(path),
+                "last_activity_at": self.ts,
+            }
+        ]
+        atomic_write_json(self.presence, data)
+
+        body = live_payload(self.db, presence_path=self.presence, now=self.now, scan=False)
+
+        self.assertEqual(body["counts"]["total"], 0)
+        self.assertEqual(body["sessions"], [])
+
+    def test_live_shows_real_turn_before_marker_ingest(self) -> None:
+        session = self.root / "grok" / "bootstrap-transition"
+        path = session / "chat_history.jsonl"
+        _write_jsonl(
+            path,
+            [
+                {
+                    "type": "system",
+                    "content": "You are Grok 4.6 released by xAI.",
+                },
+                {
+                    "type": "user",
+                    "synthetic_reason": "system_reminder",
+                    "content": "<system-reminder>The following skills are available for use:",
+                },
+            ],
+        )
+        session.mkdir(parents=True, exist_ok=True)
+        (session / "summary.json").write_text(
+            json.dumps(
+                {
+                    "agent_name": "grok-build-plan",
+                    "num_messages": 0,
+                    "num_chat_messages": 2,
+                }
+            ),
+            encoding="utf-8",
+        )
+        conn = connect(self.db)
+        conn.execute(
+            "INSERT INTO artifacts (harness, path, size, mtime_ns, content_hash, parsed_offset, parser_version) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("grok", str(path), path.stat().st_size, path.stat().st_mtime_ns, "bootstrap", path.stat().st_size, "test"),
+        )
+        artifact_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+        conn.execute(
+            "INSERT INTO sessions (id, harness, external_id, artifact_id, transcript_storage, thread_source) VALUES (?, ?, ?, ?, ?, ?)",
+            ("grok:bootstrap-transition", "grok", "bootstrap-transition", artifact_id, "source_backed", "grok_bootstrap_only"),
+        )
+        conn.commit()
+        conn.close()
+        data = json.loads(self.presence.read_text(encoding="utf-8"))
+        data["sessions"] = [
+            {
+                "harness": "grok",
+                "external_id": "bootstrap-transition",
+                "source_path": str(path),
+                "last_activity_at": self.ts,
+            }
+        ]
+        atomic_write_json(self.presence, data)
+
+        first = live_payload(self.db, presence_path=self.presence, now=self.now, scan=False)
+        self.assertEqual(first["sessions"], [])
+
+        _write_jsonl(
+            path,
+            [
+                {"type": "system", "content": "You are Grok 4.6 released by xAI."},
+                {"type": "user", "synthetic_reason": "system_reminder", "content": "<system-reminder>skills"},
+                {"type": "user", "content": "real user task"},
+            ],
+        )
+        second = live_payload(self.db, presence_path=self.presence, now=self.now, scan=False)
+        self.assertEqual(len(second["sessions"]), 1)
+        self.assertEqual(second["sessions"][0]["session_id"], "grok:bootstrap-transition")
+
+        conn = connect(self.db)
+        conn.execute(
+            "UPDATE sessions SET thread_source = NULL WHERE id = ?",
+            ("grok:bootstrap-transition",),
+        )
+        conn.commit()
+        conn.close()
+        third = live_payload(self.db, presence_path=self.presence, now=self.now, scan=False)
+        self.assertEqual(len(third["sessions"]), 1)
+        self.assertEqual(third["sessions"][0]["session_id"], "grok:bootstrap-transition")
 
     def test_foreign_parent_reference_does_not_promote_or_count_worker(self) -> None:
         conn = connect(self.db)

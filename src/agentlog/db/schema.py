@@ -120,9 +120,13 @@ CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
 CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp);
 CREATE INDEX IF NOT EXISTS idx_tool_events_session ON tool_events(session_id);
 CREATE INDEX IF NOT EXISTS idx_tool_events_name ON tool_events(tool_name);
+CREATE INDEX IF NOT EXISTS idx_tool_events_message ON tool_events(message_id);
 CREATE INDEX IF NOT EXISTS idx_skill_exposures_session ON skill_exposures(session_id);
+CREATE INDEX IF NOT EXISTS idx_skill_exposures_message ON skill_exposures(message_id);
 CREATE INDEX IF NOT EXISTS idx_artifacts_harness ON artifacts(harness);
 CREATE INDEX IF NOT EXISTS idx_exchange_windows_session ON exchange_windows(session_id);
+CREATE INDEX IF NOT EXISTS idx_exchange_windows_request ON exchange_windows(request_message_id);
+CREATE INDEX IF NOT EXISTS idx_exchange_windows_response ON exchange_windows(response_message_id);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
     text,

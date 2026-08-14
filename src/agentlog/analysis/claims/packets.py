@@ -46,6 +46,7 @@ from agentlog.source_reader import CachedSourceTranscriptReader
 from agentlog.session_identity import (
     build_identity_context,
     explicit_worker_parent_ids,
+    is_suppressed_activity_session,
     logical_projection,
     logical_root_session_id,
     provider_root_shadow_ids,
@@ -461,8 +462,9 @@ def _opaque_project_key(repo: Any, cwd: Any) -> str | None:
 
 def _session_logical_roots(conn: sqlite3.Connection) -> dict[str, dict[str, str | None]]:
     rows = conn.execute(
-        "SELECT id, harness, external_id, parent_session_id, repo, cwd FROM sessions"
+        "SELECT id, harness, external_id, parent_session_id, repo, cwd, thread_source FROM sessions"
     ).fetchall()
+    rows = [row for row in rows if not is_suppressed_activity_session(row)]
     by_id = {str(row["id"]): row for row in rows}
     parents = resolve_implicit_parent_ids(rows)
 
@@ -497,8 +499,9 @@ def _session_logical_roots(conn: sqlite3.Connection) -> dict[str, dict[str, str 
 
 def _eligible_root_session_ids(conn: sqlite3.Connection) -> set[str]:
     rows = conn.execute(
-        "SELECT id, harness, external_id, parent_session_id FROM sessions"
+        "SELECT id, harness, external_id, parent_session_id, thread_source FROM sessions"
     ).fetchall()
+    rows = [row for row in rows if not is_suppressed_activity_session(row)]
     parents = resolve_implicit_parent_ids(rows)
     explicit_workers = explicit_worker_parent_ids(conn)
     identity = build_identity_context(conn)

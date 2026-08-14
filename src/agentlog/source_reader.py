@@ -29,6 +29,7 @@ from agentlog.ingest.t3code import T3CodeAdapter
 from agentlog.ingest.warp import WarpAdapter
 from agentlog.normalize.model_identity import resolve_model_identity
 from agentlog.normalize.models import Harness, NormalizedMessage, ParseResult
+from agentlog.session_identity import is_suppressed_activity_session
 
 SourceReadStatus = Literal[
     "ready", "legacy", "source_unavailable", "source_changed"
@@ -696,6 +697,10 @@ def _read_source_transcript(
     ).fetchone()
     if row is None:
         return SourceReadResult("source_unavailable", [], warning="session not found")
+    if is_suppressed_activity_session(row):
+        return SourceReadResult(
+            "source_unavailable", [], warning="session is suppressed from activity"
+        )
 
     if not _is_source_backed(row):
         return SourceReadResult("legacy", [])

@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from agentlog.config import DEFAULT_DB_PATH, presence_path_for_db
+from agentlog.session_identity import is_suppressed_activity_session
 from agentlog.watch.presence import read_presence_file
 from agentlog.analysis.attention_signals import (
     assistant_asks_question,
@@ -220,6 +221,7 @@ def _session_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
                 s.branch AS branch,
                 s.transcript_storage AS transcript_storage,
                 s.source_sync_status AS source_sync_status,
+                s.thread_source AS thread_source,
                 s.attention_final_question AS attention_final_question,
                 s.attention_incomplete_todo AS attention_incomplete_todo,
                 s.attention_last_plan_open AS attention_last_plan_open,
@@ -503,6 +505,7 @@ def _logical_presence(
     display_by_physical: dict[str, str],
     harness_by_display: dict[str, str],
     runtime_harness_by_display: dict[str, str],
+    suppressed_ids: set[str] | None = None,
 ) -> dict[str, dict[str, Any]]:
     state_rank = {
         "waiting": 3,
@@ -511,6 +514,8 @@ def _logical_presence(
     }
     out: dict[str, dict[str, Any]] = {}
     for physical_id, raw in raw_presence.items():
+        if suppressed_ids and physical_id in suppressed_ids:
+            continue
         display_id = display_by_physical.get(physical_id, physical_id)
         entry = dict(raw)
         entry["session_id"] = display_id
@@ -610,6 +615,11 @@ def derive_attention(
         display_by_physical,
         harness_by_display,
         runtime_harness_by_display,
+        {
+            str(row["id"])
+            for row in physical_rows
+            if is_suppressed_activity_session(row)
+        },
     )
 
     stats = AttentionStats()

@@ -12,6 +12,12 @@ from typing import Any, Iterable, Iterator, TypeVar
 
 from agentlog.normalize.model_identity import ModelIdentity, resolve_model_identity
 from agentlog.normalize.models import ParseResult
+from agentlog.session_identity import (
+    GROK_BOOTSTRAP_ONLY_THREAD_SOURCE,
+    INTERNAL_APPROVAL_GUARDIAN_THREAD_SOURCE,
+    SUPPRESSED_ACTIVITY_THREAD_SOURCES,
+    is_suppressed_activity_session,
+)
 
 T = TypeVar("T")
 
@@ -2144,26 +2150,41 @@ class Repository:
         )
 
     def stats(self) -> dict[str, Any]:
+        visible_session_sql = (
+            "COALESCE(thread_source, '') NOT IN "
+            f"('{INTERNAL_APPROVAL_GUARDIAN_THREAD_SOURCE}', "
+            f"'{GROK_BOOTSTRAP_ONLY_THREAD_SOURCE}')"
+        )
         by_harness = list(
             self.conn.execute(
-                """
+                f"""
                 SELECT harness, COUNT(*) AS sessions
                 FROM sessions
+                WHERE {visible_session_sql}
                 GROUP BY harness
                 ORDER BY harness
                 """
             )
         )
-        messages = self.conn.execute("SELECT COUNT(*) AS c FROM messages").fetchone()
-        tools = self.conn.execute("SELECT COUNT(*) AS c FROM tool_events").fetchone()
-        skills = self.conn.execute("SELECT COUNT(*) AS c FROM skill_exposures").fetchone()
+        messages = self.conn.execute(
+            f"SELECT COUNT(*) AS c FROM messages m JOIN sessions s ON s.id = m.session_id WHERE {visible_session_sql.replace('thread_source', 's.thread_source')}"
+        ).fetchone()
+        tools = self.conn.execute(
+            f"SELECT COUNT(*) AS c FROM tool_events t JOIN sessions s ON s.id = t.session_id WHERE {visible_session_sql.replace('thread_source', 's.thread_source')}"
+        ).fetchone()
+        skills = self.conn.execute(
+            f"SELECT COUNT(*) AS c FROM skill_exposures e JOIN sessions s ON s.id = e.session_id WHERE {visible_session_sql.replace('thread_source', 's.thread_source')}"
+        ).fetchone()
         artifacts = self.conn.execute("SELECT COUNT(*) AS c FROM artifacts").fetchone()
-        windows = self.conn.execute("SELECT COUNT(*) AS c FROM exchange_windows").fetchone()
+        windows = self.conn.execute(
+            f"SELECT COUNT(*) AS c FROM exchange_windows w JOIN sessions s ON s.id = w.session_id WHERE {visible_session_sql.replace('thread_source', 's.thread_source')}"
+        ).fetchone()
         by_model = list(
             self.conn.execute(
-                """
+                f"""
                 SELECT COALESCE(model, '(unknown)') AS model, COUNT(*) AS sessions
                 FROM sessions
+                WHERE {visible_session_sql}
                 GROUP BY model
                 ORDER BY sessions DESC
                 LIMIT 20
@@ -2171,9 +2192,10 @@ class Repository:
             )
         )
         date_range = self.conn.execute(
-            """
+            f"""
             SELECT MIN(started_at) AS first_at, MAX(COALESCE(ended_at, started_at)) AS last_at
             FROM sessions
+            WHERE {visible_session_sql}
             """
         ).fetchone()
         return {
@@ -2195,8 +2217,10 @@ class Repository:
         since: str | None = None,
         limit: int = 50,
     ) -> list[sqlite3.Row]:
-        clauses: list[str] = []
-        params: list[Any] = []
+        suppressed_sources = sorted(SUPPRESSED_ACTIVITY_THREAD_SOURCES)
+        placeholders = ", ".join("?" for _ in suppressed_sources)
+        clauses = [f"COALESCE(thread_source, '') NOT IN ({placeholders})"]
+        params: list[Any] = list(suppressed_sources)
         if harness:
             clauses.append("harness = ?")
             params.append(harness)
@@ -2220,9 +2244,10 @@ class Repository:
         )
 
     def get_session(self, session_id: str) -> sqlite3.Row | None:
-        return self.conn.execute(
+        row = self.conn.execute(
             "SELECT * FROM sessions WHERE id = ?", (session_id,)
         ).fetchone()
+        return None if row is not None and is_suppressed_activity_session(row) else row
 
     def search_messages(self, query: str, limit: int = 30) -> list[sqlite3.Row]:
         from datetime import datetime, timezone
