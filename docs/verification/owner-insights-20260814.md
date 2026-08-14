@@ -30,7 +30,9 @@ Official Coach Luna/Terra ran on the 59 packets and was discarded: the
 7-kind compiler is the wrong tool for owner Insights. The live board
 came from a later owner-facing read of the same packets.
 
-Live board at write time: 8 approved Insights, 2 pending Proposals.
+Live board after the later backfill: 13 approved Insights, 3 pending Proposals.
+
+The 16 excluded roots were mostly Codex approval wrappers and injected skill dumps, not owner voice. Warp 2025 chats were thin (gitignore / GitHub LFS). The useful leftover was four later **source-backed** Codex roots that were not in the original 59 packets (`019febd9…`, `019febe6…`, `019ff310…`, `019ff32b…`). Those were read in pass `grok46-owner-pass-20260814-e`.
 
 ## Backfill
 
