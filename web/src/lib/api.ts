@@ -535,6 +535,7 @@ export function fetchSessionDetail(sessionId: string, signal?: AbortSignal) {
       ended_at: string | null;
       duration_seconds: number | null;
       parent_session_id: string | null;
+      relationship?: string | null;
       artifact_id: number | null;
       artifact_path: string | null;
       external_id: string;

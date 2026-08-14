@@ -24,10 +24,11 @@ function node(id, children = [], descendantCount = children.length) {
   };
 }
 
-test("worker tree nodes include workflow and provider workers but not ordinary branches", () => {
+test("worker tree nodes include workflow, provider, and launch workers but not ordinary branches", () => {
   assert.equal(isWorkerTreeNode({ thread_source: "subagent", relationship: null }), true);
   assert.equal(isWorkerTreeNode({ thread_source: "workflow_subagent", relationship: null }), true);
   assert.equal(isWorkerTreeNode({ thread_source: null, relationship: "provider_worker" }), true);
+  assert.equal(isWorkerTreeNode({ thread_source: null, relationship: "agent_worker" }), true);
   assert.equal(isWorkerTreeNode({ thread_source: null, relationship: "child" }), false);
 });
 
@@ -37,6 +38,7 @@ test("tree labels distinguish autonomous roots from main roots and workers", () 
   assert.equal(sessionTreeLabel({ thread_source: "subagent", relationship: null }, 1), "Worker");
   assert.equal(sessionTreeLabel({ thread_source: "workflow_subagent", relationship: null }, 1), "Worker");
   assert.equal(sessionTreeLabel({ thread_source: null, relationship: "provider_worker" }, 1), "Worker");
+  assert.equal(sessionTreeLabel({ thread_source: "autonomous_agent_unlinked", relationship: "agent_worker" }, 0), "Worker");
   assert.equal(sessionTreeLabel({ thread_source: null, relationship: "child" }, 1), "Branch");
 });
 

@@ -25,6 +25,7 @@ from agentlog.api.search import SourceReader, search_messages as _dual_search_me
 from agentlog.session_identity import (
     IdentityContext,
     build_identity_context,
+    explicit_agent_launch_parent_ids,
     lineage_parent_ids,
     logical_orchestrator_id,
     logical_root_session_id,
@@ -558,6 +559,17 @@ def _session_topology(
         if physical_parent in visible_ids:
             parent_by_id[session_id] = physical_parent
             relationship_by_id[session_id] = "child"
+
+    for target_id, source_id in explicit_agent_launch_parent_ids(conn).items():
+        if (
+            target_id in physical_parents
+            or target_id not in visible_ids
+            or source_id not in visible_ids
+            or target_id == source_id
+        ):
+            continue
+        parent_by_id[target_id] = source_id
+        relationship_by_id[target_id] = "agent_worker"
 
     for source_id, backings in identity.backings_by_source.items():
         if source_id not in visible_ids:
@@ -1359,6 +1371,7 @@ def session_detail_v2(
             "ended_at": s["ended_at"],
             "duration_seconds": dur,
             "parent_session_id": s["parent_session_id"],
+            "relationship": topology.relationship_by_id.get(navigation_id),
             "child_count": total_child_count,
             "descendant_count": topology.descendant_counts.get(navigation_id, 0),
             "is_orphan": navigation_id in topology.orphan_roots,
@@ -1498,18 +1511,10 @@ def orchestration_overview(
         row for row in candidate_rows if not is_suppressed_activity_session(row)
     ]
     candidates_by_id = {str(row["id"]): row for row in candidate_rows}
-    parent_rows = conn.execute(
-        "SELECT id, harness, external_id, parent_session_id, thread_source FROM sessions"
-    ).fetchall()
-    parent_rows = [
-        row for row in parent_rows if not is_suppressed_activity_session(row)
-    ]
-    implicit_parents = resolve_implicit_parent_ids(
-        parent_rows
-    )
+    resolved_parents = lineage_parent_ids(conn)
     children_by_root: dict[str, set[str]] = {}
-    for child_id, parent_id in implicit_parents.items():
-        if parent_id in candidates_by_id:
+    for child_id, parent_id in resolved_parents.items():
+        if child_id in candidates_by_id:
             children_by_root.setdefault(parent_id, set()).add(child_id)
 
     identity = build_identity_context(conn)
@@ -1547,48 +1552,21 @@ def orchestration_overview(
     physical_roots = {
         root_id: candidates_by_id[root_id]
         for root_id in children_by_root
+        if root_id in candidates_by_id
     }
-
-    link_children_by_source: dict[str, set[str]] = {}
-    for source_id, backings in identity.backings_by_source.items():
-        for backing in backings:
-            target_id = backing["target_session_id"]
-            if (
-                backing.get("link_role") != "worker"
-                or not target_id
-                or identity.owners_by_session.get(str(target_id), set())
-                != {source_id}
-            ):
-                continue
-            link_children_by_source.setdefault(source_id, set()).add(str(target_id))
-    if link_children_by_source:
-        link_where, link_params = _session_time_clause(tr, alias="s")
-        placeholders = ",".join(
-            f":link_source_{index}"
-            for index, _ in enumerate(link_children_by_source)
-        )
-        link_query_params = {
-            **link_params,
-            **{
-                f"link_source_{index}": source_id
-                for index, source_id in enumerate(sorted(link_children_by_source))
-            },
-        }
-        link_rows = conn.execute(
+    missing_root_ids = set(children_by_root).difference(physical_roots)
+    if missing_root_ids:
+        placeholders = ",".join("?" for _ in missing_root_ids)
+        rows = conn.execute(
             f"""
             SELECT s.id, s.harness, s.model AS model_raw, s.model_canonical,
                    s.effort, s.repo, s.cwd, s.started_at, s.ended_at
             FROM sessions s
-            WHERE s.id IN ({placeholders}) AND {link_where}
+            WHERE s.id IN ({placeholders})
             """,
-            link_query_params,
+            sorted(missing_root_ids),
         ).fetchall()
-        for row in link_rows:
-            source_id = str(row["id"])
-            physical_roots.setdefault(source_id, row)
-            children_by_root.setdefault(source_id, set()).update(
-                link_children_by_source[source_id]
-            )
+        physical_roots.update({str(row["id"]): row for row in rows})
 
     def presentation_id(row: sqlite3.Row) -> str:
         physical_id = str(row["id"])

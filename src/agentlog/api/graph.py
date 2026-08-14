@@ -123,6 +123,34 @@ def graph_payload(conn: sqlite3.Connection, tr: TimeRange) -> dict[str, Any]:
             "note": f"showing 90d · {hidden} older sessions hidden",
         }
 
+    lineage_parents = lineage_parent_ids(conn)
+    shown_ids = {str(row["id"]) for row in physical_rows}
+    supervisor_ids: set[str] = set()
+    pending = [lineage_parents[session_id] for session_id in shown_ids if session_id in lineage_parents]
+    while pending:
+        supervisor_id = pending.pop()
+        if supervisor_id in shown_ids or supervisor_id in supervisor_ids:
+            continue
+        supervisor_ids.add(supervisor_id)
+        parent_id = lineage_parents.get(supervisor_id)
+        if parent_id is not None:
+            pending.append(parent_id)
+    if supervisor_ids:
+        placeholders = ",".join("?" for _ in supervisor_ids)
+        physical_rows.extend(
+            conn.execute(
+                f"{_SESSION_SQL} WHERE s.id IN ({placeholders})",
+                sorted(supervisor_ids),
+            ).fetchall()
+        )
+    physical_rows = list(
+        {
+            str(row["id"]): row
+            for row in physical_rows
+            if not is_suppressed_activity_session(row)
+        }.values()
+    )
+
     identity = build_identity_context(conn)
     root_shadows = provider_root_shadow_ids(conn, context=identity)
     physical_ids = {str(row["id"]) for row in physical_rows}
@@ -163,7 +191,6 @@ def graph_payload(conn: sqlite3.Connection, tr: TimeRange) -> dict[str, Any]:
     rows = [session.row for session in visible]
     visible_by_id = {session.session_id: session for session in visible}
 
-    lineage_parents = lineage_parent_ids(conn)
     presentation_by_physical: dict[str, str] = {}
     for r in physical_rows:
         session_id = str(r["id"])

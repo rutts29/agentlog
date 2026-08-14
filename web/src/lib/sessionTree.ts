@@ -18,6 +18,7 @@ export type BranchTreeProjection = {
 export function isWorkerTreeNode(node: Pick<TreeNode, "thread_source" | "relationship">): boolean {
   return (
     node.relationship === "provider_worker" ||
+    node.relationship === "agent_worker" ||
     node.thread_source === "subagent" ||
     node.thread_source === "workflow_subagent"
   );
@@ -27,10 +28,13 @@ export function sessionTreeLabel(
   node: Pick<TreeNode, "thread_source" | "relationship">,
   depth: number,
 ): "Agent run" | "Main" | "Worker" | "Branch" {
+  if (isWorkerTreeNode(node)) {
+    return "Worker";
+  }
   if (depth === 0) {
     return node.thread_source === "autonomous_agent_unlinked" ? "Agent run" : "Main";
   }
-  return isWorkerTreeNode(node) ? "Worker" : "Branch";
+  return "Branch";
 }
 
 function nonnegativeInteger(value: unknown): number | null {

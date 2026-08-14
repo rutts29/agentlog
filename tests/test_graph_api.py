@@ -152,6 +152,49 @@ class GraphApiTests(unittest.TestCase):
         }
         self.assertIn(("t3code:owner", "codex:typed-worker"), edges)
 
+    def test_agent_launch_expands_an_out_of_range_owner_without_projection(self) -> None:
+        conn = connect(self.path)
+        conn.executescript(
+            """
+            INSERT INTO sessions
+              (id, harness, external_id, started_at, ended_at, cwd)
+            VALUES ('codex:launch-owner', 'codex', 'launch-owner',
+                    '2026-06-01T00:00:00+00:00', '2026-06-01T00:05:00+00:00', '/tmp/alpha'),
+                   ('grok:launch-worker', 'grok', 'launch-worker',
+                    '2026-07-01T00:01:00+00:00', '2026-07-01T00:04:00+00:00', '/tmp/alpha');
+            INSERT INTO session_links
+              (source_session_id, target_session_id, link_type,
+               target_harness, target_external_id, link_role)
+            VALUES ('codex:launch-owner', 'grok:launch-worker', 'agent_launch',
+                    'grok', 'launch-worker', 'worker');
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        res = self.client.get(
+            "/api/graph",
+            params={
+                "range": "custom",
+                "start": "2026-07-01T00:00:00+00:00",
+                "end": "2026-07-02T00:00:00+00:00",
+            },
+        )
+        self.assertEqual(res.status_code, 200)
+        body = res.json()
+        nodes = {
+            node["id"]: node
+            for node in body["nodes"]
+            if node["kind"] == "session"
+        }
+        self.assertEqual(nodes["grok:launch-worker"]["parent_id"], "codex:launch-owner")
+        self.assertEqual(nodes["grok:launch-worker"]["logical_harness"], "grok")
+        self.assertEqual(
+            nodes["grok:launch-worker"]["transcript_session_id"],
+            "grok:launch-worker",
+        )
+        self.assertIn("codex:launch-owner", nodes)
+
     def test_membership_edges_link_every_session_to_its_repo(self) -> None:
         body = self._get()
         member = [e for e in body["edges"] if e["kind"] == "membership"]

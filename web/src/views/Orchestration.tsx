@@ -224,7 +224,9 @@ function TreeView({
             <span className="text-[10px] text-faint-foreground">
               {node.relationship === "provider_backing"
                 ? "backing transcript"
-                : node.relationship}
+                : node.relationship === "agent_worker"
+                  ? "Worker"
+                  : node.relationship}
             </span>
           ) : null}
           <span className="tabular">
