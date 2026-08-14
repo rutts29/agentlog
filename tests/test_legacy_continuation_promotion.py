@@ -379,6 +379,67 @@ class LegacyContinuationPromotionTests(unittest.TestCase):
                 self.conn.execute("DELETE FROM artifacts WHERE path = ?", (str(path),))
                 self.conn.commit()
 
+    def test_owner_insight_provenance_survives_strict_legacy_extension(self) -> None:
+        path = self.root / "owner-insight.source"
+        old = _result(
+            Harness.T3CODE,
+            "owner-insight",
+            ("user", "request"),
+            ("assistant", "response"),
+        )
+        _, session_id = self._seed(Harness.T3CODE, "owner-insight", path, old)
+        self.conn.execute(
+            """
+            INSERT INTO owner_insight_batches(
+                id, content_hash, prompt_hash, prompt_version, redaction_version,
+                status, prepared_at, provenance_json
+            ) VALUES ('owner-batch', 'content', 'prompt', 'v2', 'v1',
+                      'prepared', '2026-08-12T00:00:00+00:00', '{}')
+            """
+        )
+        self.conn.execute(
+            """
+            INSERT INTO owner_insight_batch_messages(
+                batch_id, session_id, message_id, seq, content_hash, role,
+                source_snapshot_json, source_role
+            ) VALUES ('owner-batch', ?, ?, 1, 'hash', 'user', '{}', 'new')
+            """,
+            (session_id, f"{session_id}:m:1"),
+        )
+        self.conn.commit()
+        provenance_tables = (
+            "owner_insight_batches",
+            "owner_insight_batch_messages",
+        )
+        before = {
+            table: [tuple(row) for row in self.conn.execute(f"SELECT * FROM {table} ORDER BY 1")]
+            for table in provenance_tables
+        }
+        current = _result(
+            Harness.T3CODE,
+            "owner-insight",
+            ("user", "request"),
+            ("assistant", "response"),
+            ("user", "append"),
+        )
+
+        _ingest_one(
+            self.repo,
+            StaticAdapter(Harness.T3CODE, path, [current]),
+            path,
+            IngestStats(),
+        )
+        self.conn.commit()
+        after = {
+            table: [tuple(row) for row in self.conn.execute(f"SELECT * FROM {table} ORDER BY 1")]
+            for table in provenance_tables
+        }
+        self.assertEqual(after, before)
+        self.assertEqual(
+            self.repo.session_transcript_storage(session_id),
+            SOURCE_BACKED,
+        )
+
     def test_injected_failure_rolls_back_storage_text_and_windows(self) -> None:
         path = self.root / "rollback.source"
         old = _result(

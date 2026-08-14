@@ -2,13 +2,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
-PARSER_VERSION = "15"
+PARSER_VERSION = "16"
 
 HOME = Path.home()
 DEFAULT_DB_PATH = HOME / ".agentlog" / "agentlog.db"
 
 CODEX_SESSIONS_DIR = HOME / ".codex" / "sessions"
 CLAUDE_PROJECTS_DIR = HOME / ".claude" / "projects"
+GROK_SESSIONS_DIR = HOME / ".grok" / "sessions"
 CURSOR_PROJECTS_DIR = HOME / ".cursor" / "projects"
 CURSOR_STATE_VSCDB = (
     HOME
@@ -70,7 +71,7 @@ LOG_BACKUP_COUNT = 5
 
 # launchd-managed dashboard API (fixed port for bookmarks / clients)
 SERVICE_API_HOST = "127.0.0.1"
-SERVICE_API_PORT = 8787
+SERVICE_API_PORT = 3000
 
 # Optional override for the dashboard API bearer token. When unset, ``serve``
 # auto-loads or creates ``~/.agentlog/api_token`` (mode 0600) so loopback is

@@ -141,6 +141,21 @@ def _optional_text(value: object) -> str | None:
     return text or None
 
 
+def _workflow_group(value: object) -> tuple[str | None, str | None, int | None]:
+    if not isinstance(value, dict):
+        return None, None, None
+    group_id = _optional_text(value.get("id"))
+    if group_id is None:
+        return None, None, None
+    label = _optional_text(value.get("label")) or group_id
+    position = value.get("position")
+    if isinstance(position, bool):
+        position = None
+    elif not isinstance(position, int):
+        position = None
+    return group_id, label, position
+
+
 _SESSION_IDENTITY_COLUMNS = (
     "parent_session_id",
     "originator",
@@ -471,7 +486,8 @@ class Repository:
             SELECT repo, cwd, parent_session_id, started_at,
                    originator, thread_source,
                    inherited_message_count, inherited_record_count,
-                   fork_context_status, fork_context_boundary
+                   fork_context_status, fork_context_boundary,
+                   workflow_group_id, workflow_group_label, workflow_group_position
             FROM sessions WHERE id = ?
             """,
             (session_id,),
@@ -523,6 +539,15 @@ class Repository:
             if replace_fork_provenance or "fork_context_boundary" in extras
             else row["fork_context_boundary"]
         )
+        workflow_group = (
+            _workflow_group(extras.get("workflow_group"))
+            if replace_transcript_identity or "workflow_group" in extras
+            else (
+                row["workflow_group_id"],
+                row["workflow_group_label"],
+                row["workflow_group_position"],
+            )
+        )
         if replace_transcript_identity:
             ident = _identity_for(
                 session.model,
@@ -550,7 +575,10 @@ class Repository:
                     inherited_message_count = ?,
                     inherited_record_count = ?,
                     fork_context_status = ?,
-                    fork_context_boundary = ?
+                    fork_context_boundary = ?,
+                    workflow_group_id = ?,
+                    workflow_group_label = ?,
+                    workflow_group_position = ?
                 WHERE id = ?
                 """,
                 (
@@ -573,6 +601,7 @@ class Repository:
                     _nonnegative_int(extras.get("inherited_record_count")),
                     _optional_text(extras.get("fork_context_status")),
                     _optional_text(extras.get("fork_context_boundary")),
+                    *workflow_group,
                     session_id,
                 ),
             )
@@ -605,6 +634,9 @@ class Repository:
                     inherited_record_count = ?,
                     fork_context_status = ?,
                     fork_context_boundary = ?,
+                    workflow_group_id = ?,
+                    workflow_group_label = ?,
+                    workflow_group_position = ?,
                     artifact_id = COALESCE(?, artifact_id)
                 WHERE id = ?
                 """,
@@ -628,6 +660,7 @@ class Repository:
                     inherited_record_count,
                     fork_context_status,
                     fork_context_boundary,
+                    *workflow_group,
                     artifact_id,
                     session_id,
                 ),
@@ -653,6 +686,9 @@ class Repository:
                     inherited_record_count = ?,
                     fork_context_status = ?,
                     fork_context_boundary = ?,
+                    workflow_group_id = ?,
+                    workflow_group_label = ?,
+                    workflow_group_position = ?,
                     artifact_id = COALESCE(?, artifact_id)
                 WHERE id = ?
                 """,
@@ -674,6 +710,7 @@ class Repository:
                     inherited_record_count,
                     fork_context_status,
                     fork_context_boundary,
+                    *workflow_group,
                     artifact_id,
                     session_id,
                 ),
@@ -764,6 +801,86 @@ class Repository:
                     f"source-backed session {session_id} diverged during reparse"
                 )
 
+    def source_backed_artifact_promotion_status(
+        self, *, artifact_id: int, result: ParseResult
+    ) -> str:
+        """Classify whether another artifact can become a session's source."""
+        from agentlog.ingest.cursor import prefer_repo
+
+        session_id = _sid(
+            result.session.harness.value, result.session.external_id
+        )
+        row = self.conn.execute(
+            "SELECT artifact_id, transcript_storage, repo FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        if (
+            row is None
+            or row["transcript_storage"] != SOURCE_BACKED
+            or row["artifact_id"] == artifact_id
+        ):
+            return "not_applicable"
+        if self._artifact_storage(artifact_id) != SOURCE_BACKED:
+            raise TranscriptStorageError(
+                f"artifact {artifact_id} is not source-backed"
+            )
+
+        stored = self.conn.execute(
+            "SELECT seq, role, content_hash FROM messages "
+            "WHERE session_id = ? ORDER BY seq",
+            (session_id,),
+        ).fetchall()
+        if len(result.messages) < len(stored):
+            return "shrunk"
+        for prior, incoming in zip(stored, result.messages):
+            if (
+                int(prior["seq"]) != incoming.seq
+                or str(prior["role"]) != incoming.role
+                or str(prior["content_hash"]) != incoming.content_hash
+            ):
+                return "diverged"
+        if len(result.messages) > len(stored):
+            return "extension"
+        if prefer_repo(row["repo"], result.session.repo) != row["repo"]:
+            return "metadata_upgrade"
+        return "unchanged"
+
+    def promote_source_backed_artifact(
+        self,
+        *,
+        artifact_id: int,
+        result: ParseResult,
+        windows: Iterable[
+            tuple[str, str, str]
+            | tuple[str, str, str, str]
+            | tuple[str, str, str, str, str]
+        ],
+    ) -> str | None:
+        """Rebind a source-backed session to a safe, canonical duplicate."""
+        session_id = _sid(
+            result.session.harness.value, result.session.external_id
+        )
+        status = self.source_backed_artifact_promotion_status(
+            artifact_id=artifact_id, result=result
+        )
+        if status not in {"extension", "metadata_upgrade"}:
+            return None
+
+        with _savepoint(self.conn, "promote_source_backed_artifact"):
+            self.conn.execute(
+                "UPDATE sessions SET artifact_id = ?, source_sync_status = 'current', "
+                "source_sync_warning = NULL, source_sync_checked_at = ? WHERE id = ?",
+                (artifact_id, datetime.now().astimezone().isoformat(), session_id),
+            )
+            promoted_id = self.save_parse_result(
+                artifact_id=artifact_id,
+                result=result,
+                append=False,
+                transcript_storage=SOURCE_BACKED,
+            )
+            self.replace_exchange_windows(promoted_id, windows)
+        return promoted_id
+
     def save_parse_result(
         self,
         *,
@@ -813,6 +930,9 @@ class Repository:
         )
         fork_context_boundary = _optional_text(
             result.extras.get("fork_context_boundary")
+        )
+        workflow_group_id, workflow_group_label, workflow_group_position = _workflow_group(
+            result.extras.get("workflow_group")
         )
 
         if (
@@ -885,10 +1005,11 @@ class Repository:
                         originator, thread_source,
                         inherited_message_count, inherited_record_count,
                         fork_context_status, fork_context_boundary,
+                        workflow_group_id, workflow_group_label, workflow_group_position,
                         started_at, ended_at, repo, cwd, branch, commit_sha,
                         model, model_canonical, provider, agent_profile,
                         effort, effort_source, transcript_storage
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         session_id,
@@ -902,6 +1023,9 @@ class Repository:
                         inherited_record_count,
                         fork_context_status,
                         fork_context_boundary,
+                        workflow_group_id,
+                        workflow_group_label,
+                        workflow_group_position,
                         _iso(session.started_at),
                         _iso(session.ended_at),
                         session.repo,
@@ -1205,6 +1329,461 @@ class Repository:
                 "transcript rewrite refused"
             )
 
+    def transcript_rewrite_block_reason(self, session_id: str) -> str | None:
+        for check in (
+            self.assert_no_claim_evidence_for_transcript_rewrite,
+            self.assert_no_owner_insight_provenance_for_transcript_rewrite,
+            self._assert_no_task_cluster_for_transcript_rewrite,
+        ):
+            try:
+                check(session_id)
+            except TranscriptStorageError as exc:
+                return str(exc)
+        return None
+
+    def parser_upgrade_freeze_snapshot(
+        self,
+        *,
+        artifact_id: int,
+        previous_parser_version: str,
+        target_parser_version: str,
+    ) -> sqlite3.Row | None:
+        return self.conn.execute(
+            """
+            SELECT source_size, source_mtime_ns, source_content_hash,
+                   source_parsed_offset
+            FROM parser_upgrade_freezes
+            WHERE artifact_id = ?
+              AND previous_parser_version = ?
+              AND target_parser_version = ?
+            """,
+            (artifact_id, previous_parser_version, target_parser_version),
+        ).fetchone()
+
+    def freeze_parser_upgrade(
+        self,
+        *,
+        artifact_id: int,
+        previous_parser_version: str,
+        target_parser_version: str,
+        source_size: int,
+        source_mtime_ns: int,
+        source_content_hash: str,
+        source_parsed_offset: int,
+        reason: str,
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO parser_upgrade_freezes(
+                artifact_id, previous_parser_version, target_parser_version,
+                source_size, source_mtime_ns, source_content_hash,
+                source_parsed_offset, reason, frozen_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(artifact_id) DO UPDATE SET
+                previous_parser_version = excluded.previous_parser_version,
+                target_parser_version = excluded.target_parser_version,
+                source_size = excluded.source_size,
+                source_mtime_ns = excluded.source_mtime_ns,
+                source_content_hash = excluded.source_content_hash,
+                source_parsed_offset = excluded.source_parsed_offset,
+                reason = excluded.reason,
+                frozen_at = excluded.frozen_at
+            """,
+            (
+                artifact_id,
+                previous_parser_version,
+                target_parser_version,
+                source_size,
+                source_mtime_ns,
+                source_content_hash,
+                source_parsed_offset,
+                reason,
+                datetime.now().astimezone().isoformat(),
+            ),
+        )
+
+    def clear_parser_upgrade_freeze(self, artifact_id: int) -> None:
+        self.conn.execute(
+            "DELETE FROM parser_upgrade_freezes WHERE artifact_id = ?",
+            (artifact_id,),
+        )
+
+    def source_backed_session_ids_for_artifact(self, artifact_id: int) -> list[str]:
+        return [
+            str(row["id"])
+            for row in self.conn.execute(
+                """
+                SELECT id FROM sessions
+                WHERE artifact_id = ? AND transcript_storage = ?
+                ORDER BY id
+                """,
+                (artifact_id, SOURCE_BACKED),
+            )
+        ]
+
+    def clear_frozen_parser_upgrade_diagnostics(self, artifact_id: int) -> None:
+        self.conn.execute(
+            """
+            UPDATE sessions
+            SET source_sync_status = 'current', source_sync_warning = NULL,
+                source_sync_checked_at = ?
+            WHERE artifact_id = ? AND source_sync_status = 'frozen_parser_upgrade'
+            """,
+            (datetime.now().astimezone().isoformat(), artifact_id),
+        )
+
+    def source_backed_parse_result_is_exact(
+        self,
+        *,
+        artifact_id: int,
+        result: ParseResult,
+        windows: Iterable[tuple[str, str, str, str, str]],
+    ) -> bool:
+        session = result.session
+        session_id = _sid(session.harness.value, session.external_id)
+        row = self.conn.execute(
+            """
+            SELECT * FROM sessions
+            WHERE id = ? AND artifact_id = ? AND transcript_storage = ?
+            """,
+            (session_id, artifact_id, SOURCE_BACKED),
+        ).fetchone()
+        if row is None:
+            return False
+        session_ident = _identity_for(
+            session.model,
+            provider_hint=session.provider,
+            agent_profile_hint=session.agent_profile,
+        )
+        workflow_group = _workflow_group(result.extras.get("workflow_group"))
+        expected_session = (
+            session.parent_session_id,
+            session.originator,
+            session.thread_source,
+            _nonnegative_int(result.extras.get("inherited_message_count")),
+            _nonnegative_int(result.extras.get("inherited_record_count")),
+            _optional_text(result.extras.get("fork_context_status")),
+            _optional_text(result.extras.get("fork_context_boundary")),
+            *workflow_group,
+            _iso(session.started_at),
+            _iso(session.ended_at),
+            session.repo,
+            session.cwd,
+            session.branch,
+            session.commit_sha,
+            session.model,
+            session_ident.canonical,
+            session_ident.provider,
+            session_ident.agent_profile,
+            session.effort,
+            session.effort_source,
+        )
+        actual_session = tuple(
+            row[column]
+            for column in (
+                "parent_session_id",
+                "originator",
+                "thread_source",
+                "inherited_message_count",
+                "inherited_record_count",
+                "fork_context_status",
+                "fork_context_boundary",
+                "workflow_group_id",
+                "workflow_group_label",
+                "workflow_group_position",
+                "started_at",
+                "ended_at",
+                "repo",
+                "cwd",
+                "branch",
+                "commit_sha",
+                "model",
+                "model_canonical",
+                "provider",
+                "agent_profile",
+                "effort",
+                "effort_source",
+            )
+        )
+        if actual_session != expected_session:
+            return False
+
+        expected_messages = []
+        for message in result.messages:
+            message_ident = (
+                _identity_for(
+                    message.model,
+                    provider_hint=message.provider or session.provider,
+                    agent_profile_hint=(
+                        message.agent_profile or session.agent_profile
+                    ),
+                )
+                if message.model
+                else ModelIdentity(None, None, None, None, None)
+            )
+            expected_messages.append(
+                (
+                    _mid(session_id, message.seq),
+                    message.seq,
+                    message.role,
+                    _iso(message.timestamp),
+                    message.model,
+                    message_ident.canonical,
+                    message_ident.provider,
+                    message_ident.agent_profile,
+                    message.effort,
+                    message.effort_source,
+                    "",
+                    message.content_hash,
+                    int(message.is_tool_plumbing),
+                    int(message.authored_by_agent),
+                )
+            )
+        actual_messages = [
+            tuple(item)
+            for item in self.conn.execute(
+                """
+                SELECT id, seq, role, timestamp, model, model_canonical, provider,
+                       agent_profile, effort, effort_source, text, content_hash,
+                       is_tool_plumbing, authored_by_agent
+                FROM messages WHERE session_id = ? ORDER BY seq
+                """,
+                (session_id,),
+            )
+        ]
+        if actual_messages != expected_messages:
+            return False
+
+        expected_tools = [
+            (
+                _tid(session_id, tool.seq),
+                _mid(session_id, tool.message_seq)
+                if tool.message_seq is not None
+                else None,
+                tool.seq,
+                tool.tool_name,
+                tool.action,
+                None if tool.success is None else int(tool.success),
+                tool.duration_ms,
+                tool.operation_kind,
+            )
+            for tool in result.tool_events
+        ]
+        actual_tools = [
+            tuple(item)
+            for item in self.conn.execute(
+                """
+                SELECT id, message_id, seq, tool_name, action, success, duration_ms,
+                       operation_kind
+                FROM tool_events WHERE session_id = ? ORDER BY seq
+                """,
+                (session_id,),
+            )
+        ]
+        if actual_tools != expected_tools:
+            return False
+
+        expected_skills = sorted(
+            (
+                _kid(session_id, index, skill.skill_name),
+                _mid(session_id, skill.message_seq)
+                if skill.message_seq is not None
+                else None,
+                skill.skill_name,
+                skill.exposure_type,
+            )
+            for index, skill in enumerate(result.skill_exposures)
+        )
+        actual_skills = [
+            tuple(item)
+            for item in self.conn.execute(
+                """
+                SELECT id, message_id, skill_name, exposure_type
+                FROM skill_exposures WHERE session_id = ? ORDER BY id
+                """,
+                (session_id,),
+            )
+        ]
+        if actual_skills != expected_skills:
+            return False
+
+        expected_usage = sorted(
+            (
+                _uid(session_id, usage.usage_source, usage.seq),
+                _mid(session_id, usage.message_seq)
+                if usage.message_seq is not None
+                else None,
+                usage.seq,
+                usage.granularity,
+                usage.usage_source,
+                usage.model,
+                _identity_for(
+                    usage.model,
+                    provider_hint=session.provider,
+                    agent_profile_hint=session.agent_profile,
+                ).canonical,
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cache_creation_input_tokens,
+                usage.cache_read_input_tokens,
+                usage.cached_input_tokens,
+                usage.cache_write_input_tokens,
+                usage.reasoning_output_tokens,
+                usage.total_tokens,
+                _iso(usage.timestamp),
+                json.dumps(usage.extras, separators=(",", ":"), default=str),
+            )
+            for usage in result.token_usages
+        )
+        actual_usage = [
+            tuple(item)
+            for item in self.conn.execute(
+                """
+                SELECT id, message_id, seq, granularity, usage_source, model,
+                       model_canonical, input_tokens, output_tokens,
+                       cache_creation_input_tokens, cache_read_input_tokens,
+                       cached_input_tokens, cache_write_input_tokens,
+                       reasoning_output_tokens, total_tokens, timestamp, extras_json
+                FROM token_usage WHERE session_id = ? ORDER BY id
+                """,
+                (session_id,),
+            )
+        ]
+        if actual_usage != expected_usage:
+            return False
+
+        expected_windows = sorted(
+            (wid, request_id, response_id, input_hash, content_hash)
+            for request_id, response_id, input_hash, content_hash, wid in windows
+        )
+        actual_windows = [
+            tuple(item)
+            for item in self.conn.execute(
+                """
+                SELECT id, request_message_id, response_message_id, input_hash,
+                       content_hash
+                FROM exchange_windows WHERE session_id = ? ORDER BY id
+                """,
+                (session_id,),
+            )
+        ]
+        if actual_windows != expected_windows:
+            return False
+
+        expected_links = {
+            (str(link["link_type"]), str(link["target_harness"]), str(link["target_external_id"])): (
+                str(link["link_role"]),
+                str(link["confidence"]),
+                str(link["evidence_json"]),
+            )
+            for link in self.conn.execute(
+                """
+                SELECT link_type, target_harness, target_external_id, link_role,
+                       confidence, evidence_json
+                FROM session_links WHERE source_session_id = ?
+                """,
+                (session_id,),
+            )
+        }
+        for link in result.extras.get("session_links", []):
+            if not isinstance(link, dict):
+                return False
+            link_type = str(link.get("link_type") or "").strip()
+            target_harness = str(link.get("target_harness") or "").strip()
+            target_external_id = str(link.get("target_external_id") or "").strip()
+            if not link_type or not target_harness or not target_external_id:
+                continue
+            expected_links[(link_type, target_harness, target_external_id)] = (
+                str(link.get("link_role") or "unknown"),
+                str(link.get("confidence") or "observed"),
+                json.dumps(link.get("evidence") or {}, separators=(",", ":")),
+            )
+        actual_links = {
+            (str(link["link_type"]), str(link["target_harness"]), str(link["target_external_id"])): (
+                str(link["link_role"]),
+                str(link["confidence"]),
+                str(link["evidence_json"]),
+            )
+            for link in self.conn.execute(
+                """
+                SELECT link_type, target_harness, target_external_id, link_role,
+                       confidence, evidence_json
+                FROM session_links WHERE source_session_id = ?
+                """,
+                (session_id,),
+            )
+        }
+        if actual_links != expected_links:
+            return False
+
+        from agentlog.analysis.attention_signals import last_attention_signal
+
+        tail = next(
+            (message for message in reversed(result.messages) if not message.is_tool_plumbing),
+            None,
+        )
+        latest_tool = max(result.tool_events, key=lambda tool: tool.seq, default=None)
+        latest_role = tail.role if tail is not None else None
+        expected_attention = (
+            tail.seq if tail is not None else row["attention_last_substantive_seq"],
+            tail.role if tail is not None else row["attention_last_substantive_role"],
+            _iso(tail.timestamp) if tail is not None else row["attention_last_substantive_at"],
+            int(last_attention_signal(result.messages) == "question")
+            if tail is not None
+            else row["attention_final_question"],
+            int(last_attention_signal(result.messages) == "incomplete_todo")
+            if tail is not None
+            else row["attention_incomplete_todo"],
+            1 if tail is not None else row["attention_tail_revision"],
+            int(
+                latest_tool is not None
+                and latest_tool.tool_name in {"TodoWrite", "update_plan"}
+                and latest_role is not None
+                and latest_role != "user"
+            ),
+        )
+        actual_attention = tuple(
+            row[column]
+            for column in (
+                "attention_last_substantive_seq",
+                "attention_last_substantive_role",
+                "attention_last_substantive_at",
+                "attention_final_question",
+                "attention_incomplete_todo",
+                "attention_tail_revision",
+                "attention_last_plan_open",
+            )
+        )
+        return actual_attention == expected_attention
+
+    def assert_no_owner_insight_provenance_for_transcript_rewrite(
+        self, session_id: str
+    ) -> None:
+        evidence = self.conn.execute(
+            """
+            SELECT 'batch_message' AS source
+            FROM owner_insight_batch_messages bm
+            JOIN owner_insight_batches b ON b.id = bm.batch_id
+            WHERE bm.session_id = ? AND b.status IN ('prepared', 'imported')
+            UNION ALL
+            SELECT 'seen_message' AS source
+            FROM owner_insight_seen_messages sm
+            JOIN owner_insight_session_state ss ON ss.session_id = sm.session_id
+            WHERE sm.session_id = ?
+              AND (
+                  sm.status = 'imported'
+                  OR (sm.status = 'prepared' AND sm.generation = ss.generation)
+              )
+            LIMIT 1
+            """,
+            (session_id, session_id),
+        ).fetchone()
+        if evidence is not None:
+            raise TranscriptStorageError(
+                f"source-backed session {session_id} has owner insight provenance; "
+                "transcript rewrite refused"
+            )
+
     def legacy_continuation_status(
         self, *, artifact_id: int, result: ParseResult
     ) -> str | None:
@@ -1360,6 +1939,7 @@ class Repository:
                 f"source-backed session {session_id} belongs to another artifact"
             )
         self.assert_no_claim_evidence_for_transcript_rewrite(session_id)
+        self.assert_no_owner_insight_provenance_for_transcript_rewrite(session_id)
         self._assert_no_task_cluster_for_transcript_rewrite(session_id)
 
         with _savepoint(self.conn, "rewrite_source_backed_parse_result"):

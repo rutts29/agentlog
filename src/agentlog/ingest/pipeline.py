@@ -38,6 +38,7 @@ from agentlog.ingest.cursor import (
     lookup_composer_metas,
 )
 from agentlog.ingest.hermes import HermesAdapter
+from agentlog.ingest.grok import GrokAdapter
 from agentlog.ingest.t3code import T3CodeAdapter
 from agentlog.ingest.warp import WarpAdapter
 from agentlog.normalize.effort import normalize_effort
@@ -83,6 +84,31 @@ class FrozenSourceBackedTranscriptError(FrozenLegacyTranscriptError):
     """A source-backed transcript no longer matches its persisted identity."""
 
 
+class FrozenParserUpgradeError(TranscriptStorageError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        artifact_id: int,
+        session_ids: list[str],
+        previous_parser_version: str,
+        target_parser_version: str,
+        size: int,
+        mtime_ns: int,
+        content_hash: str,
+        parsed_offset: int,
+    ) -> None:
+        super().__init__(message)
+        self.artifact_id = artifact_id
+        self.session_ids = session_ids
+        self.previous_parser_version = previous_parser_version
+        self.target_parser_version = target_parser_version
+        self.size = size
+        self.mtime_ns = mtime_ns
+        self.content_hash = content_hash
+        self.parsed_offset = parsed_offset
+
+
 @dataclass
 class IngestStats:
     skipped: int = 0
@@ -105,6 +131,7 @@ def adapters() -> list[TranscriptAdapter]:
         WarpAdapter(),
         HermesAdapter(),
         T3CodeAdapter(),
+        GrokAdapter(),
     ]
 
 
@@ -130,20 +157,29 @@ def _sqlite_logical_snapshot(
 def _source_matches_snapshot(
     path,
     *,
+    adapter: TranscriptAdapter | None = None,
     sqlite_source: bool,
     expected_revision: tuple[int, int],
     expected_hash: str,
     parsed_offset: int,
+    revision_fn=file_stat,
+    fingerprint_fn=hash_prefix,
 ) -> bool:
+    if adapter is not None and adapter.uses_composite_source:
+        return adapter.composite_snapshot_matches(
+            path,
+            revision=expected_revision,
+            content_hash=expected_hash,
+        )
     if sqlite_source:
         snapshot = _sqlite_logical_snapshot(path)
         return snapshot == (expected_revision, expected_hash)
-    revision_before = file_stat(path)
+    revision_before = revision_fn(path)
     if revision_before != expected_revision:
         return False
-    current_hash = hash_prefix(path, parsed_offset)
+    current_hash = fingerprint_fn(path, parsed_offset)
     return (
-        file_stat(path) == revision_before
+        revision_fn(path) == revision_before
         and current_hash == expected_hash
     )
 
@@ -203,6 +239,11 @@ def ingest_all(
                 else:
                     _ingest_one(repo, adapter, path, stats)
                 repo.conn.commit()
+            except FrozenParserUpgradeError as exc:
+                repo.conn.rollback()
+                _persist_frozen_parser_upgrade(repo, exc)
+                stats.skipped += 1
+                stats.warnings.append(f"{path}: {exc}; parser upgrade frozen")
             except FrozenLegacyTranscriptError as exc:
                 repo.conn.rollback()
                 _persist_frozen_legacy(repo, exc)
@@ -227,6 +268,7 @@ def _changed_artifact_paths(
     paths: set[Path] = set()
     for raw_path in changed_paths:
         path = Path(raw_path).expanduser()
+        path = adapter.canonical_artifact_path(path)
         raw = str(path)
         for suffix in _SQLITE_SIDECARS:
             if raw.endswith(suffix):
@@ -242,7 +284,7 @@ def _changed_artifact_paths(
         if adapter.supports_byte_append:
             if path.suffix.lower() != ".jsonl" or path.name == "journal.jsonl":
                 continue
-        elif not is_sqlite_path(path):
+        elif not is_sqlite_path(path) and not adapter.uses_composite_source:
             continue
         elif adapter.harness.value == "t3code" and path.name != "state.sqlite":
             continue
@@ -288,6 +330,29 @@ def _persist_frozen_legacy(
                     error.transcript_storage or existing.transcript_storage
                 ),
             )
+    repo.conn.commit()
+
+
+def _persist_frozen_parser_upgrade(
+    repo: Repository, error: FrozenParserUpgradeError
+) -> None:
+    repo.freeze_parser_upgrade(
+        artifact_id=error.artifact_id,
+        previous_parser_version=error.previous_parser_version,
+        target_parser_version=error.target_parser_version,
+        source_size=error.size,
+        source_mtime_ns=error.mtime_ns,
+        source_content_hash=error.content_hash,
+        source_parsed_offset=error.parsed_offset,
+        reason=str(error),
+    )
+    warning = str(error)
+    for session_id in error.session_ids:
+        repo.record_source_sync_diagnostic(
+            session_id,
+            status="frozen_parser_upgrade",
+            warning=warning,
+        )
     repo.conn.commit()
 
 
@@ -378,6 +443,11 @@ def ingest_harness(
             else:
                 _ingest_one(repo, adapter, path, stats)
             repo.conn.commit()
+        except FrozenParserUpgradeError as exc:
+            repo.conn.rollback()
+            _persist_frozen_parser_upgrade(repo, exc)
+            stats.skipped += 1
+            stats.warnings.append(f"{path}: {exc}; parser upgrade frozen")
         except FrozenLegacyTranscriptError as exc:
             repo.conn.rollback()
             _persist_frozen_legacy(repo, exc)
@@ -475,10 +545,26 @@ def _ingest_one(
     attention_tail_backfill_artifact_ids: set[int] | None = None,
 ) -> None:
     sqlite_source = is_sqlite_path(path)
+    composite_source = adapter.uses_composite_source
     for attempt in range(_STABLE_SOURCE_ATTEMPTS):
         try:
-            decision = decide(repo, path, adapter.harness.value)
-            revision_before = file_stat(path)
+            source_snapshot = (
+                adapter.capture_source(path) if composite_source else None
+            )
+            decision = decide(
+                repo,
+                path,
+                adapter.harness.value,
+                revision_fn=adapter.checkpoint_revision,
+                fingerprint_fn=adapter.checkpoint_fingerprint,
+                revision=(source_snapshot.revision if source_snapshot else None),
+                force_full_reparse=composite_source,
+            )
+            revision_before = (
+                source_snapshot.revision
+                if source_snapshot is not None
+                else adapter.checkpoint_revision(path)
+            )
             if revision_before != (decision.size, decision.mtime_ns):
                 continue
             if decision.action == IngestAction.SKIP:
@@ -508,6 +594,51 @@ def _ingest_one(
             )
             if sqlite_source and logical_before_revision != revision_before:
                 continue
+            if (
+                decision.action == IngestAction.REPARSE
+                and decision.artifact is not None
+                and decision.artifact.transcript_storage == SOURCE_BACKED
+                and decision.artifact.parser_version != PARSER_VERSION
+            ):
+                frozen = repo.parser_upgrade_freeze_snapshot(
+                    artifact_id=decision.artifact.id,
+                    previous_parser_version=decision.artifact.parser_version,
+                    target_parser_version=PARSER_VERSION,
+                )
+                frozen_offset = (
+                    int(frozen["source_parsed_offset"])
+                    if frozen is not None
+                    else decision.artifact.parsed_offset
+                )
+                frozen_hash = (
+                    source_snapshot.content_hash
+                    if source_snapshot is not None
+                    else (
+                        logical_before
+                        if sqlite_source
+                        else adapter.checkpoint_fingerprint(
+                            path, frozen_offset
+                        )
+                    )
+                )
+                if (
+                    frozen is not None
+                    and int(frozen["source_size"]) == decision.size
+                    and int(frozen["source_mtime_ns"]) == decision.mtime_ns
+                    and str(frozen["source_content_hash"]) == frozen_hash
+                    and _source_matches_snapshot(
+                    path,
+                    adapter=adapter,
+                    sqlite_source=sqlite_source,
+                    expected_revision=(decision.size, decision.mtime_ns),
+                    expected_hash=frozen_hash,
+                    parsed_offset=frozen_offset,
+                    revision_fn=adapter.checkpoint_revision,
+                    fingerprint_fn=adapter.checkpoint_fingerprint,
+                    )
+                ):
+                    stats.skipped += 1
+                    return
             if (
                 sqlite_source
                 and decision.artifact is not None
@@ -541,12 +672,20 @@ def _ingest_one(
                 )
 
             data = (
-                read_slice(path, decision.start_offset)
-                if adapter.supports_byte_append
-                else b""
+                source_snapshot.data
+                if source_snapshot is not None
+                else (
+                    read_slice(path, decision.start_offset)
+                    if adapter.supports_byte_append
+                    else b""
+                )
             )
-            results = adapter.parse_path(
-                path, data, start_offset=decision.start_offset
+            results = (
+                adapter.parse_source_snapshot(path, source_snapshot)
+                if source_snapshot is not None
+                else adapter.parse_path(
+                    path, data, start_offset=decision.start_offset
+                )
             )
             if (
                 decision.action == IngestAction.APPEND
@@ -571,7 +710,10 @@ def _ingest_one(
                     parsed_offset = reported
                 else:
                     parsed_offset = reported if reported else content_size
-            if sqlite_source:
+            if source_snapshot is not None:
+                content_hash = source_snapshot.content_hash
+                revision_after = source_snapshot.revision
+            elif sqlite_source:
                 logical_after = _sqlite_logical_snapshot(path)
                 if logical_after is None:
                     continue
@@ -586,10 +728,16 @@ def _ingest_one(
                     start_offset=decision.start_offset,
                 )
             else:
-                content_hash = hash_prefix(path, parsed_offset)
-                revision_after = file_stat(path)
+                content_hash = adapter.checkpoint_fingerprint(path, parsed_offset)
+                revision_after = adapter.checkpoint_revision(path)
                 if revision_before != revision_after:
                     continue
+            if source_snapshot is not None and not adapter.composite_snapshot_matches(
+                path,
+                revision=source_snapshot.revision,
+                content_hash=source_snapshot.content_hash,
+            ):
+                continue
         except (OSError, sqlite3.Error):
             if attempt + 1 < _STABLE_SOURCE_ATTEMPTS:
                 continue
@@ -676,7 +824,8 @@ def _ingest_one(
         ]
         == SOURCE_BACKED
         and (
-            prior_sessions[
+            adapter.harness.value == "cursor"
+            or prior_sessions[
                 f"{adapter.harness.value}:{result.session.external_id}"
             ]
             < 0
@@ -715,10 +864,13 @@ def _ingest_one(
             raise RuntimeError("; ".join(reasons))
         if not _source_matches_snapshot(
             path,
+            adapter=adapter,
             sqlite_source=sqlite_source,
             expected_revision=(decision.size, decision.mtime_ns),
             expected_hash=content_hash,
             parsed_offset=parsed_offset,
+            revision_fn=adapter.checkpoint_revision,
+            fingerprint_fn=adapter.checkpoint_fingerprint,
         ):
             raise RuntimeError(f"source changed during window build: {path}")
         for external_id in possible_promotions:
@@ -770,12 +922,58 @@ def _ingest_one(
                 session_key, full_result
             )
 
+    exact_parser_upgrade_external_ids: set[str] = set()
+    if parser_upgrade:
+        assert artifact_id is not None
+        assert decision.artifact is not None
+        for external_id in source_backed_external_ids:
+            session_key = f"{adapter.harness.value}:{external_id}"
+            if (
+                prior_sessions[session_key] < 0
+                or session_artifact_ids[session_key] != artifact_id
+            ):
+                continue
+            full_result = full_source_results.get(external_id)
+            if full_result is None:
+                raise RuntimeError(
+                    "source-backed session missing from source: "
+                    f"{session_key}"
+                )
+            windows = prepared_windows[external_id]
+            if repo.source_backed_parse_result_is_exact(
+                artifact_id=artifact_id,
+                result=full_result,
+                windows=windows,
+            ):
+                exact_parser_upgrade_external_ids.add(external_id)
+                continue
+            reason = repo.transcript_rewrite_block_reason(session_key)
+            if reason is not None:
+                raise FrozenParserUpgradeError(
+                    "parser upgrade "
+                    f"{decision.artifact.parser_version} -> {PARSER_VERSION} "
+                    f"would change {session_key}; {reason}",
+                    artifact_id=artifact_id,
+                    session_ids=repo.source_backed_session_ids_for_artifact(
+                        artifact_id
+                    ),
+                    previous_parser_version=decision.artifact.parser_version,
+                    target_parser_version=PARSER_VERSION,
+                    size=decision.size,
+                    mtime_ns=decision.mtime_ns,
+                    content_hash=content_hash,
+                    parsed_offset=parsed_offset,
+                )
+
     if not _source_matches_snapshot(
         path,
+        adapter=adapter,
         sqlite_source=sqlite_source,
         expected_revision=(decision.size, decision.mtime_ns),
         expected_hash=content_hash,
         parsed_offset=parsed_offset,
+        revision_fn=adapter.checkpoint_revision,
+        fingerprint_fn=adapter.checkpoint_fingerprint,
     ):
         raise RuntimeError(f"source changed before checkpoint: {path}")
 
@@ -789,6 +987,8 @@ def _ingest_one(
         parser_version=PARSER_VERSION,
         transcript_storage=artifact_storage,
     )
+    if parser_upgrade:
+        repo.clear_parser_upgrade_freeze(artifact_id)
 
     if not results:
         if append:
@@ -821,6 +1021,11 @@ def _ingest_one(
                 warning=frozen_warning,
             )
             continue
+        if (
+            parser_upgrade
+            and result.session.external_id in exact_parser_upgrade_external_ids
+        ):
+            continue
         base_seq = repo.max_message_seq(session_key) if append else 0
         base_tool = repo.max_tool_seq(session_key) if append else 0
         base_token = repo.max_token_seq(session_key) if append else 0
@@ -836,6 +1041,12 @@ def _ingest_one(
             and session_storage == SOURCE_BACKED
             and repo.session_artifact_id(session_key) == artifact_id
         )
+        source_artifact_promotion = (
+            adapter.harness.value == "cursor"
+            and existed
+            and session_storage == SOURCE_BACKED
+            and repo.session_artifact_id(session_key) != artifact_id
+        )
         legacy_continuation = (
             existed
             and result.session.external_id in promotion_external_ids
@@ -845,10 +1056,13 @@ def _ingest_one(
         if legacy_continuation:
             if not _source_matches_snapshot(
                 path,
+                adapter=adapter,
                 sqlite_source=sqlite_source,
                 expected_revision=(decision.size, decision.mtime_ns),
                 expected_hash=content_hash,
                 parsed_offset=parsed_offset,
+                revision_fn=adapter.checkpoint_revision,
+                fingerprint_fn=adapter.checkpoint_fingerprint,
             ):
                 raise RuntimeError(f"source changed before promotion: {path}")
             full_result = full_source_result(result.session.external_id)
@@ -873,6 +1087,43 @@ def _ingest_one(
                 previous_parser_version=decision.artifact.parser_version,
                 current_parser_version=PARSER_VERSION,
             )
+        elif source_artifact_promotion:
+            full_result = full_source_result(result.session.external_id)
+            promotion_status = repo.source_backed_artifact_promotion_status(
+                artifact_id=artifact_id,
+                result=full_result,
+            )
+            if promotion_status in {"extension", "metadata_upgrade"}:
+                if not _source_matches_snapshot(
+                    path,
+                    adapter=adapter,
+                    sqlite_source=sqlite_source,
+                    expected_revision=(decision.size, decision.mtime_ns),
+                    expected_hash=content_hash,
+                    parsed_offset=parsed_offset,
+                    revision_fn=adapter.checkpoint_revision,
+                    fingerprint_fn=adapter.checkpoint_fingerprint,
+                ):
+                    raise RuntimeError(
+                        f"source changed before source-artifact promotion: {path}"
+                    )
+                windows = prepared_windows[result.session.external_id]
+                session_id = repo.promote_source_backed_artifact(
+                    artifact_id=artifact_id,
+                    result=full_result,
+                    windows=windows,
+                )
+                if session_id is None:
+                    raise RuntimeError(
+                        f"source-artifact promotion eligibility changed: {session_key}"
+                    )
+            else:
+                if promotion_status in {"diverged", "shrunk"}:
+                    stats.warnings.append(
+                        f"alternate source for {session_key} {promotion_status}; "
+                        "retaining canonical artifact"
+                    )
+                continue
         else:
             source_append = session_storage == SOURCE_BACKED and append
             try:
@@ -911,6 +1162,7 @@ def _ingest_one(
             and repo.session_artifact_id(session_id) == artifact_id
             and not parser_upgrade_rewrite
             and not legacy_continuation
+            and not source_artifact_promotion
         ):
             full_result = full_source_result(result.session.external_id)
             windows = prepared_windows[result.session.external_id]
@@ -929,6 +1181,9 @@ def _ingest_one(
             stats.sessions_added += 1
         msg_after = _session_message_count(repo, session_id)
         stats.messages_added += max(0, msg_after - msg_before)
+
+    if parser_upgrade:
+        repo.clear_frozen_parser_upgrade_diagnostics(artifact_id)
 
     if append:
         stats.appended += 1

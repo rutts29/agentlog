@@ -11,7 +11,12 @@ from rich.table import Table
 
 from agentlog import __version__
 from agentlog.analysis.deterministic import compute_stats
-from agentlog.config import API_TOKEN_ENV_VAR, DEFAULT_DB_PATH, ensure_db_parent
+from agentlog.config import (
+    API_TOKEN_ENV_VAR,
+    DEFAULT_DB_PATH,
+    SERVICE_API_PORT,
+    ensure_db_parent,
+)
 from agentlog.db.repository import Repository
 from agentlog.db.schema import connect, init_db
 from agentlog.ingest.pipeline import ingest_all
@@ -312,7 +317,7 @@ def session_show(ctx: typer.Context, session_id: str) -> None:
     # Allow bare external ids by trying prefixes
     row = repo.get_session(session_id)
     if row is None and ":" not in session_id:
-        for prefix in ("codex:", "claude:", "cursor:"):
+        for prefix in ("codex:", "claude:", "cursor:", "grok:"):
             row = repo.get_session(prefix + session_id)
             if row is not None:
                 session_id = prefix + session_id
@@ -459,11 +464,14 @@ def claims_cmd(
 
 @app.command("insights-extract")
 def insights_extract_cmd(
-    packets: Path = typer.Option(
-        ...,
+    ctx: typer.Context,
+    packets: Optional[Path] = typer.Option(
+        None,
         "--packets",
-        help="Directory of prepared coach packets (reuse coach prepare).",
+        help="Legacy imported Coach packet directory; default is the canonical database corpus.",
     ),
+    range_name: str = typer.Option("all", "--range", help="Corpus window: 24h, 7d, 30d, or all."),
+    session: list[str] = typer.Option([], "--session", help="Optional visible logical or canonical transcript session id; repeatable."),
     out: Path = typer.Option(
         ...,
         "--out",
@@ -472,59 +480,138 @@ def insights_extract_cmd(
     model: Optional[str] = typer.Option(
         None,
         "--model",
-        help="If set, call the configured chat client to fill items.",
+        help="Optional provenance label for the external reviewer; never called by Agentlog.",
     ),
     run_id: str = typer.Option(
         "owner-extract",
         "--run-id",
         help="Run id stored on the written packet.",
     ),
+    max_batch_chars: int = typer.Option(
+        240_000,
+        "--max-batch-chars",
+        help="Maximum UTF-8 bytes per review batch; evidence is never truncated.",
+    ),
+    confirm_external_review: Optional[str] = typer.Option(
+        None,
+        "--confirm-external-review",
+        help="Exact acknowledgement required before writing reviewable transcript packets.",
+    ),
 ) -> None:
-    """Extract owner-facing Insights from coach packets. Skips the 7-kind compiler."""
+    """Prepare manual, free-form owner Insight batches; never calls a model."""
     from agentlog.analysis.owner_notes import (
-        OWNER_NOTE_PROMPT,
-        collect_packet_dir_turns,
-        compact_turns,
+        OWNER_NOTE_CONFIRMATION,
+        prepare_owner_proposal_targets,
+        prepare_owner_insight_batches,
+        prepare_owner_insight_messages,
+        write_owner_batch_export,
         write_owner_fact_packet,
     )
 
-    packet_dir = packets.expanduser()
-    if not packet_dir.is_dir():
+    from agentlog.analysis.owner_corpus import collect_owner_corpus, owner_corpus_since
+
+    packet_dir = packets.expanduser() if packets is not None else None
+    if packet_dir is not None and not packet_dir.is_dir():
         console.print(f"[red]Not a packet directory:[/red] {packet_dir}")
         raise typer.Exit(code=1)
-    turns = collect_packet_dir_turns(packet_dir)
-    digest_path = out.expanduser().with_suffix(".turns.txt")
-    digest_path.parent.mkdir(parents=True, exist_ok=True)
-    digest = compact_turns(turns)
-    digest_path.write_text(digest + "\n", encoding="utf-8")
-    if not model:
-        write_owner_fact_packet(out.expanduser(), run_id=run_id, items=[])
-        console.print(
-            f"Wrote empty fact packet {out} and {len(turns)} owner turns to "
-            f"{digest_path}. Fill items (or pass --model) then insights-import."
-        )
-        return
-    from agentlog.analysis.extractors.llm_client import XAIChatClient
+    try:
+        since = owner_corpus_since(range_name)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    conn = _coach_db(ctx)
+    try:
+        def prepare(*, persist: bool):
+            if packet_dir is not None:
+                return (
+                    prepare_owner_insight_batches(
+                        conn, packet_dir, max_batch_chars=max_batch_chars, persist=persist
+                    ),
+                    {"mode": "legacy_packets"},
+                )
+            corpus = collect_owner_corpus(conn, since=since, session_ids=session or None)
+            return (
+                prepare_owner_insight_messages(
+                    conn,
+                    corpus.messages,
+                    max_batch_chars=max_batch_chars,
+                    persist=persist,
+                    detect_missing_sessions=since is None and not session,
+                ),
+                {
+                    "mode": "canonical_database_corpus",
+                    "range": range_name,
+                    "visible_sessions": corpus.visible_sessions,
+                    "source_backed_sessions": corpus.source_backed_sessions,
+                    "corpus_hash": corpus.corpus_hash,
+                    "redaction": corpus.redaction,
+                },
+            )
 
-    client = XAIChatClient()
-    result = client.complete_json(
-        system=OWNER_NOTE_PROMPT,
-        user=digest,
-        model=model,
-    )
-    items = result.get("items") if isinstance(result, dict) else None
-    if not isinstance(items, list):
-        console.print("[red]Model did not return an items list[/red]")
-        raise typer.Exit(code=1)
-    payload = write_owner_fact_packet(
-        out.expanduser(),
-        run_id=run_id,
-        items=items,
-    )
-    console.print(
-        f"Wrote {len(payload['items'])} owner notes to {out} "
-        f"from {len(turns)} turns ({model})."
-    )
+        conn.execute("SAVEPOINT owner_insights_preview")
+        try:
+            preview, corpus_summary = prepare(persist=False)
+        finally:
+            conn.execute("ROLLBACK TO owner_insights_preview")
+            conn.execute("RELEASE owner_insights_preview")
+        summary = {
+            "phase": "owner_insights_preview",
+            "messages_seen": preview["messages_seen"],
+            "new_messages": preview["new_messages"],
+            "context_messages": preview["context_messages"],
+            "batch_count": len(preview["batches"]),
+            "blocked_sessions": preview["blocked_sessions"],
+            "network_calls": 0,
+            **corpus_summary,
+            "next": "Re-run with --confirm-external-review to write redacted review packets.",
+        }
+        if confirm_external_review != OWNER_NOTE_CONFIRMATION:
+            _coach_json(summary)
+            return
+        prepared, prepared_corpus_summary = prepare(persist=True)
+        if prepared["blocked_sessions"]:
+            conn.rollback()
+            _coach_failure("owner_insights", "owner_insight_history_rewrite", blocked_sessions=prepared["blocked_sessions"])
+        if not prepared["batches"]:
+            _coach_json(
+                {
+                    **summary,
+                    "phase": "owner_insights_noop",
+                    "resumed_batches": 0,
+                    **prepared_corpus_summary,
+                    "next": "No review export was written because every selected message is already imported.",
+                }
+            )
+            return
+        export_dir = out.expanduser().with_suffix(".owner-insights")
+        target_coverage: dict[str, int] = {}
+        targets = prepare_owner_proposal_targets(conn, coverage=target_coverage)
+        manifest = write_owner_batch_export(
+            export_dir,
+            prepared["batches"],
+            targets=targets,
+            target_coverage=target_coverage,
+        )
+        write_owner_fact_packet(
+            out.expanduser(), run_id=run_id, items=[], batches=prepared["batches"], targets=targets
+        )
+        conn.commit()
+        _coach_json(
+            {
+                **summary,
+                "phase": "owner_insights_prepared",
+                "export_dir": str(export_dir),
+                "facts_template": str(out.expanduser()),
+                "model_hint": model,
+                "batch_count": manifest["batch_count"],
+                "resumed_batches": prepared["resumed_batches"],
+                "proposal_target_coverage": manifest["proposal_target_coverage"],
+                **prepared_corpus_summary,
+                "next": "Give evidence batches and owner_insights_prompt.md to reviewers; only a final reviewer receives proposal_targets.json. Merge JSON into the facts template, then run insights-import.",
+            }
+        )
+    finally:
+        conn.close()
 
 
 @app.command("insights-import")
@@ -559,9 +646,28 @@ def insights_import_cmd(
         console.print(f"[red]Import rejected:[/red] {exc}")
         raise typer.Exit(code=1) from exc
     console.print(
-        f"Imported {stats['claims']} evidence-verified session facts "
+        f"Imported {stats['claims']} evidence-verified session facts and {stats.get('proposals', 0)} review-only proposals "
         f"from {stats['run_id']} ({stats['model']})."
     )
+
+
+@app.command("insights-reset-session")
+def insights_reset_session_cmd(
+    ctx: typer.Context,
+    session_id: str = typer.Argument(..., help="Session whose rewritten history you deliberately want to review again"),
+) -> None:
+    """Explicitly begin a new manual owner-review generation after a rewrite."""
+    from agentlog.analysis.owner_notes import reset_owner_insight_session
+
+    conn = _coach_db(ctx)
+    try:
+        if conn.execute("SELECT 1 FROM sessions WHERE id=?", (session_id,)).fetchone() is None:
+            raise typer.BadParameter(f"unknown session: {session_id}")
+        reset_owner_insight_session(conn, session_id)
+        conn.commit()
+    finally:
+        conn.close()
+    console.print(f"Reset owner Insight review generation for {session_id}.")
 
 
 @propose_app.callback(invoke_without_command=True)
@@ -1981,7 +2087,7 @@ def experiment_analyze_cmd(
 def serve_cmd(
     ctx: typer.Context,
     host: str = typer.Option("127.0.0.1", "--host"),
-    port: int = typer.Option(8722, "--port"),
+    port: int = typer.Option(SERVICE_API_PORT, "--port"),
     log_file: Optional[Path] = typer.Option(
         None,
         "--log-file",
@@ -2052,7 +2158,7 @@ def serve_cmd(
             f"agentlog serve  http://{host}:{port}\n"
             f"db (read-only): {db_path}\n"
             f"access: {auth}\n"
-            "SPA injects the token; curl needs Authorization: Bearer …",
+            "SPA uses an HttpOnly browser session; curl needs Authorization: Bearer …",
             border_style="cyan",
         )
     )
@@ -2087,7 +2193,7 @@ def api_token_cmd(
 
 @service_app.command("install")
 def service_install_cmd(ctx: typer.Context) -> None:
-    """Install and start user LaunchAgents for watch + API (port 8787)."""
+    """Install and start user LaunchAgents for watch + API (port 3000)."""
     from agentlog.service.launchd import install_services
 
     try:

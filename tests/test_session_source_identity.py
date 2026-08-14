@@ -133,6 +133,56 @@ class SessionSourceIdentityRepositoryTests(unittest.TestCase):
         self.assertEqual(row["fork_context_status"], "trimmed")
         self.assertEqual(row["fork_context_boundary"], "turn-7")
 
+    def test_parser_workflow_group_persists_and_append_keeps_it(self) -> None:
+        result = self._result(inherited_messages=1)
+        result.extras["workflow_group"] = {
+            "id": "evidence",
+            "label": "Evidence sweep",
+            "position": 20,
+        }
+        session_id = self.repo.save_parse_result(
+            artifact_id=self.artifact_id,
+            result=result,
+            append=False,
+        )
+        self.repo.save_parse_result(
+            artifact_id=self.artifact_id,
+            result=ParseResult(
+                session=NormalizedSession(
+                    harness=Harness.CODEX,
+                    external_id="worker",
+                    parent_session_id="parent",
+                )
+            ),
+            append=True,
+        )
+        row = self.conn.execute(
+            "SELECT workflow_group_id, workflow_group_label, workflow_group_position "
+            "FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        assert row is not None
+        self.assertEqual(tuple(row), ("evidence", "Evidence sweep", 20))
+
+        self.repo.save_parse_result(
+            artifact_id=self.artifact_id,
+            result=ParseResult(
+                session=NormalizedSession(
+                    harness=Harness.CODEX,
+                    external_id="worker",
+                    parent_session_id="parent",
+                )
+            ),
+            append=False,
+        )
+        cleared = self.conn.execute(
+            "SELECT workflow_group_id, workflow_group_label, workflow_group_position "
+            "FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        assert cleared is not None
+        self.assertEqual(tuple(cleared), (None, None, None))
+
     def test_authoritative_reparse_can_clear_stale_source_identity(self) -> None:
         self.repo.save_parse_result(
             artifact_id=self.artifact_id,

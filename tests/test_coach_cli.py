@@ -34,6 +34,64 @@ class CoachCliTests(unittest.TestCase):
         self.assertTrue((self.run_dir / "manifest.json").is_file())
         self.assertFalse((self.tmp / "agentlog.db").exists())
 
+    def test_confirmed_owner_extract_is_a_noop_after_every_batch_is_imported(self):
+        from agentlog.analysis.insights import import_session_fact_packet
+        from agentlog.analysis.owner_corpus import collect_owner_corpus
+        from agentlog.analysis.owner_notes import (
+            OWNER_NOTE_CONFIRMATION,
+            prepare_owner_insight_messages,
+            write_owner_fact_packet,
+        )
+
+        conn = sqlite3.connect(self.db)
+        conn.row_factory = sqlite3.Row
+        init_db(conn)
+        conn.execute(
+            "INSERT INTO sessions(id,harness,external_id,repo) VALUES(?,?,?,?)",
+            ("root", "codex", "root", "demo"),
+        )
+        conn.execute(
+            "INSERT INTO messages(id,session_id,seq,role,text,content_hash) VALUES(?,?,?,?,?,?)",
+            ("root:message", "root", 1, "user", "Keep a resumable handoff ledger.", "message-hash"),
+        )
+        corpus = collect_owner_corpus(conn)
+        prepared = prepare_owner_insight_messages(conn, corpus.messages)
+        imported_packet = self.tmp / "imported-owner-facts.json"
+        write_owner_fact_packet(
+            imported_packet,
+            run_id="first-owner-review",
+            items=[],
+            batches=prepared["batches"],
+        )
+        import_session_fact_packet(conn, imported_packet, model="reviewer")
+        conn.commit()
+        before = "\n".join(conn.iterdump())
+        conn.close()
+
+        out = self.tmp / "rerun-owner-facts.json"
+        result = self.invoke(
+            "insights-extract",
+            "--range",
+            "all",
+            "--out",
+            str(out),
+            "--confirm-external-review",
+            OWNER_NOTE_CONFIRMATION,
+        )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        body = json.loads(result.output)
+        self.assertEqual(body["phase"], "owner_insights_noop")
+        self.assertEqual(body["batch_count"], 0)
+        self.assertEqual(body["resumed_batches"], 0)
+        self.assertFalse(out.exists())
+        self.assertFalse(out.with_suffix(".owner-insights").exists())
+        conn = sqlite3.connect(self.db)
+        try:
+            self.assertEqual("\n".join(conn.iterdump()), before)
+        finally:
+            conn.close()
+
     def test_full_prepare_packetizes_more_than_default_sample_bound(self):
         conn = sqlite3.connect(self.db)
         init_db(conn)

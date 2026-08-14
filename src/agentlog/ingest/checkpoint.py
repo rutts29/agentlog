@@ -24,8 +24,17 @@ class CheckpointDecision:
     start_offset: int
 
 
-def decide(repo: Repository, path: Path, harness: str) -> CheckpointDecision:
-    size, mtime_ns = file_stat(path)
+def decide(
+    repo: Repository,
+    path: Path,
+    harness: str,
+    *,
+    revision_fn=file_stat,
+    fingerprint_fn=hash_prefix,
+    revision: tuple[int, int] | None = None,
+    force_full_reparse: bool = False,
+) -> CheckpointDecision:
+    size, mtime_ns = revision if revision is not None else revision_fn(path)
     existing = repo.get_artifact_by_path(str(path))
 
     if existing is None:
@@ -55,8 +64,12 @@ def decide(repo: Repository, path: Path, harness: str) -> CheckpointDecision:
             start_offset=existing.parsed_offset,
         )
 
-    if size > existing.parsed_offset and existing.parsed_offset > 0:
-        prefix_hash = hash_prefix(path, existing.parsed_offset)
+    if (
+        not force_full_reparse
+        and size > existing.parsed_offset
+        and existing.parsed_offset > 0
+    ):
+        prefix_hash = fingerprint_fn(path, existing.parsed_offset)
         if prefix_hash == existing.content_hash:
             return CheckpointDecision(
                 action=IngestAction.APPEND,

@@ -46,7 +46,13 @@ _STATE_RANK = {
 _SEVERITY_RANK = {"warn": 0, "info": 1}
 _PLAN_TOOLS = frozenset({"TodoWrite", "update_plan"})
 _UNVERIFIED_SOURCE_STATUSES = frozenset(
-    {"source_changed", "source_unavailable", "frozen_diverged", "frozen_shrunk"}
+    {
+        "source_changed",
+        "source_unavailable",
+        "frozen_diverged",
+        "frozen_shrunk",
+        "frozen_parser_upgrade",
+    }
 )
 # Cursor/Codex path slugs that are not a real project identity for supersession.
 _AMBIGUOUS_REPOS = frozenset({"empty-window", "unknown", ""})

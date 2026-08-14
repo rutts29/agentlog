@@ -16,17 +16,25 @@ Three distinct threats, three distinct controls:
   recognise.
 * Cross-site request forgery. A page can issue a simple cross-origin POST
   without preflight; CORS blocks reading the response but not the write.
-  Browser-originated mutations must carry an allowed ``Origin``.
+  Browser-originated mutations must carry an allowed ``Origin``. The SPA's
+  HttpOnly, SameSite browser session is therefore not enough for a cross-site
+  write.
 
 Browser detection is deliberate. curl and other non-browser clients are not
 rebinding or CSRF vectors, but when a token is configured (the default for
 ``agentlog serve``) they must still present it — that is what stops arbitrary
-local processes from reading transcripts on loopback. The dashboard SPA and
-Vite proxy carry the token without a login screen.
+local processes from reading transcripts on loopback. The dashboard SPA uses a
+derived HttpOnly session credential; the Vite proxy carries the API token.
+The service is HTTP, so the session cookie cannot be marked ``Secure`` without
+breaking the loopback dashboard. Session bootstrap and acceptance are limited
+to loopback binds; remote binds remain bearer-only. Non-loopback binds already
+warn that traffic is plaintext; this cookie prevents bearer disclosure to page
+scripts, not a same-user process that can read the token file.
 """
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import ipaddress
 import secrets
@@ -42,10 +50,11 @@ from agentlog.config import API_TOKEN_ENV_VAR
 
 TOKEN_ENV_VAR = API_TOKEN_ENV_VAR
 TOKEN_HEADER = "x-agentlog-token"
-TOKEN_QUERY_PARAM = "token"
+BROWSER_SESSION_COOKIE = "agentlog_session"
+_BROWSER_SESSION_PURPOSE = b"agentlog browser session v1"
 
 LOOPBACK_NAMES = frozenset({"localhost", "localhost.localdomain", ""})
-DASHBOARD_PORTS = (8787, 8722, 5173)
+DASHBOARD_PORTS = (3000, 5173)
 
 MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
@@ -54,7 +63,6 @@ _BROWSER_HEADERS = (
     "sec-fetch-mode",
     "sec-fetch-dest",
     "origin",
-    "cookie",
     "referer",
 )
 
@@ -65,6 +73,13 @@ class BindPolicyViolation(RuntimeError):
 
 def generate_token() -> str:
     return secrets.token_urlsafe(32)
+
+
+def browser_session_token(token: str) -> str:
+    """Derive the browser-only credential without disclosing the API bearer."""
+    return hmac.new(
+        token.encode("utf-8"), _BROWSER_SESSION_PURPOSE, hashlib.sha256
+    ).hexdigest()
 
 
 def is_loopback_host(host: str | None) -> bool:
@@ -111,7 +126,7 @@ class SecurityConfig:
     allowed_hosts: frozenset[str] = field(default_factory=default_allowed_hosts)
     allowed_origins: frozenset[str] = field(default_factory=default_allowed_origins)
     bind_host: str = "127.0.0.1"
-    bind_port: int = 8787
+    bind_port: int = 3000
 
     @property
     def requires_token(self) -> bool:
@@ -210,19 +225,13 @@ def _looks_like_browser(request: Request) -> bool:
     return headers.get("user-agent", "").startswith("Mozilla/")
 
 
-def _token_from(request: Request) -> str | None:
+def _bearer_token_from(request: Request) -> str | None:
     auth = request.headers.get("authorization", "")
     if auth.lower().startswith("bearer "):
         return auth[7:].strip()
     header = request.headers.get(TOKEN_HEADER)
     if header:
         return header.strip()
-    # EventSource cannot set Authorization; allow ?token= on the SSE stream only.
-    path = request.url.path
-    if path.endswith("/stream") or "/events/" in path:
-        query = request.query_params.get(TOKEN_QUERY_PARAM)
-        if query:
-            return query.strip()
     return None
 
 
@@ -242,17 +251,30 @@ class LocalTrustBoundaryMiddleware(BaseHTTPMiddleware):
         cfg = self.config
         path = request.url.path
 
-        # Token gates the API only. The SPA shell (and /assets) must load
-        # unauthenticated so the HTML can embed the token for subsequent calls.
+        browser = _looks_like_browser(request)
+
+        # The SPA shell (and /assets) must load unauthenticated so it can set a
+        # browser-only session cookie. Non-browser API clients still need the
+        # API bearer/header.
         if cfg.requires_token and (path == "/api" or path.startswith("/api/")):
-            supplied = _token_from(request)
-            if supplied is None or not hmac.compare_digest(supplied, cfg.token or ""):
+            supplied = _bearer_token_from(request)
+            bearer_ok = supplied is not None and hmac.compare_digest(
+                supplied, cfg.token or ""
+            )
+            session = request.cookies.get(BROWSER_SESSION_COOKIE)
+            session_ok = (
+                is_loopback_host(cfg.bind_host)
+                and browser
+                and session is not None
+                and hmac.compare_digest(
+                    session, browser_session_token(cfg.token or "")
+                )
+            )
+            if not bearer_ok and not session_ok:
                 return _deny(
                     401,
-                    "missing or invalid API token; send Authorization: Bearer <token>",
+                    "missing or invalid API credential; send Authorization: Bearer <token>",
                 )
-
-        browser = _looks_like_browser(request)
 
         if browser:
             host = _hostname_of(request.headers.get("host"))

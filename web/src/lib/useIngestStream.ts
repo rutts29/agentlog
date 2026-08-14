@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { withApiToken, type IngestEvent, type PresenceEvent } from "@/lib/api";
+import { type IngestEvent, type PresenceEvent } from "@/lib/api";
 
 export type IngestBatch = {
   events: IngestEvent[];
@@ -30,9 +30,7 @@ export function useIngestStream(
   useEffect(() => {
     const since = new Date().toISOString();
     const es = new EventSource(
-      withApiToken(
-        `/api/events/stream?since=${encodeURIComponent(since)}`,
-      ),
+      `/api/events/stream?since=${encodeURIComponent(since)}`,
     );
     let queue: IngestEvent[] = [];
     let hiddenWhileQueued = false;

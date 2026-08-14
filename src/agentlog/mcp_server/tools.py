@@ -16,11 +16,15 @@ from urllib.parse import urlparse
 from agentlog.analysis.attention import derive_attention
 from agentlog.analysis.skills import list_skill_profiles
 from agentlog.api.identity_aggregates import visible_logical_sessions
-from agentlog.session_identity import logical_projection
+from agentlog.session_identity import (
+    IdentityContext,
+    build_identity_context,
+    logical_projection,
+    provider_root_shadow_ids,
+)
 from agentlog.api.model_rollup import (
     GRAIN_DESCRIPTIONS,
     SESSION_START_MODEL,
-    SESSION_START_MODEL_SQL,
 )
 from agentlog.source_reader import (
     CachedSourceTranscriptReader,
@@ -120,6 +124,8 @@ def _session_meta(
     conn: sqlite3.Connection,
     session_id: str,
     source_reader: CachedSourceTranscriptReader | None = None,
+    *,
+    context: IdentityContext | None = None,
 ) -> dict[str, Any] | None:
     row = conn.execute(
         f"""
@@ -141,13 +147,18 @@ def _session_meta(
     if row is None:
         return None
     dur = row["duration_seconds"]
-    projection = logical_projection(conn, str(row["id"]), str(row["harness"]))
+    projection = logical_projection(
+        conn, str(row["id"]), str(row["harness"]), context=context
+    )
     transcript_id = str(projection["transcript_session_id"] or row["id"])
     transcript_storage = row["transcript_storage"]
     if transcript_id != str(row["id"]):
-        transcript_storage = conn.execute(
+        transcript_row = conn.execute(
             "SELECT transcript_storage FROM sessions WHERE id = ?", (transcript_id,)
-        ).fetchone()["transcript_storage"]
+        ).fetchone()
+        if transcript_row is None:
+            return None
+        transcript_storage = transcript_row["transcript_storage"]
     source = None
     source_read = None
     if transcript_storage == "source_backed":
@@ -178,6 +189,10 @@ def _session_meta(
     return {
         "id": row["id"],
         "harness": row["harness"],
+        "logical_harness": projection["logical_harness"],
+        "runtime_harness": projection["runtime_harness"],
+        "orchestrator_session_id": projection["orchestrator_session_id"],
+        "transcript_session_id": transcript_id,
         "external_id": row["external_id"],
         "parent_session_id": row["parent_session_id"],
         "started_at": row["started_at"],
@@ -228,6 +243,7 @@ def search_sessions(
     seen: set[str] = set()
     provenance: dict[str, str] = {}
     source_reader = CachedSourceTranscriptReader()
+    identity = build_identity_context(conn)
     match = _fts_match(q)
     session_columns = {
         str(row[1]) for row in conn.execute("PRAGMA table_info(sessions)").fetchall()
@@ -279,16 +295,23 @@ def search_sessions(
         ).fetchall()
         source_visible = [
             session
-            for session in visible_logical_sessions(conn, source_rows)
+            for session in visible_logical_sessions(conn, source_rows, context=identity)
             if harness is None or session.logical_harness == harness
         ][: min(MAX_SESSION_LIMIT * 5, 200)]
         query_tokens = _FTS_TOKEN_RE.findall(q)[:24]
+        metric_ids = sorted({session.metric_session_id for session in source_visible})
+        metric_storage: dict[str, str | None] = {}
+        if metric_ids:
+            placeholders = ",".join("?" for _ in metric_ids)
+            metric_storage = {
+                str(row["id"]): row["transcript_storage"]
+                for row in conn.execute(
+                    f"SELECT id, transcript_storage FROM sessions WHERE id IN ({placeholders})",
+                    metric_ids,
+                )
+            }
         for source_session in source_visible:
-            metric_row = conn.execute(
-                "SELECT transcript_storage FROM sessions WHERE id = ?",
-                (source_session.metric_session_id,),
-            ).fetchone()
-            if metric_row is None or metric_row["transcript_storage"] != "source_backed":
+            if metric_storage.get(source_session.metric_session_id) != "source_backed":
                 continue
             result = source_reader(conn, source_session.metric_session_id)
             if not result.ready:
@@ -333,7 +356,7 @@ def search_sessions(
         candidate_ids = set(session_ids)
         canonical_ids: list[str] = []
         canonical_provenance: dict[str, str] = {}
-        for candidate in visible_logical_sessions(conn, candidate_rows):
+        for candidate in visible_logical_sessions(conn, candidate_rows, context=identity):
             if candidate.session_id not in candidate_ids and candidate.metric_session_id not in candidate_ids:
                 continue
             if candidate.session_id in canonical_ids:
@@ -351,7 +374,7 @@ def search_sessions(
     for sid in session_ids:
         if len(sessions) >= limit:
             break
-        meta = _session_meta(conn, sid, source_reader)
+        meta = _session_meta(conn, sid, source_reader, context=identity)
         if meta is not None:
             meta["provenance"] = provenance.get(sid, "metadata")
             sessions.append(meta)
@@ -373,20 +396,32 @@ def get_session(
 ) -> dict[str, Any]:
     """Return session detail; messages are truncated and capped."""
     source_reader = CachedSourceTranscriptReader()
-    meta = _session_meta(conn, session_id, source_reader)
+    identity = build_identity_context(conn)
+    meta = _session_meta(conn, session_id, source_reader, context=identity)
     if meta is None and ":" not in session_id:
-        for prefix in ("codex:", "claude:", "cursor:", "warp:", "hermes:"):
-            meta = _session_meta(conn, prefix + session_id, source_reader)
+        for prefix in ("codex:", "claude:", "cursor:", "warp:", "hermes:", "grok:"):
+            meta = _session_meta(
+                conn, prefix + session_id, source_reader, context=identity
+            )
             if meta is not None:
                 session_id = prefix + session_id
                 break
     if meta is None:
         return {"error": "not_found", "session_id": session_id}
 
-    session_row = conn.execute(
-        "SELECT id, harness FROM sessions WHERE id = ?", (session_id,)
-    ).fetchone()
-    projection = logical_projection(conn, session_id, str(session_row["harness"]))
+    requested_projection = logical_projection(
+        conn, str(meta["id"]), str(meta["harness"]), context=identity
+    )
+    owner_id = requested_projection["orchestrator_session_id"]
+    if str(meta["id"]) in provider_root_shadow_ids(conn, context=identity) and owner_id:
+        session_id = str(owner_id)
+        meta = _session_meta(conn, session_id, source_reader, context=identity)
+        if meta is None:
+            return {"error": "not_found", "session_id": session_id}
+
+    projection = logical_projection(
+        conn, session_id, str(meta["harness"]), context=identity
+    )
     transcript_id = str(projection["transcript_session_id"] or session_id)
     source_read = source_reader(conn, transcript_id)
     if source_read.status == "source_unavailable":
@@ -474,60 +509,88 @@ def usage_stats(
             ],
         }
 
-    clauses: list[str] = ["1=1"]
+    clauses: list[str] = []
     params: list[Any] = []
     if since:
         clauses.append("COALESCE(s.started_at, '') >= ?")
         params.append(since)
-    where = " AND ".join(clauses)
-    dur_sql = _duration_seconds_sql()
-
-    if group_by == "harness":
-        key_sql = "s.harness"
-    elif group_by == "model":
-        key_sql = SESSION_START_MODEL_SQL
-    elif group_by == "agent_profile":
-        key_sql = "COALESCE(NULLIF(s.agent_profile, ''), '(none)')"
-    elif group_by == "day":
-        key_sql = "substr(COALESCE(s.started_at, ''), 1, 10)"
-    else:
-        key_sql = "COALESCE(NULLIF(s.repo, ''), COALESCE(NULLIF(s.cwd, ''), '(unknown)'))"
-
-    rows = conn.execute(
-        f"""
-        SELECT
-            {key_sql} AS bucket,
-            COUNT(*) AS session_count,
-            SUM(CASE WHEN ({dur_sql}) IS NOT NULL THEN ({dur_sql}) ELSE 0 END)
-                AS duration_seconds_sum,
-            SUM(CASE WHEN ({dur_sql}) IS NOT NULL THEN 1 ELSE 0 END)
-                AS with_duration,
-            SUM(
-              (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id)
-            ) AS message_count
-        FROM sessions s
-        WHERE {where}
-        GROUP BY bucket
-        ORDER BY session_count DESC, bucket ASC
-        LIMIT 100
-        """,
-        params,
+    where = " AND ".join(clauses) or "1=1"
+    identity = build_identity_context(conn)
+    physical_rows = conn.execute(
+        f"SELECT s.* FROM sessions s WHERE {where}", params
     ).fetchall()
+    visible = visible_logical_sessions(conn, physical_rows, context=identity)
+    metric_ids = sorted({session.metric_session_id for session in visible})
+    metric_rows: dict[str, sqlite3.Row] = {}
+    message_counts: dict[str, int] = {}
+    if metric_ids:
+        placeholders = ",".join("?" for _ in metric_ids)
+        metric_rows = {
+            str(row["id"]): row
+            for row in conn.execute(
+                f"""
+                SELECT s.id, s.model_canonical, s.agent_profile,
+                       {_duration_seconds_sql()} AS duration_seconds
+                FROM sessions s WHERE s.id IN ({placeholders})
+                """,
+                metric_ids,
+            )
+        }
+        message_counts = {
+            str(row["session_id"]): int(row["n"])
+            for row in conn.execute(
+                f"""
+                SELECT session_id, COUNT(*) AS n FROM messages
+                WHERE session_id IN ({placeholders}) GROUP BY session_id
+                """,
+                metric_ids,
+            )
+        }
 
-    groups: list[dict[str, Any]] = []
-    for r in rows:
-        raw = r["bucket"] or "(unknown)"
-        if group_by == "repo" and raw != "(unknown)":
-            key = _project_label(str(raw), None)
+    buckets: dict[str, dict[str, int]] = {}
+    for session in visible:
+        metric = metric_rows.get(session.metric_session_id)
+        if metric is None:
+            continue
+        display_row = session.row
+        if group_by == "harness":
+            key = session.logical_harness
+        elif group_by == "model":
+            key = str(metric["model_canonical"] or "(unknown)")
+        elif group_by == "agent_profile":
+            key = str(metric["agent_profile"] or "(none)")
+        elif group_by == "day":
+            key = str(display_row["started_at"] or "")[:10]
         else:
-            key = str(raw)
-        n_dur = int(r["with_duration"] or 0)
-        dur_sum = int(r["duration_seconds_sum"] or 0)
+            key = _project_label(display_row["repo"], display_row["cwd"])
+        bucket = buckets.setdefault(
+            key,
+            {
+                "session_count": 0,
+                "duration_seconds_sum": 0,
+                "with_duration": 0,
+                "message_count": 0,
+            },
+        )
+        bucket["session_count"] += 1
+        bucket["message_count"] += message_counts.get(session.metric_session_id, 0)
+        duration = metric["duration_seconds"]
+        if duration is not None:
+            bucket["duration_seconds_sum"] += int(duration)
+            bucket["with_duration"] += 1
+
+    rows = sorted(
+        buckets.items(), key=lambda item: (-item[1]["session_count"], item[0])
+    )[:100]
+    groups: list[dict[str, Any]] = []
+    for key, bucket in rows:
+        n_dur = bucket["with_duration"]
+        dur_sum = bucket["duration_seconds_sum"]
         groups.append(
             {
                 "key": key,
-                "session_count": int(r["session_count"]),
-                "message_count": int(r["message_count"] or 0),
+                "session_count": bucket["session_count"],
+                "message_count": bucket["message_count"],
                 "duration_seconds_sum": dur_sum if n_dur else 0,
                 "duration_seconds_avg": (
                     round(dur_sum / n_dur) if n_dur else None

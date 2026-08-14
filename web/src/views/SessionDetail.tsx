@@ -1,5 +1,5 @@
 import { Link, useOutletContext, useParams, useSearchParams } from "react-router-dom";
-import { useEffect, useMemo, useRef } from "react";
+import { Fragment, useEffect, useMemo, useRef } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   displaySessionIdentity,
@@ -649,6 +649,7 @@ function BranchTree({
   currentId: string;
   search: string;
 }) {
+  const shownWorkflowGroups = new Set<string>();
   return (
     <ul role="tree">
       {rows.map(({ node, depth }, index) => {
@@ -656,13 +657,29 @@ function BranchTree({
         const selected = navigationId === currentId || node.id === currentId;
         const logical = logicalHarness(node);
         const runtime = runtimeHarness(node);
+        const groupKey = node.workflow_group_id
+          ? `${node.parent_navigation_id ?? ""}:${node.workflow_group_id}`
+          : null;
+        const showWorkflowGroup = Boolean(
+          groupKey && !shownWorkflowGroups.has(groupKey),
+        );
+        if (groupKey) shownWorkflowGroups.add(groupKey);
         return (
-          <li
-            key={`${navigationId}-${index}`}
-            role="treeitem"
-            aria-level={depth + 1}
-            style={{ paddingLeft: `${Math.min(depth, 12) * 8}px` }}
-          >
+          <Fragment key={`${navigationId}-${index}`}>
+            {showWorkflowGroup ? (
+              <li
+                role="presentation"
+                className="mt-2 border-l border-border-faint pl-2 text-[10px] font-medium uppercase tracking-[0.12em] text-faint-foreground"
+                style={{ marginLeft: `${Math.min(depth, 12) * 8}px` }}
+              >
+                {node.workflow_group_label ?? node.workflow_group_id}
+              </li>
+            ) : null}
+            <li
+              role="treeitem"
+              aria-level={depth + 1}
+              style={{ paddingLeft: `${Math.min(depth, 12) * 8}px` }}
+            >
             <Link
               to={sessionHref(navigationId, search)}
               aria-current={selected ? "page" : undefined}
@@ -695,7 +712,8 @@ function BranchTree({
                 />
               </div>
             </Link>
-          </li>
+            </li>
+          </Fragment>
         );
       })}
     </ul>

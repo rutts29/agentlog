@@ -1,25 +1,7 @@
 export type RangeKey = "24h" | "7d" | "30d" | "all" | "custom";
 
-declare global {
-  interface Window {
-    /** Injected into served SPA HTML; Vite proxy supplies the header instead. */
-    __AGENTLOG_TOKEN__?: string;
-  }
-}
-
 function apiAuthHeaders(): HeadersInit {
-  const token = window.__AGENTLOG_TOKEN__;
-  if (!token) return {};
-  return { Authorization: `Bearer ${token}` };
-}
-
-/** EventSource cannot set headers; append ?token= when the SPA carries one. */
-export function withApiToken(path: string): string {
-  const token = window.__AGENTLOG_TOKEN__;
-  if (!token) return path;
-  const url = new URL(path, window.location.origin);
-  url.searchParams.set("token", token);
-  return `${url.pathname}${url.search}${url.hash}`;
+  return {};
 }
 
 export function combineAbortSignals(
@@ -89,6 +71,9 @@ export type SessionIdentityFields = {
   transcript_session_id?: string | null;
   provider_backings?: ProviderBacking[] | null;
   runtime_backing_provenance?: RuntimeBackingProvenance | null;
+  workflow_group_id?: string | null;
+  workflow_group_label?: string | null;
+  workflow_group_position?: number | null;
 };
 
 export type SessionIdentityLike = {

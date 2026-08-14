@@ -50,7 +50,7 @@ def create_server(db_path: Path | str | None = None) -> MCPServer:
         query: Annotated[str, Field(description="Search text over messages, repo, cwd, model, id.")],
         harness: Annotated[
             str | None,
-            Field(description="Optional harness filter: codex, claude, cursor, warp, hermes."),
+        Field(description="Optional harness filter: codex, claude, cursor, warp, hermes, grok."),
         ] = None,
         since: Annotated[
             str | None,

@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest import mock
 
 from agentlog.config import PARSER_VERSION
+from agentlog.analysis.owner_notes import reset_owner_insight_session
 from agentlog.db.repository import SOURCE_BACKED, Repository, TranscriptStorageError
 from agentlog.db.schema import connect, init_db
 from agentlog.ingest.base import TranscriptAdapter, content_hash_text, hash_prefix
@@ -144,18 +145,7 @@ class ParserUpgradeRewriteTests(unittest.TestCase):
         self.conn.close()
         self.tmp.cleanup()
 
-    def _seed_old(self) -> tuple[int, str]:
-        size = self.path.stat().st_size
-        artifact_id = self.repo.upsert_artifact(
-            harness="codex",
-            path=str(self.path),
-            size=size,
-            mtime_ns=self.path.stat().st_mtime_ns,
-            content_hash=hash_prefix(self.path, size),
-            parsed_offset=size,
-            parser_version="old-parser",
-            transcript_storage=SOURCE_BACKED,
-        )
+    def _old_result(self) -> ParseResult:
         old = _result(
             ("user", "copied parent request"),
             ("assistant", "copied parent answer"),
@@ -179,6 +169,21 @@ class ParserUpgradeRewriteTests(unittest.TestCase):
         old.session.agent_profile = "old-profile"
         old.session.effort = "high"
         old.session.effort_source = "old-source"
+        return old
+
+    def _seed_old(self) -> tuple[int, str]:
+        size = self.path.stat().st_size
+        artifact_id = self.repo.upsert_artifact(
+            harness="codex",
+            path=str(self.path),
+            size=size,
+            mtime_ns=self.path.stat().st_mtime_ns,
+            content_hash=hash_prefix(self.path, size),
+            parsed_offset=size,
+            parser_version="old-parser",
+            transcript_storage=SOURCE_BACKED,
+        )
+        old = self._old_result()
         session_id = self.repo.save_parse_result(
             artifact_id=artifact_id,
             result=old,
@@ -210,6 +215,11 @@ class ParserUpgradeRewriteTests(unittest.TestCase):
             "task_clusters",
             "claims",
             "claim_evidence",
+            "owner_insight_batches",
+            "owner_insight_batch_messages",
+            "owner_insight_seen_messages",
+            "owner_insight_session_state",
+            "parser_upgrade_freezes",
         )
         return {
             table: [
@@ -330,6 +340,152 @@ class ParserUpgradeRewriteTests(unittest.TestCase):
                 (session_id,),
             ).fetchone()["c"],
             1,
+        )
+
+    def test_exact_parser_upgrade_advances_evidence_bearing_checkpoint(self) -> None:
+        artifact_id, session_id = self._seed_old()
+        self.conn.execute(
+            "UPDATE artifacts SET parser_version = '15' WHERE id = ?",
+            (artifact_id,),
+        )
+        self.conn.execute(
+            """
+            INSERT INTO claims(
+                id, kind, subject, predicate, value_json, scope_type,
+                derivation, observed_at, extractor_name, extractor_version,
+                created_at, updated_at
+            ) VALUES(
+                'claim', 'fact', 'session', 'observed', '{}', 'global',
+                'deterministic', '2026-08-12T00:00:00+00:00', 'test', '1',
+                '2026-08-12T00:00:00+00:00', '2026-08-12T00:00:00+00:00'
+            )
+            """
+        )
+        self.conn.execute(
+            """
+            INSERT INTO claim_evidence(id, claim_id, session_id, created_at)
+            VALUES('evidence', 'claim', ?, '2026-08-12T00:00:00+00:00')
+            """,
+            (session_id,),
+        )
+        self.conn.commit()
+        before = self._snapshot()
+
+        with mock.patch(
+            "agentlog.ingest.pipeline.adapter_for",
+            return_value=StaticAdapter(self.path, self._old_result()),
+        ):
+            stats = ingest_harness(self.repo, "codex")
+
+        self.assertEqual(stats.failed, 0)
+        self.assertEqual(stats.skipped, 0)
+        artifact = self.repo.get_artifact_by_path(str(self.path))
+        assert artifact is not None
+        self.assertEqual(artifact.parser_version, PARSER_VERSION)
+        after = self._snapshot()
+        for table in after:
+            if table != "artifacts":
+                self.assertEqual(after[table], before[table])
+
+    def test_v16_repairs_frozen_byte_append_message_shape(self) -> None:
+        artifact_id, session_id = self._seed_old()
+        turns = [
+            ("developer", "runtime envelope"),
+            ("user", "parent task"),
+            ("assistant", "initial analysis"),
+            ("user", "first follow-up"),
+            ("assistant", "first response"),
+            ("user", "second follow-up"),
+            ("assistant", "second response"),
+            ("user", "third follow-up"),
+            ("assistant", "third response"),
+            ("user", "fourth follow-up"),
+            ("assistant", "fourth response"),
+            ("user", "inserted missed user turn"),
+            ("assistant", "canonical thirteenth"),
+            ("user", "canonical fourteenth"),
+            ("user", "later missed user turn"),
+            ("assistant", "canonical sixteenth"),
+            ("assistant", "canonical seventeenth"),
+        ]
+        canonical = _result(*turns, inherited_message_count=0, marker="v16")
+        frozen = _result(
+            *(turns[:11] + turns[12:14]),
+            inherited_message_count=0,
+            marker="v15",
+        )
+        for table in (
+            "exchange_windows",
+            "tool_events",
+            "skill_exposures",
+            "token_usage",
+            "messages",
+        ):
+            self.conn.execute(f"DELETE FROM {table} WHERE session_id = ?", (session_id,))
+        self.repo.save_parse_result(
+            artifact_id=artifact_id,
+            result=frozen,
+            append=False,
+            transcript_storage=SOURCE_BACKED,
+        )
+        self.conn.execute(
+            "UPDATE artifacts SET parser_version = '15' WHERE id = ?",
+            (artifact_id,),
+        )
+        self.conn.commit()
+
+        frozen_hashes = [
+            row["content_hash"]
+            for row in self.conn.execute(
+                "SELECT content_hash FROM messages WHERE session_id = ? ORDER BY seq",
+                (session_id,),
+            )
+        ]
+        self.assertEqual(len(frozen_hashes), 13)
+        self.assertEqual(
+            frozen_hashes[11:],
+            [content_hash_text(text) for _, text in turns[12:14]],
+        )
+
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM claim_evidence WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()[0],
+            0,
+        )
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM task_clusters WHERE root_session_id = ?",
+                (session_id,),
+            ).fetchone()[0],
+            0,
+        )
+
+        _ingest_one(
+            self.repo,
+            StaticAdapter(self.path, canonical),
+            self.path,
+            IngestStats(),
+        )
+        self.conn.commit()
+
+        artifact = self.repo.get_artifact_by_path(str(self.path))
+        assert artifact is not None
+        self.assertEqual(artifact.parser_version, "16")
+        self.assertEqual(
+            [
+                (row["seq"], row["role"], row["content_hash"])
+                for row in self.conn.execute(
+                    "SELECT seq, role, content_hash FROM messages "
+                    "WHERE session_id = ? ORDER BY seq",
+                    (session_id,),
+                )
+            ],
+            [
+                (seq, role, content_hash_text(text))
+                for seq, (role, text) in enumerate(turns, start=1)
+            ],
         )
 
     def test_parser_upgrade_removes_internal_approval_guardian_activity(self) -> None:
@@ -546,9 +702,43 @@ class ParserUpgradeRewriteTests(unittest.TestCase):
         ):
             stats = ingest_harness(self.repo, "codex")
 
-        self.assertEqual(stats.failed, 1)
+        self.assertEqual(stats.failed, 0)
+        self.assertEqual(stats.skipped, 1)
         self.assertIn("derived task cluster", stats.warnings[0])
-        self.assertEqual(self._snapshot(), before)
+        after = self._snapshot()
+        for table in (
+            "artifacts",
+            "messages",
+            "tool_events",
+            "skill_exposures",
+            "token_usage",
+            "exchange_windows",
+            "session_links",
+            "task_clusters",
+        ):
+            self.assertEqual(after[table], before[table])
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT source_sync_status FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()["source_sync_status"],
+            "frozen_parser_upgrade",
+        )
+        frozen = self._snapshot()
+        adapter = StaticAdapter(self.path, local_only)
+        with (
+            mock.patch(
+                "agentlog.ingest.pipeline.adapter_for", return_value=adapter
+            ),
+            mock.patch.object(
+                adapter,
+                "parse_path",
+                side_effect=AssertionError("frozen parser upgrade re-parsed"),
+            ),
+        ):
+            repeated = ingest_harness(self.repo, "codex")
+        self.assertEqual(repeated.failed, 0)
+        self.assertEqual(repeated.skipped, 1)
+        self.assertEqual(self._snapshot(), frozen)
 
     def test_root_task_cluster_without_endpoints_blocks_rewrite(self) -> None:
         _, session_id = self._seed_old()
@@ -572,9 +762,27 @@ class ParserUpgradeRewriteTests(unittest.TestCase):
         ):
             stats = ingest_harness(self.repo, "codex")
 
-        self.assertEqual(stats.failed, 1)
+        self.assertEqual(stats.failed, 0)
+        self.assertEqual(stats.skipped, 1)
         self.assertIn("derived task cluster", stats.warnings[0])
-        self.assertEqual(self._snapshot(), before)
+        after = self._snapshot()
+        for table in (
+            "artifacts",
+            "messages",
+            "tool_events",
+            "skill_exposures",
+            "token_usage",
+            "exchange_windows",
+            "session_links",
+            "task_clusters",
+        ):
+            self.assertEqual(after[table], before[table])
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT source_sync_status FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()["source_sync_status"],
+            "frozen_parser_upgrade",
+        )
 
     def test_claim_evidence_references_block_rewrite_without_mutation(self) -> None:
         _, session_id = self._seed_old()
@@ -620,15 +828,124 @@ class ParserUpgradeRewriteTests(unittest.TestCase):
                 self.conn.commit()
                 before = self._snapshot()
 
-                with mock.patch(
-                    "agentlog.ingest.pipeline.adapter_for",
-                    return_value=StaticAdapter(self.path, local_only),
-                ):
-                    stats = ingest_harness(self.repo, "codex")
+                with self.assertRaisesRegex(TranscriptStorageError, "has claim evidence"):
+                    self.repo.rewrite_source_backed_parse_result(
+                        artifact_id=self.repo.get_artifact_by_path(str(self.path)).id,
+                        result=local_only,
+                        windows=_windows_from_source_result(session_id, local_only),
+                        previous_parser_version="old-parser",
+                        current_parser_version=PARSER_VERSION,
+                    )
 
-                self.assertEqual(stats.failed, 1)
-                self.assertIn("has claim evidence", stats.warnings[0])
                 self.assertEqual(self._snapshot(), before)
+
+    def test_owner_reset_unblocks_prepared_provenance_for_parser_upgrade(self) -> None:
+        _, session_id = self._seed_old()
+        self.conn.execute(
+            """
+            INSERT INTO owner_insight_batches(
+                id, content_hash, prompt_hash, prompt_version, redaction_version,
+                status, prepared_at, provenance_json
+            ) VALUES ('owner-batch', 'content', 'prompt', 'v2', 'v1',
+                      'prepared', '2026-08-12T00:00:00+00:00', '{}')
+            """
+        )
+        self.conn.execute(
+            """
+            INSERT INTO owner_insight_batch_messages(
+                batch_id, session_id, message_id, seq, content_hash, role,
+                source_snapshot_json, source_role
+            ) VALUES ('owner-batch', ?, ?, 1, 'hash', 'user', '{}', 'new')
+            """,
+            (session_id, f"{session_id}:m:1"),
+        )
+        self.conn.execute(
+            """
+            INSERT INTO owner_insight_seen_messages(
+                session_id, message_id, generation, content_hash, seq, role,
+                first_batch_id, status
+            ) VALUES (?, ?, 1, 'hash', 1, 'user', 'owner-batch', 'prepared')
+            """,
+            (session_id, f"{session_id}:m:1"),
+        )
+        self.conn.execute(
+            """
+            INSERT INTO owner_insight_session_state(session_id, checked_at)
+            VALUES (?, '2026-08-12T00:00:00+00:00')
+            """,
+            (session_id,),
+        )
+        self.conn.commit()
+        local_only = _result(
+            ("user", "worker-local request"),
+            ("assistant", "new worker answer"),
+            inherited_message_count=2,
+            marker="new",
+        )
+
+        with mock.patch(
+            "agentlog.ingest.pipeline.adapter_for",
+            return_value=StaticAdapter(self.path, local_only),
+        ):
+            stats = ingest_harness(self.repo, "codex")
+
+        self.assertEqual(stats.failed, 0)
+        self.assertEqual(stats.skipped, 1)
+        self.assertIn("owner insight provenance", stats.warnings[0])
+        artifact = self.repo.get_artifact_by_path(str(self.path))
+        assert artifact is not None
+        self.assertEqual(artifact.parser_version, "old-parser")
+        reset_owner_insight_session(self.conn, session_id)
+        self.conn.commit()
+
+        with mock.patch(
+            "agentlog.ingest.pipeline.adapter_for",
+            return_value=StaticAdapter(self.path, local_only),
+        ):
+            resumed = ingest_harness(self.repo, "codex")
+
+        self.assertEqual(resumed.failed, 0)
+        artifact = self.repo.get_artifact_by_path(str(self.path))
+        assert artifact is not None
+        self.assertEqual(artifact.parser_version, PARSER_VERSION)
+
+    def test_owner_reset_preserves_imported_provenance_guard(self) -> None:
+        artifact_id, session_id = self._seed_old()
+        self.conn.execute(
+            """
+            INSERT INTO owner_insight_batches(
+                id, content_hash, prompt_hash, prompt_version, redaction_version,
+                status, prepared_at, provenance_json
+            ) VALUES ('owner-imported', 'content', 'prompt', 'v2', 'v1',
+                      'imported', '2026-08-12T00:00:00+00:00', '{}')
+            """
+        )
+        self.conn.execute(
+            """
+            INSERT INTO owner_insight_batch_messages(
+                batch_id, session_id, message_id, seq, content_hash, role,
+                source_snapshot_json, source_role
+            ) VALUES ('owner-imported', ?, ?, 1, 'hash', 'user', '{}', 'new')
+            """,
+            (session_id, f"{session_id}:m:1"),
+        )
+        self.conn.commit()
+        reset_owner_insight_session(self.conn, session_id)
+        changed = _result(
+            ("user", "worker-local request"),
+            ("assistant", "new worker answer"),
+            inherited_message_count=2,
+            marker="new",
+        )
+
+        with self.assertRaisesRegex(TranscriptStorageError, "owner insight provenance"):
+            self.repo.rewrite_source_backed_parse_result(
+                artifact_id=artifact_id,
+                result=changed,
+                windows=_windows_from_source_result(session_id, changed),
+                previous_parser_version="old-parser",
+                current_parser_version=PARSER_VERSION,
+            )
 
     def test_checkpoint_blocked_parse_does_not_advance_or_mutate(self) -> None:
         self._seed_old()

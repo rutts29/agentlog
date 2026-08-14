@@ -26,6 +26,7 @@ from agentlog.api.app import create_app  # noqa: E402
 from agentlog.api.security import (  # noqa: E402
     BindPolicyViolation,
     SecurityConfig,
+    default_allowed_origins,
     generate_token,
     is_loopback_host,
     resolve_bind,
@@ -292,6 +293,13 @@ def _seed_window_with_canary(conn: sqlite3.Connection) -> None:
 
 
 class BindPolicyTests(unittest.TestCase):
+    def test_default_origins_cover_dashboard_and_vite_only(self):
+        origins = default_allowed_origins()
+        self.assertIn("http://127.0.0.1:3000", origins)
+        self.assertIn("http://127.0.0.1:5173", origins)
+        self.assertNotIn("http://127.0.0.1:8787", origins)
+        self.assertNotIn("http://127.0.0.1:8722", origins)
+
     def test_loopback_detection(self):
         for host in ("127.0.0.1", "localhost", "::1", "127.0.0.5", "[::1]"):
             with self.subTest(host=host):

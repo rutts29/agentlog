@@ -32,7 +32,7 @@ Streamlit is the right call for a throwaway internal report. This dashboard *is*
 
 ### Stack specification
 
-- **Backend:** FastAPI (already a Python project; reads `~/.agentlog/agentlog.db` directly). Serves JSON at `/api/*` and the built SPA as static files. Single process: `agentlog serve` → `http://localhost:8722`.
+- **Backend:** FastAPI (already a Python project; reads `~/.agentlog/agentlog.db` directly). Serves JSON at `/api/*` and the built SPA as static files. Single process: `agentlog serve` → `http://localhost:3000`.
 - **Frontend:** Vite + React + TypeScript.
 - **Components:** shadcn/ui (Radix primitives + Tailwind).
 - **Charts:** **Recharts** — the shadcn charts library is built on it, so chart theming inherits the design tokens for free. Rules: no animated entrances, no 3D, `strokeWidth 1.5`, muted fills at 70–80% opacity.

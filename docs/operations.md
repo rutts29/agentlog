@@ -17,7 +17,7 @@ This writes:
 | LaunchAgent | Role |
 |---|---|
 | `~/Library/LaunchAgents/com.agentlog.watch.plist` | `python -m agentlog.watch` |
-| `~/Library/LaunchAgents/com.agentlog.api.plist` | API on `http://127.0.0.1:8787` |
+| `~/Library/LaunchAgents/com.agentlog.api.plist` | API on `http://127.0.0.1:3000` |
 
 Both use the absolute `.venv` interpreter, `RunAtLoad`, `KeepAlive`,
 `ProcessType=Background`, and a mild `Nice` so ingest stays out of the way.
@@ -55,7 +55,7 @@ launchd also captures stdout/stderr next to those files (`*.stdout.log`,
 ## Health
 
 ```bash
-curl -s http://127.0.0.1:8787/api/health | python -m json.tool
+curl -s http://127.0.0.1:3000/api/health | python -m json.tool
 ```
 
 `degraded: true` with a `reason` means the watcher heartbeat (`presence.json`) is
@@ -67,7 +67,7 @@ while the watcher is down.
 1. `agentlog service status` — note PIDs and `reason`.
 2. Check `~/.agentlog/logs/watch.log` / `api.log` for traceback.
 3. `agentlog service stop` then `agentlog service start` (or `install` to rewrite plists).
-4. If port 8787 is wedged: `lsof -i :8787`, stop the API service, free the port, start again.
+4. If port 3000 is wedged: `lsof -i :3000`, stop the API service, free the port, start again.
 5. Watcher catch-up runs on every start, so a gap while the Mac slept or the
    daemon was dead is filled without waiting for a new file event.
 

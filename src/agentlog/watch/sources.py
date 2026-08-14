@@ -19,6 +19,7 @@ def default_sources() -> list[WatchSource]:
     sources: list[WatchSource] = [
         WatchSource("codex", config.CODEX_SESSIONS_DIR, poll=False),
         WatchSource("claude", config.CLAUDE_PROJECTS_DIR, poll=False),
+        WatchSource("grok", config.GROK_SESSIONS_DIR, poll=False),
         WatchSource("cursor", config.CURSOR_PROJECTS_DIR, poll=False),
         WatchSource("cursor", config.CURSOR_STATE_VSCDB, poll=True),
         WatchSource("warp", config.WARP_SQLITE, poll=True),
