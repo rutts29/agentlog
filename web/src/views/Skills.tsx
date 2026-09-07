@@ -10,7 +10,7 @@ import { rangeViewQueryOptions } from "@/lib/viewQueries";
 
 type Ctx = { range: string };
 
-/* Gated metric marker: outlined warn chip with a dashed border (§3.5). */
+/* Gated metric marker: outlined warn chip with a dashed border. */
 function GatedChip() {
   return (
     <span

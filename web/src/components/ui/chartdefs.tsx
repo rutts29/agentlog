@@ -1,5 +1,5 @@
 /**
- * Shared SVG gradient defs for Recharts (§3.4.1): soft vertical fills from
+ * Shared SVG gradient defs for Recharts: soft vertical fills from
  * series color → residual tint. Fill with `chartGradient(key)` and a solid
  * stroke for stack edges. Gradients are lighting, not decoration.
  */

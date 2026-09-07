@@ -183,7 +183,7 @@ class SemanticMetricTestBase(unittest.TestCase):
 
 class LabelFieldMappingTests(SemanticMetricTestBase):
     def test_redirect_turn_kinds_reach_the_numerator(self) -> None:
-        """C2: labels live in turn_kinds_json, not in the reliability flags."""
+        """Labels live in turn_kinds_json, not in the reliability flags."""
         for i in range(12):
             session = self.fx.session(f"codex:s{i}")
             self.fx.window(session, f"w{i}")

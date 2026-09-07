@@ -18,10 +18,10 @@ Paste into Cursor MCP config (adjust the absolute paths):
 {
   "mcpServers": {
     "agentlog": {
-      "command": "/Users/example/projects/example-agent/.venv/bin/python",
+      "command": "/absolute/path/to/agentlog/.venv/bin/python",
       "args": ["-m", "agentlog.mcp_server"],
       "env": {
-        "AGENTLOG_DB": "/Users/example/.agentlog/agentlog.db"
+        "AGENTLOG_DB": "/absolute/path/to/agentlog.db"
       }
     }
   }

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 PARSER_VERSION = "16"
@@ -85,7 +86,20 @@ WATCHER_PRESENCE_STALE_SECONDS = PRESENCE_HEARTBEAT_SECONDS * 3
 
 
 def ensure_db_parent(db_path: Path) -> None:
-    db_path.parent.mkdir(parents=True, exist_ok=True)
+    parent = Path(db_path).expanduser().absolute().parent
+    parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    # Only Agentlog's dedicated directory is ours to tighten. A custom DB may
+    # live in a shared directory, and a symlink may point at the user's home.
+    if (
+        os.name == "posix"
+        and parent == DEFAULT_DB_PATH.expanduser().absolute().parent
+        and not parent.is_symlink()
+    ):
+        fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fchmod(fd, 0o700)
+        finally:
+            os.close(fd)
 
 
 def presence_path_for_db(db_path: Path | None = None) -> Path:

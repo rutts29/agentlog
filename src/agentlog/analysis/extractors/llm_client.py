@@ -9,6 +9,13 @@ from typing import Any, Protocol
 from agentlog.safety.egress import assert_egress_allowed
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Keep the authorized request on its exact endpoint."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 class ChatClient(Protocol):
     def complete_json(self, *, system: str, user: str, model: str) -> dict[str, Any]:
         ...
@@ -29,10 +36,12 @@ class XAIChatClient:
         api_key: str | None = None,
         base_url: str = "https://api.x.ai/v1",
         timeout_s: float = 120.0,
+        opener: urllib.request.OpenerDirector | None = None,
     ) -> None:
         self.api_key = api_key or os.environ.get("XAI_API_KEY") or ""
         self.base_url = base_url.rstrip("/")
         self.timeout_s = timeout_s
+        self._opener = opener or urllib.request.build_opener(_NoRedirectHandler())
 
     @property
     def endpoint(self) -> str:
@@ -70,7 +79,7 @@ class XAIChatClient:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
+            with self._opener.open(req, timeout=self.timeout_s) as resp:
                 body = json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")

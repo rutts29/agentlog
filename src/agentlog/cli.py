@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import TYPE_CHECKING, Any, Mapping, Optional
 
 import typer
 from rich.console import Console
@@ -20,6 +20,9 @@ from agentlog.config import (
 from agentlog.db.repository import Repository
 from agentlog.db.schema import connect, init_db
 from agentlog.ingest.pipeline import ingest_all
+
+if TYPE_CHECKING:
+    from agentlog.analysis.extractors.llm_client import XAIChatClient
 
 app = typer.Typer(
     name="agentlog",
@@ -1497,8 +1500,9 @@ REMOTE_EGRESS_ACK_FLAG = "--egress-acknowledgement"
 
 def _enable_remote_egress_or_exit(
     *, allow: bool, acknowledgement: Optional[str], endpoint: str
-) -> None:
+) -> XAIChatClient:
     """Turn the process-wide egress gate on, or explain why we will not."""
+    from agentlog.analysis.extractors.llm_client import XAIChatClient
     from agentlog.safety.egress import (
         ACKNOWLEDGEMENT,
         EGRESS_DISCLOSURE,
@@ -1506,11 +1510,12 @@ def _enable_remote_egress_or_exit(
         enable_remote_extraction,
     )
 
+    client = XAIChatClient(base_url=endpoint)
     if not allow:
-        return
+        return client
     console.print(
         Panel.fit(
-            f"REMOTE EXTRACTION REQUESTED\n\n{EGRESS_DISCLOSURE}\n\nEndpoint: {endpoint}",
+            f"REMOTE EXTRACTION REQUESTED\n\n{EGRESS_DISCLOSURE}\n\nEndpoint: {client.endpoint}",
             border_style="red",
         )
     )
@@ -1525,11 +1530,12 @@ def _enable_remote_egress_or_exit(
         raise typer.Exit(code=2)
     try:
         enable_remote_extraction(
-            endpoint=endpoint, acknowledgement=acknowledgement or ""
+            endpoint=client.endpoint, acknowledgement=acknowledgement or ""
         )
     except EgressBlocked as exc:
         console.print(str(exc))
         raise typer.Exit(code=2) from exc
+    return client
 
 
 @extract_app.command("egress-preview")
@@ -1541,6 +1547,9 @@ def extract_egress_preview_cmd(
     limit: int = typer.Option(5, "--limit", help="Windows to preview (0 = all)"),
     model: str = typer.Option("grok-4.5", "--model"),
     batch_size: int = typer.Option(1, "--batch-size"),
+    endpoint: str = typer.Option(
+        "https://api.x.ai/v1", "--endpoint", help="Remote extraction base URL"
+    ),
 ) -> None:
     """Show exactly what remote extraction would transmit. Sends nothing."""
     import json
@@ -1556,7 +1565,7 @@ def extract_egress_preview_cmd(
     init_db(conn)
     conn.execute("PRAGMA busy_timeout = 30000")
     preview = build_egress_preview(
-        conn, limit=limit, model=model, batch_size=batch_size
+        conn, limit=limit, model=model, batch_size=batch_size, base_url=endpoint
     )
     console.print(
         Panel.fit(
@@ -1619,7 +1628,7 @@ def extract_audit_run_cmd(
 
     from agentlog.analysis.extractors.pipeline import run_audit_phase
 
-    _enable_remote_egress_or_exit(
+    client = _enable_remote_egress_or_exit(
         allow=allow_remote_egress,
         acknowledgement=egress_acknowledgement,
         endpoint=endpoint,
@@ -1631,6 +1640,7 @@ def extract_audit_run_cmd(
         conn,
         audit_pack=pack,
         gold_path=gold,
+        client=client,
         model=model,
         compare_batch_size=batch_size,
     )
@@ -1841,7 +1851,7 @@ def extract_ux_full_cmd(
     from agentlog.analysis.extractors.audit import AuditGateResult, LabelScore
     from agentlog.analysis.extractors.pipeline import run_full_ux_extract
 
-    _enable_remote_egress_or_exit(
+    client = _enable_remote_egress_or_exit(
         allow=allow_remote_egress,
         acknowledgement=egress_acknowledgement,
         endpoint=endpoint,
@@ -1875,6 +1885,7 @@ def extract_ux_full_cmd(
     try:
         run_id = run_full_ux_extract(
             conn,
+            client=client,
             model=model,
             batch_size=batch_size,
             owner_authorized=authorize,

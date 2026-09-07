@@ -1,4 +1,4 @@
-"""Privacy and trust-boundary regressions: LLM egress (H7) and the server (H3)."""
+"""Privacy and trust-boundary regressions: LLM egress and the server."""
 
 from __future__ import annotations
 

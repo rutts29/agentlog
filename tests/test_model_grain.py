@@ -1,6 +1,6 @@
 """Model grain contract: session counts and message counts never mix.
 
-Reproduces the H6 defect — a session recorded as model A whose second message
+Reproduces a model attribution defect — a session recorded as model A whose second message
 runs on model B — and asserts the aggregates stay internally consistent.
 """
 

@@ -9,7 +9,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import shutil
 import sqlite3
 import subprocess
 import tempfile
@@ -97,12 +96,11 @@ def backup_agentlog_db(
                 if destination_conn is not None:
                     destination_conn.close()
                 source_conn.close()
-            shutil.copymode(src, tmp_path)
         else:
             # Keep missing and zero-byte sources as explicit empty backups.
             tmp_path.write_bytes(b"")
-            if src.is_file():
-                shutil.copymode(src, tmp_path)
+        # Keep mkstemp's owner-only mode. Legacy source permissions may expose
+        # private data to other OS accounts and must not propagate to backups.
         os.replace(tmp_path, target)
     except Exception:
         tmp_path.unlink(missing_ok=True)

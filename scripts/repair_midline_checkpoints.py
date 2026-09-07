@@ -1,6 +1,6 @@
 """Rewind artifact checkpoints that sit inside an unterminated JSONL record.
 
-A checkpoint written in the middle of a line (the H2 defect) makes append
+A checkpoint written in the middle of a line makes append
 ingestion resume after a partial record, so the completed record can never be
 parsed. Rewinding to the start of that line lets normal incremental ingest
 recover it. Metadata only: no session, message or label rows are touched.

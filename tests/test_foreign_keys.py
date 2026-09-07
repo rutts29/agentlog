@@ -1,4 +1,4 @@
-"""C1: foreign-key enforcement must survive fresh init and upgrades."""
+"""Foreign-key enforcement must survive fresh init and upgrades."""
 
 from __future__ import annotations
 

@@ -48,6 +48,7 @@ from agentlog.api.security import (
 )
 from agentlog.api.search import DEFAULT_SOURCE_SCAN_LIMIT
 from agentlog.config import DEFAULT_DB_PATH
+from agentlog.db.schema import prepare_database_file
 from agentlog.normalize.model_identity import repair_null_model_identity
 from agentlog.source_reader import CachedSourceTranscriptReader
 
@@ -69,7 +70,7 @@ def _startup_repair_model_identity(db_path: Path) -> None:
     """Heal rows wiped by older writers that omitted model_canonical."""
     if not db_path.is_file():
         return
-    conn = sqlite3.connect(str(db_path), timeout=30)
+    conn = sqlite3.connect(prepare_database_file(db_path), timeout=30)
     conn.row_factory = sqlite3.Row
     try:
         conn.execute(f"PRAGMA busy_timeout = {WRITE_BUSY_TIMEOUT_MS}")

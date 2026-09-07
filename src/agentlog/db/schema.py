@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import os
 import sqlite3
+import stat
 from pathlib import Path
+
+from agentlog import config
 
 BUSY_TIMEOUT_MS = 30_000
 
@@ -157,8 +161,53 @@ END;
 """
 
 
-def connect(db_path: Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(str(db_path), timeout=BUSY_TIMEOUT_MS / 1000)
+def _restrict_storage_file(path: Path) -> None:
+    """Heal an existing regular file without following a sidecar symlink."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except (FileNotFoundError, PermissionError):
+        return
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError(f"database storage is not a regular file: {path}")
+        try:
+            os.fchmod(fd, 0o600)
+        except PermissionError:
+            # Preserve read-only access to stores owned by another account.
+            pass
+    finally:
+        os.close(fd)
+
+
+def prepare_database_file(db_path: Path | str) -> str:
+    """Secure writable SQLite storage before opening and return its filename."""
+    filename = str(db_path)
+    if os.name == "posix" and filename not in ("", ":memory:"):
+        if Path(db_path).absolute().parent == config.DEFAULT_DB_PATH.absolute().parent:
+            config.ensure_db_parent(Path(db_path))
+        # Resolve intentional DB symlinks, but never follow sidecar symlinks.
+        # SQLite derives new journal/WAL/SHM modes from the database file, so
+        # secure the DB before opening it rather than chmod after writes.
+        path = Path(db_path).resolve()
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            pass
+        else:
+            try:
+                os.fchmod(fd, 0o600)
+            finally:
+                os.close(fd)
+        _restrict_storage_file(path)
+        for suffix in ("-wal", "-shm", "-journal"):
+            _restrict_storage_file(Path(str(path) + suffix))
+        filename = str(path)
+    return filename
+
+
+def connect(db_path: Path | str) -> sqlite3.Connection:
+    filename = prepare_database_file(db_path)
+    conn = sqlite3.connect(filename, timeout=BUSY_TIMEOUT_MS / 1000)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")

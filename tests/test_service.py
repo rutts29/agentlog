@@ -316,7 +316,7 @@ class LoggingSetupTests(unittest.TestCase):
 
             root = logging.getLogger()
             handlers = [
-                h for h in root.handlers if h.__class__.__name__ == "RotatingFileHandler"
+                h for h in root.handlers if isinstance(h, logging.handlers.RotatingFileHandler)
             ]
             self.assertEqual(len(handlers), 1)
             self.assertEqual(handlers[0].maxBytes, LOG_MAX_BYTES)

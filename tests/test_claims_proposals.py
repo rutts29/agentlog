@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -454,6 +456,32 @@ class ClaimDerivationTests(unittest.TestCase):
 
 
 class ScopeAndDiffTests(unittest.TestCase):
+    def test_repository_inventory_uses_configured_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            root = home / "projects" / "configured"
+            root.mkdir(parents=True)
+            agents = root / "AGENTS.md"
+            agents.write_text("# Project rules\n", encoding="utf-8")
+            with patch.dict(os.environ, {"AGENTLOG_REPO_ROOTS": str(root)}):
+                inventory = discover_config_inventory(home)
+                existing = [f.path for f in inventory.files if f.scope_type == "repo" and f.exists]
+                self.assertEqual(existing, [agents])
+                explicit_empty = discover_config_inventory(home, extra_repo_roots=[])
+                self.assertFalse(any(f.scope_type == "repo" for f in explicit_empty.files))
+
+    def test_repository_inventory_uses_only_supplied_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            root = home / "projects" / "example"
+            root.mkdir(parents=True)
+            agents = root / "AGENTS.md"
+            agents.write_text("# Project rules\n", encoding="utf-8")
+            self.assertFalse(any(f.scope_type == "repo" for f in discover_config_inventory(home).files))
+            inventory = discover_config_inventory(home, extra_repo_roots=[root, root])
+            existing_repo_files = [f.path for f in inventory.files if f.scope_type == "repo" and f.exists]
+            self.assertEqual(existing_repo_files, [agents])
+
     def test_scope_dedupe_against_inventory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)

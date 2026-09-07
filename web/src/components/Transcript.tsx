@@ -125,7 +125,7 @@ function Turn({
       style={
         focused
           ? {
-              /* The active turn is this view's one glow center (R1). */
+              /* The active turn is this view's one glow center . */
               background: `color-mix(in srgb, ${spec.color} 7%, transparent)`,
               boxShadow: `inset 2px 0 0 ${spec.color}, 0 0 20px -6px color-mix(in srgb, ${spec.color} 35%, transparent)`,
             }

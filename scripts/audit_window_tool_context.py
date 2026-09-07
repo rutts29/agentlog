@@ -1,4 +1,4 @@
-"""Read-only audit: how many exchange windows had wrong tool context (H8).
+"""Read-only audit: how many exchange windows had wrong tool context.
 
 Compares the legacy tool selection (message-seq range applied to tool seq) with
 the linkage-based selection now used by the UX window-context loader, and

@@ -9,10 +9,26 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from agentlog.config import LOG_BACKUP_COUNT, LOG_MAX_BYTES
+from agentlog.safety.write_guard import assert_writable
+
+
+def _assert_log_targets(path: Path, backup_count: int) -> Path:
+    resolved = assert_writable(path, purpose="daemon log")
+    for index in range(1, backup_count + 1):
+        assert_writable(Path(f"{path}.{index}"), purpose="daemon log rotation")
+    return resolved
+
+
+class _GuardedRotatingFileHandler(RotatingFileHandler):
+    def doRollover(self) -> None:
+        # Backup links can change after logging is configured.
+        _assert_log_targets(Path(self.baseFilename), self.backupCount)
+        super().doRollover()
 
 
 def ensure_log_dir(path: Path) -> Path:
-    path = Path(path).expanduser()
+    path = assert_writable(path, purpose="daemon log")
+    path = _assert_log_targets(path, LOG_BACKUP_COUNT)
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -33,7 +49,7 @@ def configure_daemon_logging(
     dest: Path | None = None
     if log_file is not None:
         dest = ensure_log_dir(log_file)
-        handler: logging.Handler = RotatingFileHandler(
+        handler: logging.Handler = _GuardedRotatingFileHandler(
             dest,
             maxBytes=LOG_MAX_BYTES,
             backupCount=LOG_BACKUP_COUNT,

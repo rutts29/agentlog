@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -229,18 +230,10 @@ def discover_config_inventory(
                     scope_id=path.stem,
                 )
 
+    if extra_repo_roots is None:
+        configured = os.environ.get("AGENTLOG_REPO_ROOTS", "")
+        extra_repo_roots = [Path(p).expanduser() for p in configured.split(os.pathsep) if p.strip()]
     repo_roots: list[Path] = []
-    for rel in (
-        "example_app",
-        "projects/example-security",
-        "projects/example-agent",
-        "projects/example-telemetry",
-        "projects/example-research",
-        "projects/example-app",
-    ):
-        cand = base / rel
-        if cand.is_dir():
-            repo_roots.append(cand)
     if extra_repo_roots:
         for root in extra_repo_roots:
             if root.is_dir():

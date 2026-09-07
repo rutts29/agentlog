@@ -16,7 +16,7 @@ import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Iterator
-from urllib.parse import urlparse
+from urllib.parse import SplitResult, urlsplit
 
 ACKNOWLEDGEMENT = "i-understand-transcript-text-leaves-this-machine"
 
@@ -42,16 +42,47 @@ class EgressGrant:
 
     @property
     def host(self) -> str:
-        return _host_of(self.endpoint)
+        return _endpoint_identity(self.endpoint).hostname
+
+
+@dataclass(frozen=True)
+class _EndpointIdentity:
+    scheme: str
+    hostname: str
+    port: int
+    path: str
+    query: str
 
 
 _lock = threading.Lock()
 _grant: EgressGrant | None = None
 
 
-def _host_of(url: str) -> str:
-    parsed = urlparse(url if "://" in url else f"//{url}")
-    return (parsed.hostname or "").lower()
+def _endpoint_identity(url: str) -> _EndpointIdentity:
+    """Return the network-relevant identity of one absolute HTTP endpoint."""
+    try:
+        parsed: SplitResult = urlsplit(url)
+    except ValueError as exc:
+        raise EgressBlocked("remote extraction endpoint is not a valid URL") from exc
+    scheme = parsed.scheme.lower()
+    hostname = (parsed.hostname or "").lower()
+    if scheme not in {"http", "https"} or not hostname:
+        raise EgressBlocked("remote extraction requires an absolute HTTP(S) endpoint")
+    if parsed.username is not None or parsed.password is not None:
+        raise EgressBlocked("remote extraction endpoint must not contain credentials")
+    if parsed.fragment:
+        raise EgressBlocked("remote extraction endpoint must not contain a URL fragment")
+    try:
+        port = parsed.port or (443 if scheme == "https" else 80)
+    except ValueError as exc:
+        raise EgressBlocked("remote extraction endpoint has an invalid port") from exc
+    return _EndpointIdentity(
+        scheme=scheme,
+        hostname=hostname,
+        port=port,
+        path=parsed.path or "/",
+        query=parsed.query,
+    )
 
 
 def remote_extraction_grant() -> EgressGrant | None:
@@ -80,9 +111,7 @@ def enable_remote_extraction(
             "remote extraction requires the exact acknowledgement string "
             f"{ACKNOWLEDGEMENT!r}. {EGRESS_DISCLOSURE}"
         )
-    host = _host_of(endpoint)
-    if not host:
-        raise EgressBlocked(f"cannot grant egress to an endpoint without a host: {endpoint!r}")
+    _endpoint_identity(endpoint)
     grant = EgressGrant(endpoint=endpoint, purpose=purpose)
     global _grant
     with _lock:
@@ -125,9 +154,9 @@ def assert_egress_allowed(url: str, *, purpose: str = "network send") -> EgressG
             "explicit opt-in (agentlog extract egress-preview shows exactly what "
             f"would be sent). {EGRESS_DISCLOSURE}"
         )
-    if grant.host != _host_of(url):
+    if _endpoint_identity(grant.endpoint) != _endpoint_identity(url):
         raise EgressBlocked(
-            f"remote extraction was authorized for host {grant.host!r}, "
-            f"not {_host_of(url)!r}"
+            "remote extraction was authorized for a different endpoint; "
+            "scheme, host, port, path, and query must match"
         )
     return grant

@@ -1,7 +1,7 @@
 """Read-only audit: do stored messages match a full re-parse of each artifact?
 
-Detects silent loss from checkpointing past a partially written JSONL tail (H2)
-and from equal-length duplicate replacement (M3). Never writes to the database.
+Detects silent loss from checkpointing past a partially written JSONL tail
+and from equal-length duplicate replacement. Never writes to the database.
 """
 
 from __future__ import annotations

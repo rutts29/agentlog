@@ -12,7 +12,7 @@ const DRAIN_MS = 2_000;
 const BURST_CAP = 25;
 
 /**
- * Subscribe to the ingest SSE stream with the §2.5 animation budget:
+ * Subscribe to the ingest SSE stream with the animation budget:
  * events queue and drain at most once per 2s; bursts over 25 drop the
  * animation flag; a hidden tab drains without animation on return.
  * Also forwards `presence` frames when a handler is supplied.

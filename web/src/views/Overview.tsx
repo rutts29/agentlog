@@ -117,7 +117,7 @@ function heatColor(t: number): string {
   return t < 0.5 ? mix(dark, mid, t * 2) : mix(mid, light, (t - 0.5) * 2);
 }
 
-/* Column headers in the ref-1 "instrument label" register. */
+/* Column headers in the "instrument label" register. */
 function ColumnLabel({ children }: { children: React.ReactNode }) {
   return (
     <div className="microlabel border-b border-border-faint pb-1.5 font-mono text-[10px] text-faint-foreground">
@@ -434,7 +434,7 @@ export function Overview() {
 
   return (
     <div className="space-y-3">
-      {/* Observatory: telemetry L · graph stage · telemetry R (§5). */}
+      {/* Observatory: telemetry L · graph stage · telemetry R. */}
       <div className="grid grid-cols-1 gap-3 min-[900px]:grid-cols-[260px_minmax(0,1fr)] min-[1200px]:grid-cols-[260px_minmax(520px,1fr)_300px]">
         {/* ── LEFT TELEMETRY ── */}
         <aside className="min-w-0 space-y-3">

@@ -16,9 +16,10 @@ Three distinct threats, three distinct controls:
   recognise.
 * Cross-site request forgery. A page can issue a simple cross-origin POST
   without preflight; CORS blocks reading the response but not the write.
-  Browser-originated mutations must carry an allowed ``Origin``. The SPA's
-  HttpOnly, SameSite browser session is therefore not enough for a cross-site
-  write.
+  Browser-originated mutations must carry an allowed ``Origin``. Cookie-only
+  mutations also require the request's exact origin, since cookies are shared
+  across ports. The Vite proxy uses an explicit API token for its allowed
+  cross-origin requests.
 
 Browser detection is deliberate. curl and other non-browser clients are not
 rebinding or CSRF vectors, but when a token is configured (the default for
@@ -252,6 +253,7 @@ class LocalTrustBoundaryMiddleware(BaseHTTPMiddleware):
         path = request.url.path
 
         browser = _looks_like_browser(request)
+        cookie_authenticated = False
 
         # The SPA shell (and /assets) must load unauthenticated so it can set a
         # browser-only session cookie. Non-browser API clients still need the
@@ -275,6 +277,7 @@ class LocalTrustBoundaryMiddleware(BaseHTTPMiddleware):
                     401,
                     "missing or invalid API credential; send Authorization: Bearer <token>",
                 )
+            cookie_authenticated = session_ok and not bearer_ok
 
         if browser:
             host = _hostname_of(request.headers.get("host"))
@@ -293,6 +296,14 @@ class LocalTrustBoundaryMiddleware(BaseHTTPMiddleware):
                 return _deny(
                     403,
                     "browser-initiated writes must send an Origin header",
+                )
+            request_origin = f"{request.url.scheme}://{request.url.netloc}"
+            if cookie_authenticated and _origin_host_port(origin) != _origin_host_port(
+                request_origin
+            ):
+                return _deny(
+                    403,
+                    "browser session writes must come from the same origin",
                 )
 
         return await call_next(request)

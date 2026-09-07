@@ -197,7 +197,7 @@ def _instruction_proposals(
             )
 
         # Dedupe only against the chosen target (plus global AGENTS), not every
-        # project file — otherwise example_app wording suppresses global proposals.
+        # project file, so project-specific wording cannot suppress global proposals.
         from agentlog.analysis.claims.scope import ConfigInventory
 
         scoped_files = [

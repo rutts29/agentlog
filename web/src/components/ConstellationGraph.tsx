@@ -75,7 +75,7 @@ const SPAWN_MS = 350;
 const RING_MS = 600;
 const EDGE_DRAW_MS = 250;
 const PULSE_MS = 1200;
-/** §2.5 settle on genuine arrivals: hold a low alpha floor, then decay. */
+/** On new arrivals, hold a low alpha floor, then decay. */
 const SETTLE_ALPHA = 0.12;
 const SETTLE_MS = 800;
 /** Sessions older than this fade toward the floor opacity. */
@@ -220,7 +220,7 @@ export function ConstellationGraph({
   const selectedRef = useRef<GNode | null>(null);
   selectedRef.current = selected;
 
-  /* Highlight dim level, eased toward target per frame (§2.3, 120ms). */
+  /* Highlight dim level, eased toward target per frame. */
   const dimRef = useRef({ value: 0, last: 0 });
   const egoRef = useRef<Set<string>>(new Set());
 
@@ -514,7 +514,7 @@ export function ConstellationGraph({
     [data],
   );
 
-  /* Diff refetches into spawn/pulse animations (§2.5). */
+  /* Diff refetches into spawn/pulse animations. */
   useEffect(() => {
     /* Swapping to a range React Query already has cached replaces the whole
        node set without anything being ingested. Diffing across that boundary
@@ -563,7 +563,7 @@ export function ConstellationGraph({
       toastTimer.current = window.setTimeout(() => setToast(null), 4000);
     }
     /* A graphData change already restarts the engine, so the settle only needs
-       a floor under alpha, not a reset to 1.0 (§2.5). */
+       a floor under alpha, not a reset to 1.0. */
     if (added.length > 0 && !reduced) {
       setSettleAlpha(SETTLE_ALPHA);
       if (settleTimer.current) window.clearTimeout(settleTimer.current);
@@ -938,7 +938,7 @@ export function ConstellationGraph({
         ctx.fill();
       }
 
-      /* One expanding spawn / presence ring (§2.5.1) — one-shot only. */
+      /* One expanding spawn / presence ring — one-shot only. */
       const ring = ringRef.current.get(node.id);
       if (ring) {
         const p = (now - ring.t0) / RING_MS;

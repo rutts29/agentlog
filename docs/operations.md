@@ -55,8 +55,11 @@ launchd also captures stdout/stderr next to those files (`*.stdout.log`,
 ## Health
 
 ```bash
-curl -s http://127.0.0.1:3000/api/health | python -m json.tool
+curl -s -H "Authorization: Bearer <your-local-token>" \
+  http://127.0.0.1:3000/api/health | python -m json.tool
 ```
+
+Replace the placeholder with the local API token from `~/.agentlog/api_token`.
 
 `degraded: true` with a `reason` means the watcher heartbeat (`presence.json`) is
 stale or missing, or the DB is unreachable. The API process can still answer

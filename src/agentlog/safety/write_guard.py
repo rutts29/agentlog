@@ -13,7 +13,6 @@ proposal target can never be written by accident.
 
 from __future__ import annotations
 
-import os
 import tempfile
 from pathlib import Path
 
@@ -85,20 +84,8 @@ def allowed_roots() -> tuple[Path, ...]:
 
 def _resolve(path: Path | str) -> Path:
     """Absolute, symlink-resolved path that tolerates missing components."""
-    p = Path(path).expanduser()
-    p = Path(os.path.abspath(p))
-    tail: list[str] = []
-    probe = p
-    while not probe.exists():
-        parent = probe.parent
-        if parent == probe:
-            break
-        tail.append(probe.name)
-        probe = parent
-    base = probe.resolve() if probe.exists() else probe
-    for name in reversed(tail):
-        base = base / name
-    return base
+    # Non-strict resolution follows dangling symlinks as well as existing ones.
+    return Path(path).expanduser().resolve()
 
 
 def is_harness_config(path: Path | str) -> bool:

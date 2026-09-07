@@ -8,6 +8,8 @@ from typing import TypeVar
 
 from fastapi import Request
 
+from agentlog.db.schema import prepare_database_file
+
 T = TypeVar("T")
 
 # Per-connection wait for locks. Background ingest/watch can hold write locks
@@ -91,7 +93,7 @@ def get_write_conn(request: Request) -> Generator[sqlite3.Connection, None, None
     """Open a read-write SQLite connection for mutating endpoints."""
     db_path = get_db_path(request)
     conn = sqlite3.connect(
-        str(db_path),
+        prepare_database_file(db_path),
         check_same_thread=False,
         timeout=WRITE_BUSY_TIMEOUT_MS / 1000,
     )
