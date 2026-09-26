@@ -3,16 +3,20 @@ import { Link, useOutletContext, useSearchParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { DiagnosticLoader } from "@/components/DiagnosticLoader";
 import { CommandFloor } from "@/components/command-grid/CommandFloor";
-import { fetchOrchestration, fetchRecent, fetchSessionDetail, type PresenceEvent } from "@/lib/api";
+import { ExecutionTimeline } from "@/components/command-grid/ExecutionTimeline";
+import { MissionArena } from "@/components/command-grid/MissionArena";
+import { fetchMissionReplay, fetchOrchestration, fetchRecent, type PresenceEvent } from "@/lib/api";
 import { projectCommandFloor, type CommandFloorActor } from "@/lib/commandFloor";
 import {
-  buildCommandReplay,
-  projectReplayFrame,
-  type ReplayFrame,
-} from "@/lib/commandReplay";
+  buildMissionReplay,
+  findMissionFrame,
+  latestMissionFrameForActor,
+  projectMissionReplayFrame,
+  type MissionFrame,
+} from "@/lib/missionReplay";
 import { useIngestStream } from "@/lib/useIngestStream";
 import { useLivePresence } from "@/lib/useLivePresence";
-import { formatDayTime } from "@/lib/utils";
+import { formatDayTime, formatDuration } from "@/lib/utils";
 
 type Ctx = { range: string };
 type FloorMode = "live" | "replay";
@@ -30,7 +34,7 @@ function actorStateLabel(actor: CommandFloorActor): string {
   }
 }
 
-function replayOutcomeLabel(frame: ReplayFrame): string {
+function replayOutcomeLabel(frame: MissionFrame): string {
   if (frame.outcome === "success") return "verified success";
   if (frame.outcome === "failure") return "observed failure";
   return "outcome unavailable";
@@ -71,7 +75,7 @@ export function CommandFloorView() {
       seen.add(session.id);
       candidates.push({
         id: session.id,
-        label: `${session.project} · coordinator · ${formatDayTime(session.started_at)}`,
+        label: `${session.project} · ${session.child_count} direct · ${formatDayTime(session.started_at)}`,
       });
     }
     for (const session of recent.data?.items ?? []) {
@@ -89,44 +93,52 @@ export function CommandFloorView() {
     params.get("session") ||
     replayCandidates[0]?.id ||
     null;
-  const detail = useQuery({
-    queryKey: ["command-floor-replay-detail", replaySessionId],
+  const mission = useQuery({
+    queryKey: ["command-floor-mission-replay", replaySessionId],
     queryFn: ({ signal }) => {
       if (!replaySessionId) throw new Error("Replay requires a session id");
-      return fetchSessionDetail(replaySessionId, signal);
+      return fetchMissionReplay(replaySessionId, signal);
     },
     enabled: mode === "replay" && Boolean(replaySessionId),
     staleTime: 60_000,
   });
   const replay = useMemo(
-    () => detail.data ? buildCommandReplay(detail.data) : null,
-    [detail.data],
+    () => mission.data ? buildMissionReplay(mission.data) : null,
+    [mission.data],
   );
-  const defaultFrame = replay
-    ? Math.max(
-        0,
-        replay.frames.findIndex((candidate) => candidate.kind === "human") >= 0
-          ? replay.frames.findIndex((candidate) => candidate.kind === "human")
-          : replay.frames.findIndex((candidate) => ["agent", "tool"].includes(candidate.kind)),
-      )
-    : 0;
+  const linkedFrame = replay
+    ? findMissionFrame(replay, params.get("msg"), params.get("actor"))
+    : null;
+  const defaultFrame = linkedFrame ?? replay?.recommendedFrameIndex ?? 0;
   const requestedFrame = Number(params.get("frame") ?? String(defaultFrame));
   const frameIndex = replay
     ? Math.max(0, Math.min(Number.isFinite(requestedFrame) ? requestedFrame : 0, replay.frames.length - 1))
     : 0;
   const frame = replay?.frames[frameIndex] ?? null;
   const replayProjection = useMemo(
-    () => detail.data && frame ? projectReplayFrame(detail.data, frame) : null,
-    [detail.data, frame],
+    () => replay && frame ? projectMissionReplayFrame(replay, frame.index) : null,
+    [frame, replay],
   );
   const projection = mode === "replay" && replayProjection ? replayProjection : liveProjection;
   const activeActorId =
     selectedActorId && projection.byId.has(selectedActorId)
       ? selectedActorId
       : mode === "replay"
-        ? projection.actors[0]?.id ?? null
+        ? frame && projection.byId.has(frame.actorId)
+          ? frame.actorId
+          : projection.actors[0]?.id ?? null
         : null;
   const selected = activeActorId ? projection.byId.get(activeActorId) ?? null : null;
+  const selectedFrame = replay && activeActorId
+    ? latestMissionFrameForActor(replay, activeActorId, frameIndex)
+    : null;
+  const selectedMeta = replay && activeActorId ? replay.actorById.get(activeActorId) ?? null : null;
+  const recentSelectedTools = replay && activeActorId
+    ? replay.frames
+        .filter((candidate) => candidate.actorId === activeActorId && candidate.kind === "tool" && candidate.index <= frameIndex)
+        .slice(-4)
+        .reverse()
+    : [];
 
   useEffect(() => {
     if (mode !== "replay" || !playing || !replay) return;
@@ -136,9 +148,12 @@ export function CommandFloorView() {
     }
     const timer = window.setTimeout(() => {
       const next = new URLSearchParams(params);
-      next.set("frame", String(frameIndex + 1));
+      const step = Math.max(1, Math.floor(replay.frames.length / 1_000));
+      next.set("frame", String(Math.min(replay.frames.length - 1, frameIndex + step)));
+      next.delete("msg");
+      next.delete("actor");
       setParams(next, { replace: true });
-    }, 900);
+    }, 240);
     return () => window.clearTimeout(timer);
   }, [frameIndex, mode, params, playing, replay, setParams]);
 
@@ -148,9 +163,9 @@ export function CommandFloorView() {
 
   const traceSearch = (() => {
     const next = new URLSearchParams({ range });
-    if (mode === "replay" && frame?.messageId) {
-      next.set("msg", frame.messageId);
-      next.set("replayFrame", String(frame.index));
+    if (mode === "replay" && selectedFrame?.messageId) {
+      next.set("msg", selectedFrame.messageId);
+      next.set("replayFrame", String(frameIndex));
     }
     return next.toString();
   })();
@@ -160,6 +175,8 @@ export function CommandFloorView() {
     next.set("range", range);
     next.delete("crew");
     next.delete("frame");
+    next.delete("msg");
+    next.delete("actor");
     if (nextMode === "live") {
       next.delete("mode");
       next.delete("session");
@@ -177,6 +194,8 @@ export function CommandFloorView() {
     next.set("session", sessionId);
     next.delete("frame");
     next.delete("crew");
+    next.delete("msg");
+    next.delete("actor");
     setSelectedActorId(null);
     setParams(next, { replace: true });
   };
@@ -185,6 +204,8 @@ export function CommandFloorView() {
     if (!replay) return;
     const next = new URLSearchParams(params);
     next.set("frame", String(Math.max(0, Math.min(index, replay.frames.length - 1))));
+    next.delete("msg");
+    next.delete("actor");
     setParams(next, { replace: true });
   };
 
@@ -196,27 +217,31 @@ export function CommandFloorView() {
     setParams(next, { replace: true });
   };
 
-  const replayPending = mode === "replay" && (!replaySessionId || detail.isLoading || !replayProjection);
+  const replayPending = mode === "replay" && (!replaySessionId || mission.isLoading || !replayProjection);
 
   return (
     <div className="command-floor-view">
       <header className="command-page-head">
         <div>
           <div className="command-page-head__eyebrow">
-            {mode === "live" ? "live local projection" : "source-backed historical projection"}
+            {mode === "live" ? "live local projection" : "indexed multi-session mission replay"}
           </div>
           <h1>Command floor</h1>
           <p>
             {mode === "live"
               ? "Real sessions and spawned workers, mapped to crew and familiars."
-              : "Replay observed human, agent, and tool events without inventing activity."}
+              : "Replay the full recorded crew, tool traffic, lineage, and execution timing."}
           </p>
         </div>
         <div className="command-page-head__metrics">
           <span><strong>{projection.operatorCount}</strong> operators</span>
-          <span><strong>{projection.familiarCount}</strong> familiars</span>
+          <span><strong>{projection.familiarCount}</strong> active familiars</span>
           <span><strong>{projection.workingCount}</strong> working</span>
-          <span className={projection.waitingCount > 0 ? "is-warn" : ""}><strong>{projection.waitingCount}</strong> human gates</span>
+          {mode === "replay" && replay ? (
+            <span><strong>{replay.actors.length - 1}</strong> mission workers</span>
+          ) : (
+            <span className={projection.waitingCount > 0 ? "is-warn" : ""}><strong>{projection.waitingCount}</strong> human gates</span>
+          )}
         </div>
       </header>
 
@@ -241,6 +266,7 @@ export function CommandFloorView() {
               <button type="button" onClick={() => setReplayFrame(frameIndex - 1)} disabled={frameIndex <= 0}>←</button>
               <button type="button" onClick={() => setPlaying((current) => !current)} disabled={!replay || frameIndex >= replay.frames.length - 1}>{playing ? "Pause" : "Play"}</button>
               <button type="button" onClick={() => setReplayFrame(frameIndex + 1)} disabled={!replay || frameIndex >= replay.frames.length - 1}>→</button>
+              <button type="button" onClick={() => replay && setReplayFrame(replay.recommendedFrameIndex)} disabled={!replay}>Burst</button>
             </div>
             <label className="floor-replay-scrubber">
               <span>{replay ? `${frameIndex + 1}/${replay.frames.length}` : "0/0"}</span>
@@ -256,20 +282,41 @@ export function CommandFloorView() {
         <div className={`replay-frame replay-frame--${frame.outcome}`} aria-live="polite">
           <span className="replay-frame__index">F-{String(frame.index + 1).padStart(3, "0")}</span>
           <span><strong>{frame.title}</strong><small>{frame.detail}</small></span>
-          <span>{frame.kind}</span>
+          <span>{projection.byId.get(frame.actorId)?.callsign ?? frame.kind}</span>
           <span>{replayOutcomeLabel(frame)}</span>
         </div>
       ) : null}
 
-      {replayPending ? (
-        <DiagnosticLoader label="Building source-backed replay" rows={6} />
+      {mode === "replay" && mission.isError ? (
+        <div className="ops-empty">Mission replay could not be read from the local ledger.</div>
+      ) : replayPending ? (
+        <DiagnosticLoader label="Indexing mission replay" rows={6} />
       ) : (
-        <div className="command-floor-layout">
-          <CommandFloor
-            projection={projection}
-            selectedActorId={activeActorId}
-            onSelectActor={selectActor}
-          />
+        <>
+          {mode === "replay" && replay ? (
+            <ExecutionTimeline
+              replay={replay}
+              projection={projection}
+              frameIndex={frameIndex}
+              selectedActorId={activeActorId}
+              onSelectFrame={setReplayFrame}
+            />
+          ) : null}
+          <div className="command-floor-layout">
+            {mode === "replay" && replay ? (
+              <MissionArena
+                projection={projection}
+                replay={replay}
+                selectedActorId={activeActorId}
+                onSelectActor={selectActor}
+              />
+            ) : (
+              <CommandFloor
+                projection={projection}
+                selectedActorId={activeActorId}
+                onSelectActor={selectActor}
+              />
+            )}
           <aside className="crew-inspector" aria-live="polite">
             <div className="crew-inspector__head">
               <span>{mode === "live" ? "crew inspector" : "replay inspector"}</span>
@@ -292,7 +339,32 @@ export function CommandFloorView() {
                   <div><dt>Project</dt><dd>{selected.project}</dd></div>
                   <div><dt>Evidence</dt><dd>{selected.specialtyEvidence} specialty · {selected.sourceSnapshotStatus} source</dd></div>
                   <div><dt>Lineage</dt><dd>{selected.lineage.kind === "root" ? "root operator" : selected.lineage.kind === "attached" ? `attached to ${projection.byId.get(selected.lineage.parentId)?.callsign ?? selected.lineage.parentId}` : "parent unavailable"}</dd></div>
+                  {selectedMeta ? <div><dt>Trace</dt><dd>{selectedMeta.message_count} messages · {selectedMeta.tool_count} tools · L{selectedMeta.depth}</dd></div> : null}
                 </dl>
+                {selectedFrame?.kind === "tool" ? (
+                  <section className={`inspector-tool inspector-tool--${selectedFrame.outcome}`}>
+                    <header><span>Tool packet</span><strong>{selectedFrame.tool}</strong></header>
+                    <p>{selectedFrame.context || selectedFrame.action || "Action unavailable"}</p>
+                    <dl>
+                      <div><dt>Action</dt><dd>{selectedFrame.action || "unknown"}</dd></div>
+                      <div><dt>Outcome</dt><dd>{replayOutcomeLabel(selectedFrame)}</dd></div>
+                      <div><dt>Duration</dt><dd>{selectedFrame.durationMs == null ? "unavailable" : formatDuration(selectedFrame.durationMs / 1000)}</dd></div>
+                      <div><dt>Operation</dt><dd>{selectedFrame.operationKind || "unknown"}</dd></div>
+                      <div><dt>Timing</dt><dd>{selectedFrame.timeEvidence}</dd></div>
+                    </dl>
+                  </section>
+                ) : null}
+                {mode === "replay" && recentSelectedTools.length > 0 ? (
+                  <section className="inspector-tool-history">
+                    <header>Recent tool packets</header>
+                    {recentSelectedTools.map((toolFrame) => (
+                      <button type="button" key={toolFrame.id} onClick={() => setReplayFrame(toolFrame.index)}>
+                        <span>{toolFrame.tool}</span>
+                        <small>{toolFrame.outcome} · {toolFrame.durationMs == null ? "?" : formatDuration(toolFrame.durationMs / 1000)}</small>
+                      </button>
+                    ))}
+                  </section>
+                ) : null}
                 {selected.sessionId ? (
                   <Link className="command-link" to={`/sessions/${encodeURIComponent(selected.sessionId)}?${traceSearch}`}>
                     Open holotrace →
@@ -308,7 +380,13 @@ export function CommandFloorView() {
               <div className="crew-inspector__warning">{projection.unattachedFamiliarCount} familiar lineage {projection.unattachedFamiliarCount === 1 ? "link is" : "links are"} unavailable.</div>
             ) : null}
           </aside>
-        </div>
+          </div>
+          {mode === "replay" && replay && (replay.bounds.nodes_truncated || replay.bounds.events_truncated) ? (
+            <div className="crew-inspector__warning">
+              Replay is bounded to {replay.bounds.returned_node_count}/{replay.bounds.total_node_count} agents and {replay.bounds.returned_event_count}/{replay.bounds.total_event_count} events.
+            </div>
+          ) : null}
+        </>
       )}
     </div>
   );

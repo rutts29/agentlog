@@ -10,6 +10,7 @@ from threading import Event
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -145,6 +146,7 @@ def create_app(
         allow_methods=["GET", "POST"],
         allow_headers=["*"],
     )
+    app.add_middleware(GZipMiddleware, minimum_size=1_024)
 
     @app.get("/api/health")
     def health(derived: bool = Query(True)) -> dict:
@@ -400,6 +402,17 @@ def create_app(
             raise HTTPException(status_code=404, detail="session not found")
         return tree
 
+    @app.get("/api/sessions/{session_id}/replay")
+    def session_replay(
+        session_id: str,
+        limit: int = Query(50_000, ge=1, le=50_000),
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> dict:
+        replay = descriptive.mission_replay(conn, session_id, limit=limit)
+        if replay is None:
+            raise HTTPException(status_code=404, detail="session not found")
+        return replay
+
     @app.get("/api/sessions/{session_id}")
     def session(
         session_id: str,
@@ -514,6 +527,17 @@ def create_app(
         if tree is None:
             raise HTTPException(status_code=404, detail="session not found")
         return tree
+
+    @app.get("/api/sessions/{session_id:path}/replay")
+    def session_replay_path(
+        session_id: str,
+        limit: int = Query(50_000, ge=1, le=50_000),
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> dict:
+        replay = descriptive.mission_replay(conn, session_id, limit=limit)
+        if replay is None:
+            raise HTTPException(status_code=404, detail="session not found")
+        return replay
 
     @app.get("/api/sessions/{session_id:path}")
     def session_path(

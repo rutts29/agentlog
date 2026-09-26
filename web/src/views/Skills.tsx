@@ -123,9 +123,9 @@ export function Skills() {
               </tr>
             </thead>
             <tbody>
-              {items.map((s) => (
+              {items.map((s, index) => (
                 <tr
-                  key={s.skill}
+                  key={s.id ?? `${s.skill}-${index}`}
                   className="border-b border-border-faint last:border-0 hover:bg-muted/40"
                 >
                   <td className="px-4 py-1.5 font-mono text-[12px] text-muted-foreground">

@@ -103,7 +103,7 @@ type Specialty = {
 
 const READ_PATTERN = /\b(read|search|grep|glob|find|browse|inspect|scan|query)\b/i;
 const BUILD_PATTERN = /\b(write|edit|patch|create|generate|build|implement|refactor)\b/i;
-const TEST_PATTERN = /\b(test|pytest|jest|vitest|lint|typecheck|check|diagnos|reproduc)\b/i;
+const TEST_PATTERN = /\b(tests?|pytest|jest|vitest|lint|typecheck|check|diagnos|reproduc)\b/i;
 const REVIEW_PATTERN = /\b(review|evidence|adjudicat|approve|proposal|audit|assess)\b/i;
 const SYSTEMS_PATTERN = /\b(deploy|server|monitor|docker|container|infra|database|migrat|recover)\b/i;
 

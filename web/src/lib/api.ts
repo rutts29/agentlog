@@ -682,6 +682,112 @@ export type TreeNode = SessionIdentityFields & {
   children: TreeNode[];
 };
 
+export type MissionReplayActor = SessionIdentityFields & {
+  id: string;
+  navigation_id?: string;
+  parent_navigation_id?: string | null;
+  root_navigation_id?: string;
+  harness: string;
+  model: string | null;
+  effort: string | null;
+  project: string;
+  started_at: string | null;
+  ended_at: string | null;
+  parent_session_id: string | null;
+  thread_source?: string | null;
+  message_count: number;
+  tool_count: number;
+  child_count: number;
+  descendant_count: number;
+  relationship?: string | null;
+  depth: number;
+};
+
+export type MissionReplayLifecycleEvent = {
+  kind: "lifecycle";
+  phase: "spawn" | "complete";
+  id: string;
+  actor_id: string;
+  timestamp: string | null;
+  seq: number;
+};
+
+export type MissionReplayMessageEvent = {
+  kind: "message";
+  id: string;
+  actor_id: string;
+  timestamp: string | null;
+  seq: number;
+  role: string;
+  model: string | null;
+  effort: string | null;
+  text: string;
+  text_truncated: boolean;
+  is_tool_plumbing: boolean;
+  authored_by_agent: boolean;
+  source_message_id: string;
+};
+
+export type MissionReplayToolEvent = {
+  kind: "tool";
+  id: string;
+  actor_id: string;
+  timestamp: string | null;
+  time_evidence: "message" | "session";
+  seq: number;
+  tool_name: string;
+  action: string;
+  action_truncated: boolean;
+  context: string;
+  context_truncated: boolean;
+  success: number | null;
+  duration_ms: number | null;
+  operation_kind: string;
+  source_message_id: string | null;
+};
+
+export type MissionReplayEvent =
+  | MissionReplayLifecycleEvent
+  | MissionReplayMessageEvent
+  | MissionReplayToolEvent;
+
+export type MissionReplayPayload = {
+  root_id: string;
+  requested_id: string;
+  actors: MissionReplayActor[];
+  edges: Array<{
+    source: string;
+    target: string;
+    relationship: string;
+  }>;
+  events: MissionReplayEvent[];
+  counts: {
+    actors: number;
+    messages: number;
+    tools: number;
+    events: number;
+  };
+  bounds: {
+    max_nodes: number;
+    returned_node_count: number;
+    total_node_count: number;
+    nodes_truncated: boolean;
+    max_events: number;
+    returned_event_count: number;
+    total_event_count: number;
+    events_truncated: boolean;
+  };
+  note: string;
+};
+
+export function fetchMissionReplay(sessionId: string, signal?: AbortSignal) {
+  return getJson<MissionReplayPayload>(
+    `/api/sessions/${encodeURIComponent(sessionId)}/replay`,
+    undefined,
+    signal,
+  );
+}
+
 export function fetchAutoReview(range: string, signal?: AbortSignal) {
   return getJson<{
     total: number;
@@ -714,6 +820,7 @@ export function fetchSkills(range: string, signal?: AbortSignal) {
     activations: number;
     distinct_fired: number;
     items: Array<{
+      id?: string | null;
       skill: string;
       fires: number;
       sessions: number;

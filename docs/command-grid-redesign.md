@@ -87,11 +87,12 @@ observe, deep-links to existing evidence, and can ship incrementally.
 5. Transcript, Sessions, and review surfaces.
 6. Historical replay and original production sprite assets.
 
-Historical replay is derived from the canonical session detail timeline. It
-reuses the same crew projection, moves the stable actor between observed work
-stations, and links each replay frame back to its source Holotrace message.
-Tool success, failure, action, and duration stay explicit; replay never invents
-unobserved workers.
+Historical replay is derived from one compact indexed mission payload spanning
+the resolved session tree. The same event stream drives the time lanes, arena,
+actor inspector, and Holotrace evidence links. Actors enter and leave at their
+recorded lifecycle timestamps, while tool name, operation class, context,
+success, duration, and timing confidence remain explicit. The replay does not
+invent workers or missing tool arguments.
 
 ## Non-negotiable behavior
 

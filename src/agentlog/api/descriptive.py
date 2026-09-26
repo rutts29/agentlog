@@ -11,7 +11,7 @@ import sqlite3
 from threading import Event
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlparse
 
@@ -53,6 +53,8 @@ _SORT_COLUMNS = {
 _TREE_MAX_NODES = 500
 _TREE_MAX_DEPTH = 64
 _DETAIL_MAX_CHILDREN = 200
+_REPLAY_MAX_EVENTS = 50_000
+_REPLAY_TEXT_LIMIT = 480
 
 
 def _project_label(repo: str | None, cwd: str | None) -> str:
@@ -1764,6 +1766,233 @@ def orchestration_tree(
         "note": (
             "Session tree from resolved physical parents and observed worker links. "
             "Provider transcript shadows are provenance, not duplicate nodes."
+        ),
+    }
+
+
+def mission_replay(
+    conn: sqlite3.Connection,
+    session_id: str,
+    *,
+    limit: int = _REPLAY_MAX_EVENTS,
+) -> dict[str, Any] | None:
+    """Return one compact, time-ordered replay for a full session tree."""
+    requested = _resolve_session(conn, session_id)
+    if requested is None or is_suppressed_activity_session(requested):
+        return None
+
+    identity = build_identity_context(conn)
+    topology = _session_topology(conn, identity)
+    requested_id = str(requested["id"])
+    requested_navigation_id = requested_id
+    if requested_id in topology.hidden_ids:
+        owner_id = logical_orchestrator_id(conn, requested_id, context=identity)
+        if owner_id not in topology.rows:
+            return None
+        requested_navigation_id = str(owner_id)
+    root_id = topology.root_by_id.get(
+        requested_navigation_id, requested_navigation_id
+    )
+    if root_id not in topology.rows or root_id in topology.hidden_ids:
+        return None
+
+    member_ids = _conversation_members(topology, root_id)[:_TREE_MAX_NODES]
+    member_set = set(member_ids)
+    bases = _session_node_bases(
+        conn, topology, identity, member_set, root_id
+    )
+
+    depths: dict[str, int] = {root_id: 0}
+    for member_id in member_ids:
+        parent_id = topology.parent_by_id.get(member_id)
+        if parent_id in depths:
+            depths[member_id] = depths[parent_id] + 1
+        elif member_id != root_id:
+            depths[member_id] = 1
+
+    actor_by_transcript_id: dict[str, str] = {}
+    actors: list[dict[str, Any]] = []
+    for member_id in member_ids:
+        actor = {**bases[member_id], "depth": depths.get(member_id, 0)}
+        actors.append(actor)
+        transcript_id = str(actor.get("transcript_session_id") or member_id)
+        actor_by_transcript_id.setdefault(transcript_id, member_id)
+
+    transcript_ids = sorted(actor_by_transcript_id)
+    placeholders = ",".join("?" for _ in transcript_ids)
+    messages = conn.execute(
+        f"""
+        SELECT id, session_id, seq, role, timestamp, model, model_canonical,
+               effort, text, is_tool_plumbing, authored_by_agent
+        FROM messages
+        WHERE session_id IN ({placeholders})
+        ORDER BY session_id, seq
+        """,
+        transcript_ids,
+    ).fetchall()
+    tools = conn.execute(
+        f"""
+        SELECT t.id, t.session_id, t.message_id, t.seq, t.tool_name,
+               t.action, t.success, t.duration_ms, t.operation_kind,
+               m.timestamp AS message_timestamp, m.text AS message_text
+        FROM tool_events t
+        LEFT JOIN messages m ON m.id = t.message_id
+        WHERE t.session_id IN ({placeholders})
+        ORDER BY t.session_id, t.seq
+        """,
+        transcript_ids,
+    ).fetchall()
+
+    def compact(value: str | None) -> tuple[str, bool]:
+        text = (value or "").strip()
+        if len(text) <= _REPLAY_TEXT_LIMIT:
+            return text, False
+        return text[:_REPLAY_TEXT_LIMIT].rstrip() + "…", True
+
+    events: list[dict[str, Any]] = []
+    for actor in actors:
+        actor_id = str(actor["id"])
+        if actor.get("started_at"):
+            events.append(
+                {
+                    "kind": "lifecycle",
+                    "phase": "spawn",
+                    "id": f"spawn:{actor_id}",
+                    "actor_id": actor_id,
+                    "timestamp": actor["started_at"],
+                    "seq": -1,
+                }
+            )
+        if actor.get("ended_at"):
+            events.append(
+                {
+                    "kind": "lifecycle",
+                    "phase": "complete",
+                    "id": f"complete:{actor_id}",
+                    "actor_id": actor_id,
+                    "timestamp": actor["ended_at"],
+                    "seq": 2**31 - 1,
+                }
+            )
+
+    for row in messages:
+        actor_id = actor_by_transcript_id.get(str(row["session_id"]))
+        if actor_id is None:
+            continue
+        text, truncated = compact(row["text"])
+        events.append(
+            {
+                "kind": "message",
+                "id": row["id"],
+                "actor_id": actor_id,
+                "timestamp": row["timestamp"],
+                "seq": row["seq"],
+                "role": row["role"],
+                "model": (
+                    display_model(row["model_canonical"])
+                    if (row["model"] or row["model_canonical"])
+                    else None
+                ),
+                "effort": row["effort"],
+                "text": text,
+                "text_truncated": truncated,
+                "is_tool_plumbing": bool(row["is_tool_plumbing"]),
+                "authored_by_agent": bool(row["authored_by_agent"]),
+                "source_message_id": row["id"],
+            }
+        )
+
+    for row in tools:
+        actor_id = actor_by_transcript_id.get(str(row["session_id"]))
+        if actor_id is None:
+            continue
+        action, truncated = compact(row["action"])
+        context, context_truncated = compact(row["message_text"])
+        actor_started_at = bases[actor_id].get("started_at")
+        events.append(
+            {
+                "kind": "tool",
+                "id": row["id"],
+                "actor_id": actor_id,
+                "timestamp": row["message_timestamp"] or actor_started_at,
+                "time_evidence": (
+                    "message" if row["message_timestamp"] else "session"
+                ),
+                "seq": row["seq"],
+                "tool_name": row["tool_name"],
+                "action": action,
+                "action_truncated": truncated,
+                "context": context,
+                "context_truncated": context_truncated,
+                "success": row["success"],
+                "duration_ms": row["duration_ms"],
+                "operation_kind": row["operation_kind"],
+                "source_message_id": row["message_id"],
+            }
+        )
+
+    actor_order = {
+        actor_id: index for index, actor_id in enumerate(member_ids)
+    }
+
+    def event_time(value: Any) -> float:
+        if not value:
+            return float("inf")
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.timestamp()
+        except ValueError:
+            return float("inf")
+
+    event_kind_order = {"lifecycle": 0, "message": 1, "tool": 2}
+    events.sort(
+        key=lambda event: (
+            event_time(event.get("timestamp")),
+            actor_order.get(str(event["actor_id"]), 2**31 - 1),
+            int(event.get("seq") or 0),
+            event_kind_order[str(event["kind"])],
+            str(event["id"]),
+        )
+    )
+    total_events = len(events)
+    bounded_limit = min(max(1, limit), _REPLAY_MAX_EVENTS)
+    returned_events = events[:bounded_limit]
+    total_node_count = topology.descendant_counts.get(root_id, 0) + 1
+    return {
+        "root_id": root_id,
+        "requested_id": session_id,
+        "actors": actors,
+        "edges": [
+            {
+                "source": parent_id,
+                "target": actor_id,
+                "relationship": topology.relationship_by_id.get(actor_id, "child"),
+            }
+            for actor_id, parent_id in topology.parent_by_id.items()
+            if actor_id in member_set and parent_id in member_set
+        ],
+        "events": returned_events,
+        "counts": {
+            "actors": len(actors),
+            "messages": len(messages),
+            "tools": len(tools),
+            "events": total_events,
+        },
+        "bounds": {
+            "max_nodes": _TREE_MAX_NODES,
+            "returned_node_count": len(actors),
+            "total_node_count": total_node_count,
+            "nodes_truncated": len(actors) < total_node_count,
+            "max_events": _REPLAY_MAX_EVENTS,
+            "returned_event_count": len(returned_events),
+            "total_event_count": total_events,
+            "events_truncated": len(returned_events) < total_events,
+        },
+        "note": (
+            "Compact indexed replay across the visible session tree. Full source "
+            "messages remain available through each session's Holotrace."
         ),
     }
 

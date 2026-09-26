@@ -40,7 +40,6 @@ import {
   sessionTreeQueryOptions,
 } from "@/lib/sessionQueries";
 import { useIngestStream } from "@/lib/useIngestStream";
-import { buildCommandReplay } from "@/lib/commandReplay";
 
 type Ctx = { range: string };
 type DetailSession = Awaited<ReturnType<typeof fetchSessionDetail>>["session"];
@@ -164,19 +163,6 @@ export function SessionDetail() {
     return [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8);
   }, [messages]);
 
-  const focusedReplayFrame = useMemo(() => {
-    if (!q.data || !focus) return null;
-    const frames = buildCommandReplay(q.data).frames;
-    const requestedFrameIndex = requestedReplayFrame == null
-      ? Number.NaN
-      : Number(requestedReplayFrame);
-    const requestedFrame = Number.isInteger(requestedFrameIndex)
-      ? frames[requestedFrameIndex]
-      : undefined;
-    if (requestedFrame?.messageId === focus) return requestedFrame;
-    return frames.find((frame) => frame.messageId === focus) ?? null;
-  }, [focus, q.data, requestedReplayFrame]);
-
   if (q.isLoading) {
     return <DiagnosticLoader label="Opening transcript" />;
   }
@@ -201,6 +187,7 @@ export function SessionDetail() {
     const p = new URLSearchParams(params);
     p.delete("msg");
     p.delete("replayFrame");
+    p.delete("actor");
     p.delete("root");
     return p.toString();
   })();
@@ -208,9 +195,14 @@ export function SessionDetail() {
   const replaySearch = new URLSearchParams({
     range: params.get("range") ?? "24h",
     mode: "replay",
-    session: currentNavigationId,
+    session: session.root_navigation_id ?? currentNavigationId,
   });
-  if (focusedReplayFrame) replaySearch.set("frame", String(focusedReplayFrame.index));
+  if (requestedReplayFrame != null) {
+    replaySearch.set("frame", requestedReplayFrame);
+  } else if (focus) {
+    replaySearch.set("msg", focus);
+    replaySearch.set("actor", currentNavigationId);
+  }
   const branchCount = Math.max(
     0,
     treeQuery.data?.tree.descendant_count ??

@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from agentlog.api.app import create_app
 from agentlog.api.descriptive import (
     list_sessions_v2,
+    mission_replay,
     orchestration_tree,
     session_detail_v2,
     session_facets,
@@ -694,6 +695,88 @@ class SessionsTreeBrowsingTests(unittest.TestCase):
         tree = orchestration_tree(self.conn, "codex:thread-root")
         assert tree is not None
         self.assertEqual(tree["tree"]["children"][0]["thread_source"], "subagent")
+
+    def test_mission_replay_merges_worker_events_and_tool_evidence(self) -> None:
+        self.session(
+            "codex:replay-root",
+            external_id="replay-root",
+            started_at="2026-08-10T10:00:00+00:00",
+            ended_at="2026-08-10T10:10:00+00:00",
+            model="gpt-root",
+            repo="/repo/mission",
+        )
+        self.session(
+            "codex:replay-worker",
+            external_id="replay-worker",
+            parent="replay-root",
+            started_at="2026-08-10T10:01:00+00:00",
+            ended_at="2026-08-10T10:05:00+00:00",
+            model="gpt-worker",
+            repo="/repo/mission",
+            thread_source="subagent",
+        )
+        self.conn.execute(
+            """
+            INSERT INTO messages
+              (id, session_id, seq, role, timestamp, model, model_canonical,
+               text, content_hash, authored_by_agent)
+            VALUES
+              ('root-command', 'codex:replay-root', 1, 'user',
+               '2026-08-10T10:00:05+00:00', NULL, NULL,
+               'Inspect the mission', 'root-command', 0),
+              ('worker-answer', 'codex:replay-worker', 1, 'assistant',
+               '2026-08-10T10:02:00+00:00', 'gpt-worker', 'gpt-worker',
+               'Running the checks', 'worker-answer', 1)
+            """
+        )
+        self.conn.execute(
+            """
+            INSERT INTO tool_events
+              (id, session_id, message_id, seq, tool_name, action, success,
+               duration_ms, operation_kind)
+            VALUES
+              ('worker-tool', 'codex:replay-worker', 'worker-answer', 2,
+               'run_tests', 'pytest -q', 1, 4200, 'execute')
+            """
+        )
+        self.conn.commit()
+
+        replay = mission_replay(self.conn, "codex:replay-worker")
+
+        assert replay is not None
+        self.assertEqual(replay["root_id"], "codex:replay-root")
+        self.assertEqual(replay["counts"]["actors"], 2)
+        self.assertEqual(replay["counts"]["messages"], 2)
+        self.assertEqual(replay["counts"]["tools"], 1)
+        self.assertEqual(
+            replay["edges"],
+            [
+                {
+                    "source": "codex:replay-root",
+                    "target": "codex:replay-worker",
+                    "relationship": "child",
+                }
+            ],
+        )
+        worker = next(
+            actor for actor in replay["actors"]
+            if actor["id"] == "codex:replay-worker"
+        )
+        self.assertEqual(worker["depth"], 1)
+        tool = next(event for event in replay["events"] if event["kind"] == "tool")
+        self.assertEqual(tool["actor_id"], "codex:replay-worker")
+        self.assertEqual(tool["tool_name"], "run_tests")
+        self.assertEqual(tool["action"], "pytest -q")
+        self.assertEqual(tool["context"], "Running the checks")
+        self.assertEqual(tool["duration_ms"], 4200)
+        self.assertEqual(tool["source_message_id"], "worker-answer")
+
+        self.conn.close()
+        with TestClient(create_app(self.path)) as client:
+            response = client.get("/api/sessions/codex%3Areplay-root/replay")
+        self.conn = connect(self.path)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["counts"]["actors"], 2)
 
     def test_session_list_exposes_root_thread_source(self) -> None:
         self.session(

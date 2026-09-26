@@ -23,10 +23,12 @@ const pkg = JSON.parse(fs.readFileSync(path.join(webRoot, "package.json"), "utf8
 
 for (const required of [
   "src/lib/commandFloor.ts",
-  "src/lib/commandReplay.ts",
+  "src/lib/missionReplay.ts",
   "src/views/CommandFloorView.tsx",
   "src/components/command-grid/CommandFloor.tsx",
   "src/components/command-grid/CrewSprite.tsx",
+  "src/components/command-grid/MissionArena.tsx",
+  "src/components/command-grid/ExecutionTimeline.tsx",
   "src/components/command-grid/RuntimeGrid.tsx",
   "src/components/command-grid/SectorMap.tsx",
   "src/components/DiagnosticLoader.tsx",
@@ -56,7 +58,8 @@ for (const label of [
   "Sector map",
   "Council review",
   "Holotrace · Transcript",
-  "source-backed historical projection",
+  "indexed multi-session mission replay",
+  "Execution timeline",
 ]) {
   assert.ok(source.includes(label), `missing approved interface label: ${label}`);
 }
