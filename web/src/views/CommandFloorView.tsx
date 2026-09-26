@@ -115,6 +115,9 @@ export function CommandFloorView() {
     ? Math.max(0, Math.min(Number.isFinite(requestedFrame) ? requestedFrame : 0, replay.frames.length - 1))
     : 0;
   const frame = replay?.frames[frameIndex] ?? null;
+  const replayProgress = replay && replay.frames.length > 1
+    ? Math.round((frameIndex / (replay.frames.length - 1)) * 100)
+    : 0;
   const replayProjection = useMemo(
     () => replay && frame ? projectMissionReplayFrame(replay, frame.index) : null,
     [frame, replay],
@@ -263,13 +266,13 @@ export function CommandFloorView() {
               </select>
             </label>
             <div className="floor-replay-controls">
-              <button type="button" onClick={() => setReplayFrame(frameIndex - 1)} disabled={frameIndex <= 0}>←</button>
+              <button type="button" aria-label="Previous event" title="Previous event" onClick={() => setReplayFrame(frameIndex - 1)} disabled={frameIndex <= 0}>←</button>
               <button type="button" onClick={() => setPlaying((current) => !current)} disabled={!replay || frameIndex >= replay.frames.length - 1}>{playing ? "Pause" : "Play"}</button>
-              <button type="button" onClick={() => setReplayFrame(frameIndex + 1)} disabled={!replay || frameIndex >= replay.frames.length - 1}>→</button>
-              <button type="button" onClick={() => replay && setReplayFrame(replay.recommendedFrameIndex)} disabled={!replay}>Burst</button>
+              <button type="button" aria-label="Next event" title="Next event" onClick={() => setReplayFrame(frameIndex + 1)} disabled={!replay || frameIndex >= replay.frames.length - 1}>→</button>
+              <button type="button" onClick={() => replay && setReplayFrame(replay.recommendedFrameIndex)} disabled={!replay}>Peak activity</button>
             </div>
             <label className="floor-replay-scrubber">
-              <span>{replay ? `${frameIndex + 1}/${replay.frames.length}` : "0/0"}</span>
+              <span>{frame ? `${formatDayTime(frame.timestamp)} · ${replayProgress}%` : "Replay timeline"}</span>
               <input type="range" min="0" max={Math.max(0, (replay?.frames.length ?? 1) - 1)} value={frameIndex} onChange={(event) => setReplayFrame(Number(event.target.value))} disabled={!replay} />
             </label>
           </>
@@ -286,7 +289,7 @@ export function CommandFloorView() {
 
       {mode === "replay" && frame ? (
         <div className={`replay-frame replay-frame--${frame.outcome}`} aria-live="polite">
-          <span className="replay-frame__index">F-{String(frame.index + 1).padStart(3, "0")}</span>
+          <time className="replay-frame__index">{formatDayTime(frame.timestamp)}</time>
           <span><strong>{frame.title}</strong><small>{frame.detail}</small></span>
           <span>{projection.byId.get(frame.actorId)?.callsign ?? frame.kind}</span>
           <span>{replayOutcomeLabel(frame)}</span>
@@ -327,7 +330,7 @@ export function CommandFloorView() {
             <div className="crew-inspector__head">
               <span>{mode === "live" ? "crew inspector" : "replay inspector"}</span>
               <span className={mode === "live" && connected ? "is-live" : ""}>
-                {mode === "live" ? (connected ? "stream linked" : "fallback link") : `frame ${frameIndex + 1}`}
+                {mode === "live" ? (connected ? "stream linked" : "fallback link") : `${replayProgress}% · ${formatDayTime(frame?.timestamp)}`}
               </span>
             </div>
             {selected ? (

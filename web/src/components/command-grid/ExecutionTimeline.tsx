@@ -1,4 +1,4 @@
-import type { CommandFloorProjection } from "@/lib/commandFloor";
+import { callsignForActor, type CommandFloorProjection } from "@/lib/commandFloor";
 import type { MissionFrame, MissionReplay } from "@/lib/missionReplay";
 import { formatDayTime } from "@/lib/utils";
 
@@ -66,7 +66,7 @@ function lanePriority(frame: MissionFrame): number {
 }
 
 function clusterFrames(frames: MissionFrame[], start: number, end: number): FrameCluster[] {
-  const bucketMs = Math.max(1_000, (end - start) / 120);
+  const bucketMs = Math.max(1_000, (end - start) / 48);
   const buckets = new Map<number, MissionFrame[]>();
   frames.forEach((frame, index) => {
     const at = timestamp(frame, start + index);
@@ -88,6 +88,49 @@ function clusterFrames(frames: MissionFrame[], start: number, end: number): Fram
       outcome: failure ? "failure" : values.some((frame) => frame.outcome === "success") ? "success" : "unknown",
     };
   });
+}
+
+function compactToolName(tool: string): string {
+  const normalized = tool.toLowerCase();
+  if (/test|pytest|jest|vitest/.test(normalized)) return "tests";
+  if (/patch|edit|write/.test(normalized)) return "patch";
+  if (/read|search|grep|glob|find/.test(normalized)) return "inspect";
+  if (/spawn|fork|delegate/.test(normalized)) return "spawn";
+  if (/wait/.test(normalized)) return "wait";
+  if (/exec|command|shell|terminal|stdin/.test(normalized)) return "exec";
+  return tool.replaceAll("_", " ").slice(0, 12);
+}
+
+function clusterLabel(cluster: FrameCluster): string {
+  const semanticText = cluster.frames
+    .map((frame) => `${frame.tool ?? ""} ${frame.operationKind ?? ""} ${frame.action ?? ""} ${frame.context ?? ""} ${frame.detail}`)
+    .join(" ")
+    .toLowerCase();
+  if (/pytest|vitest|jest|cargo test|go test|npm test|run_tests|\btests?\b/.test(semanticText)) return "tests";
+  if (/apply_patch|\bpatch\b|\bedit(?:ed|ing)?\b|\bwrite(?:s|ing)?\b/.test(semanticText)) return "patch";
+  if (/git diff|\breview(?:ed|ing)?\b/.test(semanticText)) return "review";
+  if (/read_file|ripgrep|\bgrep\b|\bsearch\b|\binspect(?:ed|ing)?\b|\bfind\b/.test(semanticText)) return "inspect";
+  if (/spawn_agent|\bspawn\b|\bfork\b|\bdelegate\b/.test(semanticText)) return "spawn";
+  if (/wait_agent|\bwait(?:ed|ing)?\b/.test(semanticText)) return "wait";
+  const tools = cluster.frames
+    .map((frame) => frame.tool)
+    .filter((tool): tool is string => Boolean(tool));
+  if (tools.length > 0) {
+    const counts = new Map<string, number>();
+    for (const tool of tools) counts.set(tool, (counts.get(tool) ?? 0) + 1);
+    const dominant = [...counts.entries()].sort((left, right) => right[1] - left[1])[0]?.[0];
+    return dominant ? compactToolName(dominant) : "tool";
+  }
+  if (cluster.outcome === "failure") return "failed";
+  switch (cluster.kind) {
+    case "human": return "command";
+    case "agent": return "response";
+    case "spawn": return "spawn";
+    case "complete": return "returned";
+    case "context": return "brief";
+    case "system": return "system";
+    case "tool": return "tool";
+  }
 }
 
 export function ExecutionTimeline({
@@ -135,7 +178,7 @@ export function ExecutionTimeline({
     <section className="execution-timeline">
       <header className="execution-timeline__head">
         <div><span className="ops-panel__slash" aria-hidden />{heading} <small>{description}</small></div>
-        <span>{lanes.length} lanes · {window.frames.length} visible events</span>
+        <span>{lanes.length} crew lanes · {window.frames.length} events in view</span>
       </header>
       <div className="execution-timeline__axis">
         <span>Crew</span>
@@ -149,7 +192,7 @@ export function ExecutionTimeline({
           return (
             <div className="execution-lane" key={lane.actorId}>
               <div className="execution-lane__actor">
-                <strong>{actor?.callsign ?? `L${meta?.depth ?? 0}`}</strong>
+                <strong>{actor?.callsign ?? callsignForActor(lane.actorId, (meta?.depth ?? 0) > 0)}</strong>
                 <small>{actor?.displayName ?? meta?.model ?? meta?.harness ?? "agent"}</small>
               </div>
               <div className="execution-lane__track">
@@ -171,7 +214,7 @@ export function ExecutionTimeline({
                       title={summary}
                       aria-label={`${actor?.callsign ?? lane.actorId}: ${summary}`}
                     >
-                      {cluster.frames.length > 1 ? `×${cluster.frames.length}` : frame.kind === "tool" ? frame.tool : frame.kind === "spawn" ? "+" : ""}
+                      {clusterLabel(cluster)}
                     </button>
                   );
                 })}

@@ -509,12 +509,12 @@ kbd {
 .floor-replay-controls button:hover:not(:disabled) { background: var(--muted); color: var(--foreground); }
 .floor-replay-controls button:disabled { opacity: .35; cursor: default; }
 .floor-replay-scrubber { display: flex; min-width: 180px; flex: 1; align-items: center; gap: 8px; }
-.floor-replay-scrubber span { width: 62px; color: var(--command-cyan); font-family: "JetBrains Mono", ui-monospace, monospace; font-size: var(--text-micro); }
+.floor-replay-scrubber span { width: 170px; flex-shrink: 0; color: var(--command-cyan); font-family: "JetBrains Mono", ui-monospace, monospace; font-size: var(--text-micro); }
 .floor-replay-scrubber input { width: 100%; accent-color: var(--command-yellow); }
 .floor-modebar__link { margin-left: auto; color: var(--command-amber); font-family: "JetBrains Mono", ui-monospace, monospace; font-size: var(--text-micro); letter-spacing: .08em; text-transform: uppercase; }
 .live-mode-note { border-left: 3px solid var(--command-cyan); background: color-mix(in srgb, var(--command-cyan) 5%, var(--card)); padding: 8px 10px; color: var(--muted-foreground); font-size: var(--text-data); }
 .floor-modebar__link.is-live { color: var(--status-ok); }
-.replay-frame { display: grid; grid-template-columns: 58px minmax(0, 1fr) 75px 120px; align-items: center; gap: 9px; border: 1px solid var(--border); border-left: 3px solid var(--command-amber); background: var(--card); padding: 8px 10px; }
+.replay-frame { display: grid; grid-template-columns: 118px minmax(0, 1fr) 75px 120px; align-items: center; gap: 9px; border: 1px solid var(--border); border-left: 3px solid var(--command-amber); background: var(--card); padding: 8px 10px; }
 .replay-frame--success { border-left-color: var(--status-ok); }
 .replay-frame--failure { border-left-color: var(--command-red); }
 .replay-frame__index, .replay-frame > span:nth-child(3), .replay-frame > span:last-child { color: var(--faint-foreground); font-family: "JetBrains Mono", ui-monospace, monospace; font-size: var(--text-micro); text-transform: uppercase; }
@@ -564,7 +564,7 @@ kbd {
 .execution-lane__actor small { overflow: hidden; color: var(--faint-foreground); font-size: var(--text-micro); text-overflow: ellipsis; white-space: nowrap; }
 .execution-lane__track { position: relative; overflow: hidden; background: repeating-linear-gradient(90deg, transparent 0 calc(25% - 1px), var(--border-faint) calc(25% - 1px) 25%); }
 .execution-lane__cursor { position: absolute; z-index: 3; top: 0; bottom: 0; width: 1px; background: var(--command-yellow); box-shadow: 0 0 7px rgba(240, 224, 0, .45); pointer-events: none; }
-.execution-block { position: absolute; z-index: 2; top: 12px; height: 21px; min-width: 4px; overflow: hidden; border: 1px solid #3b4c57; background: #24333d; color: #dce4e8; font-family: "JetBrains Mono", monospace; font-size: var(--text-micro); line-height: 19px; text-overflow: ellipsis; white-space: nowrap; }
+.execution-block { position: absolute; z-index: 2; top: 12px; height: 21px; min-width: 4px; overflow: hidden; border: 1px solid #3b4c57; background: #24333d; padding: 0 5px; color: #dce4e8; font-family: "JetBrains Mono", monospace; font-size: var(--text-micro); line-height: 19px; text-overflow: ellipsis; white-space: nowrap; }
 .execution-block:hover { z-index: 4; border-color: var(--command-yellow); }
 .execution-block--human { background: var(--command-yellow); color: #0b0d0b; }
 .execution-block--agent { border-color: var(--command-cyan); background: color-mix(in srgb, var(--command-cyan) 68%, #10222a); color: #061015; }
@@ -716,7 +716,8 @@ kbd {
   .floor-modebar__session { align-items: stretch; flex-direction: column; }
   .floor-modebar__session select { width: 100%; max-width: none; }
   .floor-replay-scrubber { min-width: 0; }
-  .replay-frame { grid-template-columns: 50px minmax(0, 1fr); }
+  .floor-replay-scrubber span { width: 150px; }
+  .replay-frame { grid-template-columns: 108px minmax(0, 1fr); }
   .replay-frame > span:nth-child(3), .replay-frame > span:last-child { display: none; }
   .mission-arena__head { align-items: start; flex-direction: column; }
   .mission-arena__rail { grid-template-columns: repeat(3, 1fr); }
