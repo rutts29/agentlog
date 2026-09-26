@@ -79,6 +79,7 @@ export type CommandFloorActor = CrewOperator | CrewFamiliar;
 
 export type CommandFloorRoom = {
   id: string;
+  rootId: string | null;
   project: string;
   actorIds: string[];
   operatorIds: string[];
@@ -133,7 +134,7 @@ function hash(value: string): number {
   return result >>> 0;
 }
 
-function callsignFor(id: string, worker: boolean): string {
+export function callsignForActor(id: string, worker: boolean): string {
   const number = (hash(id) % 99) + 1;
   return `${worker ? "F" : "A"}-${String(number).padStart(2, "0")}`;
 }
@@ -301,7 +302,7 @@ export function projectCommandFloor(sessions: LiveSession[]): CommandFloorProjec
       harnessDisplay: session.harness_display || session.harness,
       project,
       roomId: slug(project),
-      callsign: callsignFor(id, worker),
+      callsign: callsignForActor(id, worker),
       displayName: displayName(session),
       specialty: specialty.specialty,
       specialtyEvidence: specialty.evidence,
@@ -331,11 +332,34 @@ export function projectCommandFloor(sessions: LiveSession[]): CommandFloorProjec
     byId.get(actor.lineage.parentId)?.childIds.push(actor.id);
   }
 
+  for (const actor of actors) {
+    let roomOwner: CommandFloorActor = actor;
+    const visited = new Set<string>();
+    while (
+      roomOwner.kind === "familiar" &&
+      roomOwner.lineage.kind === "attached" &&
+      !visited.has(roomOwner.id)
+    ) {
+      visited.add(roomOwner.id);
+      const parent = byId.get(roomOwner.lineage.parentId);
+      if (!parent) break;
+      roomOwner = parent;
+    }
+    actor.roomId = `mission:${roomOwner.id}`;
+  }
+
+  const ownerByRoom = new Map(
+    actors
+      .filter((actor): actor is CrewOperator => actor.kind === "operator")
+      .map((actor) => [actor.roomId, actor]),
+  );
   const roomMap = new Map<string, CommandFloorRoom>();
   for (const actor of actors) {
+    const owner = ownerByRoom.get(actor.roomId);
     const room = roomMap.get(actor.roomId) ?? {
       id: actor.roomId,
-      project: actor.project,
+      rootId: owner?.id ?? null,
+      project: owner?.project ?? actor.project,
       actorIds: [],
       operatorIds: [],
       familiarIds: [],

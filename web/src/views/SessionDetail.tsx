@@ -224,8 +224,8 @@ export function SessionDetail() {
   const maxBucketTools = Math.max(...buckets.map((b) => b.tools), 1);
 
   return (
-    <div className="space-y-3">
-      <div>
+    <div className="session-detail-view">
+      <div className="session-detail-view__head">
         <Link
           to={`/sessions${backSearch ? `?${backSearch}` : ""}`}
           className="text-[12px] text-muted-foreground hover:text-foreground"
@@ -296,7 +296,7 @@ export function SessionDetail() {
         </div>
       ) : null}
 
-      <div className="grid grid-cols-1 items-start gap-3 lg:grid-cols-[minmax(0,1fr)_300px]">
+      <div className="session-detail-layout grid grid-cols-1 gap-3 lg:grid-cols-[minmax(0,1fr)_330px]">
         {/* Left: the transcript. */}
         <PanelCard
           title="Holotrace · Transcript"
@@ -327,8 +327,9 @@ export function SessionDetail() {
               ) : null}
             </span>
           }
-          className="p-0"
+          className="session-detail-transcript p-0"
         >
+          <div className="session-detail-transcript__scroll">
           {showInheritedContext && inheritedContext ? (
             <InheritedContextRow
               context={inheritedContext}
@@ -358,10 +359,11 @@ export function SessionDetail() {
               isChildSession={isChildSession}
             />
           )}
+          </div>
         </PanelCard>
 
-        {/* Right: session anatomy, sticky. */}
-        <div className="space-y-3 lg:sticky lg:top-0">
+        {/* Right: independently scrolling session evidence rail. */}
+        <aside className="session-detail-sidebar space-y-3">
           <Card>
             <CardTitle>Mission anatomy</CardTitle>
             <div className="mt-2 grid grid-cols-2 gap-x-3 gap-y-2">
@@ -395,7 +397,7 @@ export function SessionDetail() {
                   </div>
                 ))}
               </div>
-              <div className="mt-1 flex justify-between text-[9px] text-faint-foreground">
+              <div className="mt-1 flex justify-between text-[10px] text-faint-foreground">
                 <span>start</span>
                 <span style={{ color: "var(--speaker-human)" }}>▂ human turn</span>
                 <span>end</span>
@@ -497,10 +499,14 @@ export function SessionDetail() {
               </nav>
               {branchCount > 0 ? (
                 <Link
-                  to={`/orchestration?root=${encodeURIComponent(treeQuery.data.root_id)}${backSearch ? `&${backSearch}` : ""}`}
-                  className="mt-2 inline-block text-[11px] text-muted-foreground hover:text-foreground"
+                  to={`/floor?${new URLSearchParams({
+                    range: params.get("range") ?? "24h",
+                    mode: "replay",
+                    session: treeQuery.data.root_id,
+                  }).toString()}`}
+                  className="command-link mt-3"
                 >
-                  Open runtime topology →
+                  Replay this mission →
                 </Link>
               ) : null}
             </Card>
@@ -574,7 +580,7 @@ export function SessionDetail() {
               </div>
             ) : null}
           </Card>
-        </div>
+        </aside>
       </div>
     </div>
   );

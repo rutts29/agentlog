@@ -278,6 +278,12 @@ export function CommandFloorView() {
         )}
       </div>
 
+      {mode === "live" ? (
+        <div className="live-mode-note">
+          Live shows current presence only. Switch to Replay for recorded timelines, tool packets, and complete mission lineage.
+        </div>
+      ) : null}
+
       {mode === "replay" && frame ? (
         <div className={`replay-frame replay-frame--${frame.outcome}`} aria-live="polite">
           <span className="replay-frame__index">F-{String(frame.index + 1).padStart(3, "0")}</span>

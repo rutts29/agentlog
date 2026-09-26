@@ -205,6 +205,7 @@ function recommendedFrame(frames: MissionFrame[], actorCount: number): number {
   let bestRight = 0;
   let bestScore = -1;
   const windowMs = 30 * 60 * 1_000;
+  const activeWeight = actorCount <= 12 ? 200 : 8;
   for (let right = 0; right < timed.length; right += 1) {
     const current = timed[right];
     actorCounts.set(current.actorId, (actorCounts.get(current.actorId) ?? 0) + 1);
@@ -218,7 +219,7 @@ function recommendedFrame(frames: MissionFrame[], actorCount: number): number {
       if (leaving.kind === "tool") toolCount -= 1;
       left += 1;
     }
-    const score = actorCounts.size * 24 + (activeAtFrame.get(current.index) ?? 0) * 8 + toolCount * 3 + (right - left + 1);
+    const score = actorCounts.size * 24 + (activeAtFrame.get(current.index) ?? 0) * activeWeight + toolCount * 3 + (right - left + 1);
     if (score > bestScore) {
       bestScore = score;
       bestLeft = left;

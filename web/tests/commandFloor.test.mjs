@@ -125,3 +125,15 @@ test("unknown source and activity stay unknown", () => {
   assert.equal(actor.sourceSnapshotStatus, "unknown");
 });
 
+test("separate root sessions in the same project get separate mission rooms", () => {
+  const projection = projectCommandFloor([
+    live({ session_id: "codex:root-1", external_id: "root-1" }),
+    live({ session_id: "codex:root-2", external_id: "root-2" }),
+  ]);
+
+  assert.equal(projection.rooms.length, 2);
+  assert.deepEqual(
+    projection.rooms.map((room) => room.rootId).sort(),
+    ["codex:root-1", "codex:root-2"],
+  );
+});

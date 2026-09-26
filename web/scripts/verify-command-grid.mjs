@@ -26,14 +26,36 @@ for (const required of [
   "src/lib/missionReplay.ts",
   "src/views/CommandFloorView.tsx",
   "src/components/command-grid/CommandFloor.tsx",
+  "src/components/command-grid/CommandDeckScene.tsx",
   "src/components/command-grid/CrewSprite.tsx",
+  "src/components/command-grid/TraceShards.tsx",
+  "src/components/command-grid/EvidenceTrail.tsx",
   "src/components/command-grid/MissionArena.tsx",
+  "src/components/command-grid/MissionTopology.tsx",
   "src/components/command-grid/ExecutionTimeline.tsx",
   "src/components/command-grid/RuntimeGrid.tsx",
   "src/components/command-grid/SectorMap.tsx",
   "src/components/DiagnosticLoader.tsx",
 ]) {
   assert.ok(fs.existsSync(path.join(webRoot, required)), `missing ${required}`);
+}
+
+for (const requiredAsset of [
+  "src/assets/command-grid/command-room-runtime.jpg",
+  "src/assets/command-grid/operators/coordinator-sprite.png",
+  "src/assets/command-grid/operators/researcher-sprite.png",
+  "src/assets/command-grid/operators/builder-sprite.png",
+  "src/assets/command-grid/operators/tester-sprite.png",
+  "src/assets/command-grid/operators/reviewer-sprite.png",
+  "src/assets/command-grid/operators/systems-sprite.png",
+  "src/assets/command-grid/familiars/scout-hound-sprite.png",
+  "src/assets/command-grid/familiars/archive-owl-sprite.png",
+  "src/assets/command-grid/familiars/builder-beetle-sprite.png",
+  "src/assets/command-grid/familiars/test-spider-sprite.png",
+  "src/assets/command-grid/familiars/review-raven-sprite.png",
+  "src/assets/command-grid/familiars/ops-repair-crab-sprite.png",
+]) {
+  assert.ok(fs.existsSync(path.join(webRoot, requiredAsset)), `missing ${requiredAsset}`);
 }
 
 for (const forbidden of [

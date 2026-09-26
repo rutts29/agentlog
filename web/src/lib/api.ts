@@ -822,6 +822,10 @@ export function fetchSkills(range: string, signal?: AbortSignal) {
     items: Array<{
       id?: string | null;
       skill: string;
+      source?: string | null;
+      source_path?: string | null;
+      duplicate_copies?: number;
+      name_conflict?: boolean;
       fires: number;
       sessions: number;
       last_fired: string | null;

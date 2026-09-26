@@ -26,14 +26,14 @@ function timelineWindow(replay: MissionReplay, frameIndex: number) {
   const currentAt = current?.timestamp ? Date.parse(current.timestamp) : Number.NaN;
   let frames: MissionFrame[] = [];
   if (Number.isFinite(currentAt)) {
-    for (const horizon of [15, 60, 360, 1_440]) {
+    for (const horizon of [15, 60]) {
       const radius = horizon * 60 * 1_000;
       frames = replay.frames.filter((frame) => {
         if (!frame.timestamp) return false;
         const at = Date.parse(frame.timestamp);
         return Number.isFinite(at) && Math.abs(at - currentAt) <= radius;
       });
-      if (frames.length >= 40) break;
+      if (frames.length >= 10) break;
     }
   }
   if (frames.length === 0) {
@@ -84,7 +84,7 @@ function clusterFrames(frames: MissionFrame[], start: number, end: number): Fram
       id: `${values[0].actorId}:${bucket}`,
       frames: values,
       representative,
-      kind: human ? "human" : tool ? "tool" : representative.kind,
+      kind: tool ? "tool" : human ? "human" : representative.kind,
       outcome: failure ? "failure" : values.some((frame) => frame.outcome === "success") ? "success" : "unknown",
     };
   });
@@ -96,12 +96,16 @@ export function ExecutionTimeline({
   frameIndex,
   selectedActorId,
   onSelectFrame,
+  heading = "Execution timeline",
+  description = "recorded multi-agent events",
 }: {
   replay: MissionReplay;
   projection: CommandFloorProjection;
   frameIndex: number;
   selectedActorId: string | null;
   onSelectFrame: (index: number) => void;
+  heading?: string;
+  description?: string;
 }) {
   const window = timelineWindow(replay, frameIndex);
   const laneMap = new Map<string, Lane>();
@@ -130,7 +134,7 @@ export function ExecutionTimeline({
   return (
     <section className="execution-timeline">
       <header className="execution-timeline__head">
-        <div><span className="ops-panel__slash" aria-hidden />Execution timeline <small>recorded multi-agent events</small></div>
+        <div><span className="ops-panel__slash" aria-hidden />{heading} <small>{description}</small></div>
         <span>{lanes.length} lanes · {window.frames.length} visible events</span>
       </header>
       <div className="execution-timeline__axis">

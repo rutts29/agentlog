@@ -148,7 +148,7 @@ export function Search() {
                   />
                   <span className="text-[11px] text-muted-foreground">{hit.project}</span>
                   <span
-                    className="microlabel text-[9px]"
+                    className="microlabel text-[10px]"
                     style={{
                       color:
                         hit.role === "user"

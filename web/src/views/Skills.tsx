@@ -14,7 +14,7 @@ type Ctx = { range: string };
 function GatedChip() {
   return (
     <span
-      className="microlabel rounded-[4px] border border-dashed px-1.5 py-[1px] text-[9px]"
+      className="microlabel rounded-[4px] border border-dashed px-1.5 py-[1px] text-[10px]"
       style={{
         borderColor: "color-mix(in srgb, var(--status-warn) 55%, transparent)",
         color: "var(--status-warn)",
@@ -114,7 +114,7 @@ export function Skills() {
           <table className="w-full text-left text-[12px]">
             <thead>
               <tr className="microlabel border-b border-border text-[10px] text-faint-foreground">
-                <th className="px-4 py-2 font-medium">Skill</th>
+                <th className="px-4 py-2 font-medium">Skill / source</th>
                 <th className="py-2 text-right font-medium">Fires</th>
                 <th className="py-2 text-right font-medium">Sessions</th>
                 <th className="py-2 pl-8 font-medium">Trend, 8w</th>
@@ -128,8 +128,13 @@ export function Skills() {
                   key={s.id ?? `${s.skill}-${index}`}
                   className="border-b border-border-faint last:border-0 hover:bg-muted/40"
                 >
-                  <td className="px-4 py-1.5 font-mono text-[12px] text-muted-foreground">
-                    {s.skill}
+                  <td className="px-4 py-2 text-muted-foreground">
+                    <span className="block font-mono text-[12px] text-foreground">{s.skill}</span>
+                    <span className="mt-0.5 block text-[11px] text-faint-foreground">
+                      {s.source || "observed exposure"}
+                      {(s.duplicate_copies ?? 0) > 0 ? ` · ${s.duplicate_copies} duplicate copies` : ""}
+                      {s.name_conflict ? " · name conflict" : ""}
+                    </span>
                   </td>
                   <td className="tabular py-1.5 text-right">{s.fires}</td>
                   <td className="tabular py-1.5 text-right text-muted-foreground">

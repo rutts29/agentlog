@@ -94,6 +94,20 @@ recorded lifecycle timestamps, while tool name, operation class, context,
 success, duration, and timing confidence remain explicit. The replay does not
 invent workers or missing tool arguments.
 
+## Production art
+
+The live and replay floors share one generated command-room environment and a
+role-specific crew pack. The checked-in runtime set contains six operator
+portraits and six mechanical familiars under `web/src/assets/command-grid/`.
+The scene maps Agentlog's observed state onto those assets; the art never owns
+session or activity state.
+
+The room ships as an optimized 385 KB JPEG and the transparent sprites are
+256 px PNGs, roughly 58–70 KB each. The original generated masters remain
+outside the frontend bundle. CSS transitions move actors when telemetry changes
+their station, and state keyframes communicate working, waiting, coordinating,
+or idle behavior without a runtime animation dependency.
+
 ## Non-negotiable behavior
 
 - No parser or database contract changes for visual convenience.

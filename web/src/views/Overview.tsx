@@ -1,12 +1,17 @@
 import { useEffect, useMemo, useRef } from "react";
-import { Link, useOutletContext } from "react-router-dom";
+import { Link, useNavigate, useOutletContext } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { DiagnosticLoader } from "@/components/DiagnosticLoader";
 import { EmptyState } from "@/components/EmptyState";
 import { RuntimeGrid } from "@/components/command-grid/RuntimeGrid";
+import { ExecutionTimeline } from "@/components/command-grid/ExecutionTimeline";
+import { EvidenceTrail } from "@/components/command-grid/EvidenceTrail";
+import { MissionTopology } from "@/components/command-grid/MissionTopology";
 import { SectorMap } from "@/components/command-grid/SectorMap";
-import { fetchAttention, type PresenceEvent } from "@/lib/api";
+import { TraceShards } from "@/components/command-grid/TraceShards";
+import { fetchAttention, fetchMissionReplay, type PresenceEvent } from "@/lib/api";
 import { projectCommandFloor } from "@/lib/commandFloor";
+import { buildMissionReplay, projectMissionReplayFrame } from "@/lib/missionReplay";
 import { overviewGraphQueryOptions, overviewQueryOptions } from "@/lib/overviewQueries";
 import { useIngestStream } from "@/lib/useIngestStream";
 import { useLivePresence } from "@/lib/useLivePresence";
@@ -26,6 +31,7 @@ function queueTone(severity: string, state: string): string {
 
 export function Overview() {
   const { range } = useOutletContext<Ctx>();
+  const navigate = useNavigate();
   const queryClient = useQueryClient();
   const presenceHandler = useRef<(data: PresenceEvent) => void>(() => {});
   const { connected } = useIngestStream(
@@ -52,7 +58,44 @@ export function Overview() {
     () => projectCommandFloor(presence.sessions),
     [presence.sessions],
   );
+  const timelineSessionId =
+    projection.actors.find((actor) => actor.kind === "operator")?.sessionId ??
+    overview.data?.recent.items.find((session) => (session.child_count ?? 0) > 0)?.navigation_id ??
+    overview.data?.recent.items[0]?.navigation_id ??
+    overview.data?.recent.items[0]?.id ??
+    null;
+  const missionReplayQuery = useQuery({
+    queryKey: ["overview-mission-replay", timelineSessionId],
+    queryFn: ({ signal }) => {
+      if (!timelineSessionId) throw new Error("Overview timeline requires a mission");
+      return fetchMissionReplay(timelineSessionId, signal);
+    },
+    enabled: Boolean(timelineSessionId),
+    staleTime: 15_000,
+    refetchInterval: connected ? 15_000 : false,
+  });
+  const timelineReplay = useMemo(
+    () => missionReplayQuery.data ? buildMissionReplay(missionReplayQuery.data) : null,
+    [missionReplayQuery.data],
+  );
+  const timelineFrameIndex = timelineReplay?.recommendedFrameIndex ?? 0;
+  const timelineProjection = useMemo(
+    () => timelineReplay ? projectMissionReplayFrame(timelineReplay, timelineFrameIndex) : null,
+    [timelineFrameIndex, timelineReplay],
+  );
   const search = new URLSearchParams({ range }).toString();
+  const openReplayFrame = (index: number) => {
+    if (!timelineReplay) return;
+    navigate({
+      pathname: "/floor",
+      search: new URLSearchParams({
+        range,
+        mode: "replay",
+        session: timelineReplay.rootId,
+        frame: String(index),
+      }).toString(),
+    });
+  };
 
   if (overview.isLoading) return <DiagnosticLoader label="Reading command ledger" rows={7} />;
   if (overview.isError || !overview.data) {
@@ -95,9 +138,25 @@ export function Overview() {
       </section>
 
       <div className="ops-board__grid">
-        <RuntimeGrid actors={projection.actors} missions={recent} search={search} />
+        {timelineReplay && timelineProjection ? (
+          <div className="overview-timeline-panel">
+            <ExecutionTimeline
+              replay={timelineReplay}
+              projection={timelineProjection}
+              frameIndex={timelineFrameIndex}
+              selectedActorId={timelineReplay.frames[timelineFrameIndex]?.actorId ?? null}
+              onSelectFrame={openReplayFrame}
+              heading="Live grid"
+              description="busiest recorded mission window"
+            />
+          </div>
+        ) : (
+          <RuntimeGrid actors={projection.actors} missions={recent} search={search} />
+        )}
 
-        {graph.isLoading ? (
+        {timelineReplay ? (
+          <MissionTopology replay={timelineReplay} range={range} />
+        ) : graph.isLoading ? (
           <DiagnosticLoader label="Mapping sector topology" compact rows={4} />
         ) : graph.data ? (
           <SectorMap data={graph.data} search={search} compact />
@@ -120,7 +179,14 @@ export function Overview() {
           </div>
         </section>
 
-        <section className="ops-panel trace-panel">
+        {timelineReplay && timelineProjection ? (
+          <TraceShards
+            replay={timelineReplay}
+            projection={timelineProjection}
+            frameIndex={timelineFrameIndex}
+            onSelectFrame={openReplayFrame}
+          />
+        ) : <section className="ops-panel trace-panel">
           <header className="ops-panel__head"><div><span className="ops-panel__slash" aria-hidden />Trace shards <small>recent sessions and live signals</small></div><Link to={`/sessions?${search}`}>all traces →</Link></header>
           <div className="trace-list">
             {projection.actors.slice(0, 3).map((actor) => (
@@ -134,7 +200,7 @@ export function Overview() {
               </Link>
             ))}
           </div>
-        </section>
+        </section>}
 
         <section className="ops-panel missions-panel">
           <header className="ops-panel__head"><div><span className="ops-panel__slash" aria-hidden />Active missions <small>recent conversation roots</small></div><Link to={`/sessions?${search}`}>{recent.length} shown →</Link></header>
@@ -150,7 +216,9 @@ export function Overview() {
           </div>
         </section>
 
-        <section className="ops-panel tools-panel">
+        {timelineReplay ? (
+          <EvidenceTrail replay={timelineReplay} frameIndex={timelineFrameIndex} range={range} />
+        ) : <section className="ops-panel tools-panel">
           <header className="ops-panel__head"><div><span className="ops-panel__slash" aria-hidden />Tool packets <small>range traffic</small></div><span>{data.tools.total} calls</span></header>
           <div className="tool-packet-list">
             {topTools.map((tool) => (
@@ -161,7 +229,7 @@ export function Overview() {
               </div>
             ))}
           </div>
-        </section>
+        </section>}
       </div>
     </div>
   );
