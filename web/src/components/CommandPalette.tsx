@@ -24,16 +24,17 @@ type Item = {
 };
 
 const VIEWS: Array<{ label: string; path: string }> = [
-  { label: "Overview", path: "/" },
-  { label: "Sessions", path: "/sessions" },
-  { label: "Search", path: "/search" },
-  { label: "Models", path: "/models" },
-  { label: "Orchestration", path: "/orchestration" },
-  { label: "Auto-review", path: "/auto-review" },
-  { label: "Skills", path: "/skills" },
-  { label: "Insights", path: "/insights" },
-  { label: "Proposals", path: "/proposals" },
-  { label: "Manual review", path: "/adjudicate" },
+  { label: "Command deck", path: "/" },
+  { label: "Command floor", path: "/floor" },
+  { label: "Active missions", path: "/sessions" },
+  { label: "Trace search", path: "/search" },
+  { label: "Model systems", path: "/models" },
+  { label: "Sector map", path: "/orchestration" },
+  { label: "Signal review", path: "/auto-review" },
+  { label: "Crew skills", path: "/skills" },
+  { label: "Intel reports", path: "/insights" },
+  { label: "Council proposals", path: "/proposals" },
+  { label: "Council review", path: "/adjudicate" },
 ];
 
 export function CommandPalette({

@@ -13,12 +13,12 @@ import {
 } from "@/lib/api";
 import { PanelCard } from "@/components/ui/card";
 import { EmptyState } from "@/components/EmptyState";
-import { LoadingOrb } from "@/components/LoadingOrb";
+import { DiagnosticLoader } from "@/components/DiagnosticLoader";
 import { HarnessTag, ModelBadge, RuntimeHarnessLabel } from "@/components/ui/badges";
 import { cn, formatDuration, formatFullTime, harnessColor } from "@/lib/utils";
 import { useViewShortcuts } from "@/lib/keyboard";
 import { isWorkerTreeNode, projectBranchTree, sessionTreeLabel } from "@/lib/sessionTree";
-import { LiveOrb } from "@/components/LiveOrb";
+import { AgentStatusMark } from "@/components/command-grid/AgentStatusMark";
 import { useIngestStream } from "@/lib/useIngestStream";
 import { useLivePresence } from "@/lib/useLivePresence";
 import {
@@ -303,7 +303,7 @@ export function Sessions() {
   );
 
   if (list.isLoading) {
-    return <LoadingOrb label="Reading sessions" />;
+    return <DiagnosticLoader label="Reading sessions" />;
   }
   if (list.isError || !list.data) {
     return (
@@ -324,11 +324,12 @@ export function Sessions() {
   const facetsPending = !facets.data && facets.isFetching;
 
   return (
-    <div className="space-y-3">
-      <div className="flex flex-wrap items-end justify-between gap-2">
+    <div className="mission-view space-y-3">
+      <div className="command-page-head">
         <div>
-          <h1 className="text-[18px] font-semibold tracking-tight">Sessions</h1>
-          <p className="mt-0.5 text-[11px] text-faint-foreground">
+          <div className="command-page-head__eyebrow">conversation roots · full branch counts</div>
+          <h1>Active missions</h1>
+          <p>
             {list.data.note}
           </p>
         </div>
@@ -342,7 +343,7 @@ export function Sessions() {
         </div>
       </div>
 
-      <div className="rounded-card border border-border bg-card p-3">
+      <div className="mission-filters">
         <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-6">
           <FacetSelect
             label="Harness"
@@ -420,7 +421,7 @@ export function Sessions() {
       </div>
 
       <PanelCard
-        title="Conversations"
+        title="Mission roster · Sessions"
         aside={`${cursor + 1}–${Math.min(cursor + items.length, list.data.total)} of ${list.data.total.toLocaleString()}`}
       >
         {items.length === 0 ? (
@@ -432,7 +433,7 @@ export function Sessions() {
           </div>
         ) : (
           <div className="overflow-x-auto">
-            <table className="w-full text-left text-[12px]">
+            <table className="mission-table w-full text-left text-[12px]">
               <thead>
                 <tr className="microlabel border-b border-border text-[10px] text-faint-foreground">
                   <SortTh label="Activity" col="started_at" sort={sort} order={order} onClick={toggleSort} first />
@@ -514,10 +515,8 @@ export function Sessions() {
                             </span>
                             {live ? (
                               <span className="inline-flex items-center gap-1 text-[10px] text-accent-live">
-                                <LiveOrb
+                              <AgentStatusMark
                                   state={live.state}
-                                  harnessColor={harnessColor(live.logical_harness || live.harness)}
-                                  size={15}
                                   worker={live.role === "worker"}
                                   title={syncing ? "Transcript syncing" : live.activity || live.state}
                                 />

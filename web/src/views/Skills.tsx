@@ -2,7 +2,7 @@ import { useOutletContext } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { fetchSkills } from "@/lib/api";
 import { EmptyState } from "@/components/EmptyState";
-import { LoadingOrb } from "@/components/LoadingOrb";
+import { DiagnosticLoader } from "@/components/DiagnosticLoader";
 import { Card, CardTitle, PanelCard } from "@/components/ui/card";
 import { MicroBars } from "@/components/ui/spark";
 import { formatDay } from "@/lib/utils";
@@ -33,7 +33,7 @@ export function Skills() {
   }));
 
   if (q.isLoading) {
-    return <LoadingOrb label="Reading skills" />;
+    return <DiagnosticLoader label="Reading skills" />;
   }
   if (!q.data) {
     return (
@@ -50,7 +50,7 @@ export function Skills() {
   return (
     <div className="space-y-3">
       <div className="flex items-baseline justify-between">
-        <h1 className="text-[18px] font-semibold tracking-tight">Skills</h1>
+        <h1 className="text-[18px] font-semibold tracking-tight">Crew skills</h1>
         <span className="text-[12px] text-faint-foreground">
           exposure counts are descriptive — not effectiveness scores
         </span>
@@ -101,7 +101,7 @@ export function Skills() {
         </Card>
       </div>
 
-      <PanelCard title="Activation table" aside={`${items.length} skills`}>
+      <PanelCard title="Capability registry · Activation table" aside={`${items.length} skills`}>
         {items.length === 0 ? (
           <div className="p-4">
             <EmptyState

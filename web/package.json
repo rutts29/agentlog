@@ -6,7 +6,10 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "migrate:command-grid": "node scripts/migrate-command-grid.mjs",
+    "test:contracts": "node --test tests/*.test.mjs",
+    "verify:command-grid": "npm run migrate:command-grid && npm run test:contracts && npm run build && node scripts/verify-command-grid.mjs"
   },
   "dependencies": {
     "@fontsource-variable/inter": "^5.3.0",
@@ -17,12 +20,10 @@
     "@tanstack/react-query": "^5.66.9",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
-    "d3-force-3d": "^3.0.6",
     "date-fns": "^4.1.0",
     "lucide-react": "^0.475.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "react-force-graph-2d": "^1.29.1",
     "react-router-dom": "^7.18.3",
     "recharts": "^2.15.1",
     "tailwind-merge": "^2.6.0"

@@ -1,4 +1,4 @@
-import { Link, useNavigate, useOutletContext, useSearchParams } from "react-router-dom";
+import { Link, useOutletContext, useSearchParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import {
   fetchOrchestration,
@@ -8,19 +8,20 @@ import {
   type TreeNode,
 } from "@/lib/api";
 import { EmptyState } from "@/components/EmptyState";
-import { LoadingOrb } from "@/components/LoadingOrb";
+import { DiagnosticLoader } from "@/components/DiagnosticLoader";
+import { SectorMap } from "@/components/command-grid/SectorMap";
 import { Card, CardTitle, PanelCard } from "@/components/ui/card";
 import { Kpi } from "@/components/ui/kpi";
 import { HarnessTag, ModelBadge, RuntimeHarnessLabel } from "@/components/ui/badges";
 import { cn, formatDayTime, harnessColor } from "@/lib/utils";
 import { rangeViewQueryOptions } from "@/lib/viewQueries";
+import { overviewGraphQueryOptions } from "@/lib/overviewQueries";
 
 type Ctx = { range: string };
 
 export function Orchestration() {
   const { range } = useOutletContext<Ctx>();
   const [params, setParams] = useSearchParams();
-  const navigate = useNavigate();
   const root = params.get("root");
 
   const overview = useQuery(rangeViewQueryOptions({
@@ -32,9 +33,10 @@ export function Orchestration() {
     queryFn: ({ signal }) => fetchSessionTree(root!, signal),
     enabled: Boolean(root),
   });
+  const graph = useQuery(overviewGraphQueryOptions(range));
 
   if (overview.isLoading) {
-    return <LoadingOrb label="Mapping orchestration" />;
+    return <DiagnosticLoader label="Mapping orchestration" />;
   }
   if (overview.isError || !overview.data) {
     return (
@@ -50,27 +52,31 @@ export function Orchestration() {
   const signals = data.signals;
 
   return (
-    <div className="space-y-3">
-      <div className="flex items-baseline justify-between">
-        <h1 className="text-[18px] font-semibold tracking-tight">Orchestration</h1>
-        <span className="text-[12px] text-faint-foreground">
-          supervisor → worker structure from parent_session_id
-        </span>
+    <div className="sector-view space-y-3">
+      <div className="command-page-head">
+        <div>
+          <div className="command-page-head__eyebrow">verified parent_session_id lineage</div>
+          <h1>Sector map</h1>
+          <p>Coordinator roots, spawned workers, handoffs, and runtime lineage.</p>
+        </div>
+        <span className="text-[11px] text-faint-foreground">Orchestration · canonical view</span>
       </div>
 
-      <div className="grid grid-cols-5 gap-3">
-        <Kpi title="Supervisor roots" value={data.supervisor_roots} sub="sessions with children" />
-        <Kpi title="Child sessions" value={data.child_sessions} sub="spawned workers" />
-        <Kpi title="Worker briefs" value={signals.worker_brief ?? 0} sub="classified request kind" />
+      <div className="grid grid-cols-2 gap-2 md:grid-cols-5">
+        <Kpi title="Coordinator roots" value={data.supervisor_roots} sub="sessions with workers" />
+        <Kpi title="Familiar sessions" value={data.child_sessions} sub="spawned workers" />
+        <Kpi title="Crew briefs" value={signals.worker_brief ?? 0} sub="classified requests" />
         <Kpi title="Handoffs" value={signals.inter_agent_handoff ?? 0} sub="inter-agent" />
-        <Kpi title="Task notifications" value={signals.task_notification ?? 0} sub="harness-synthetic" />
+        <Kpi title="Task signals" value={signals.task_notification ?? 0} sub="harness-synthetic" />
       </div>
 
-      <div className="grid grid-cols-5 items-start gap-3">
+      {graph.data ? <SectorMap data={graph.data} search={new URLSearchParams({ range }).toString()} /> : graph.isLoading ? <DiagnosticLoader label="Mapping sectors" compact rows={3} /> : null}
+
+      <div className="grid grid-cols-1 items-start gap-3 lg:grid-cols-5">
         <PanelCard
-          title="Supervisors"
+          title="Coordinators"
           aside={`${data.items.length} shown`}
-          className="col-span-2"
+          className="lg:col-span-2"
         >
           {data.items.length === 0 ? (
             <div className="p-4">
@@ -107,7 +113,7 @@ export function Orchestration() {
                     <span className="flex items-baseline gap-1.5">
                       <span className="display-md display-ink">{item.child_count}</span>
                       <span className="microlabel text-[9px] text-faint-foreground">
-                        {item.child_count === 1 ? "child" : "children"}
+                        {item.child_count === 1 ? "familiar" : "familiars"}
                       </span>
                     </span>
                   </div>
@@ -122,28 +128,15 @@ export function Orchestration() {
                       {formatDayTime(item.started_at)}
                     </span>
                   </div>
-                  <div className="mt-1">
-                    <span
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        const p = new URLSearchParams(params);
-                        p.delete("root");
-                        p.set("focus", item.id);
-                        navigate({ pathname: "/", search: p.toString() });
-                      }}
-                      className="cursor-pointer text-[10px] text-faint-foreground hover:text-foreground"
-                    >
-                      open in graph →
-                    </span>
-                  </div>
+                  <div className="mt-1 text-[10px] text-faint-foreground">select to inspect lineage →</div>
                 </button>
               ))}
             </div>
           )}
         </PanelCard>
 
-        <Card className="col-span-3">
-          <CardTitle>Tree</CardTitle>
+        <Card className="lg:col-span-3">
+          <CardTitle>Lineage</CardTitle>
           {!root ? (
             <div className="mt-3">
               <EmptyState

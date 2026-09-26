@@ -3,7 +3,7 @@ import { Link, useOutletContext } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { fetchInsights, type InsightCard } from "@/lib/api";
 import { EmptyState } from "@/components/EmptyState";
-import { LoadingOrb } from "@/components/LoadingOrb";
+import { DiagnosticLoader } from "@/components/DiagnosticLoader";
 import { rangeViewQueryOptions } from "@/lib/viewQueries";
 
 type Ctx = { range: string };
@@ -84,7 +84,7 @@ export function Insights() {
   }));
 
   if (q.isLoading) {
-    return <LoadingOrb label="Reading insights" />;
+    return <DiagnosticLoader label="Reading insights" />;
   }
   if (!q.data) {
     return (
@@ -102,7 +102,7 @@ export function Insights() {
   return (
     <div className="space-y-8">
       <div>
-        <h1 className="text-[22px] font-semibold tracking-tight">Insights</h1>
+        <h1 className="text-[22px] font-semibold tracking-tight">Intel reports</h1>
         <p className="mt-1 max-w-[58ch] text-[13px] leading-relaxed text-muted-foreground">
           Notes for you — how you ran a session, and what to do differently next time.
         </p>

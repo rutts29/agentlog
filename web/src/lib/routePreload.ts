@@ -1,5 +1,6 @@
 export const viewLoaders = {
   "/": () => import("@/views/Overview"),
+  "/floor": () => import("@/views/CommandFloorView"),
   "/sessions": () => import("@/views/Sessions"),
   "/search": () => import("@/views/Search"),
   "/models": () => import("@/views/Models"),

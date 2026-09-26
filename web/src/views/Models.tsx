@@ -12,7 +12,7 @@ import {
 import { fetchModelMix, fetchModelMonthly, fetchTimeseries } from "@/lib/api";
 import { AggregatePanel } from "@/components/AggregatePanel";
 import { EmptyState } from "@/components/EmptyState";
-import { LoadingOrb } from "@/components/LoadingOrb";
+import { DiagnosticLoader } from "@/components/DiagnosticLoader";
 import { Card, CardTitle, PanelCard } from "@/components/ui/card";
 import { HarnessTag } from "@/components/ui/badges";
 import { Meter } from "@/components/ui/spark";
@@ -122,7 +122,7 @@ export function Models() {
   });
 
   if (mixQ.isLoading || monthlyQ.isLoading || byModelQ.isLoading) {
-    return <LoadingOrb label="Reading model activity" />;
+    return <DiagnosticLoader label="Reading model activity" />;
   }
   if (!mixQ.data || !monthlyQ.data || !byModelQ.data) {
     return (
@@ -186,7 +186,7 @@ export function Models() {
   return (
     <div className="space-y-3">
       <div className="flex items-baseline justify-between">
-        <h1 className="text-[18px] font-semibold tracking-tight">Models</h1>
+        <h1 className="text-[18px] font-semibold tracking-tight">Model systems</h1>
         <span className="max-w-xl text-right text-[12px] text-faint-foreground">
           assistant-turn model mix — describes usage, not which model is better
         </span>
@@ -311,7 +311,7 @@ export function Models() {
         </Card>
       </div>
 
-      <PanelCard title="Usage table" aside={`${data.items.length} models`}>
+      <PanelCard title="Model registry · Usage table" aside={`${data.items.length} models`}>
         <div className="overflow-x-auto">
           <table className="min-w-[720px] w-full text-left text-[12px]">
           <thead>

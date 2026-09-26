@@ -14,7 +14,7 @@ import {
 import { classifySpeaker } from "@/lib/speaker";
 import { useViewShortcuts } from "@/lib/keyboard";
 import { EmptyState } from "@/components/EmptyState";
-import { LoadingOrb } from "@/components/LoadingOrb";
+import { DiagnosticLoader } from "@/components/DiagnosticLoader";
 import { Card, CardTitle, PanelCard } from "@/components/ui/card";
 import { HarnessTag, ModelBadge } from "@/components/ui/badges";
 import { cn } from "@/lib/utils";
@@ -502,7 +502,7 @@ export function Adjudicate() {
   });
 
   if (queue.isLoading) {
-    return <LoadingOrb label="Checking escalations" />;
+    return <DiagnosticLoader label="Checking escalations" />;
   }
   if (queue.isError || !queue.data) {
     return (
@@ -517,7 +517,7 @@ export function Adjudicate() {
       <div className="space-y-3">
         <div className="flex items-baseline justify-between gap-3">
           <div>
-            <h1 className="text-[18px] font-semibold tracking-tight">Manual review</h1>
+            <h1 className="text-[18px] font-semibold tracking-tight">Council review</h1>
             <p className="mt-0.5 text-[12px] text-faint-foreground">
               Reserved for exceptional cases that need an explicit human decision
             </p>
@@ -536,7 +536,7 @@ export function Adjudicate() {
     );
   }
   if (taxonomy.isLoading) {
-    return <LoadingOrb label="Preparing review" />;
+    return <DiagnosticLoader label="Preparing review" />;
   }
   if (taxonomy.isError || !taxonomy.data) {
     return (
@@ -558,7 +558,7 @@ export function Adjudicate() {
     <div className="space-y-3">
       <div className="flex items-baseline justify-between gap-3">
         <div>
-          <h1 className="text-[18px] font-semibold tracking-tight">Manual review</h1>
+          <h1 className="text-[18px] font-semibold tracking-tight">Council review</h1>
           <p className="mt-0.5 text-[12px] text-faint-foreground">
             Escalated blind review — commit before the LLM answer is revealed
           </p>

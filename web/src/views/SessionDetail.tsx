@@ -15,7 +15,7 @@ import {
 } from "@/lib/api";
 import { CopyPath } from "@/components/CopyPath";
 import { EmptyState } from "@/components/EmptyState";
-import { LoadingOrb } from "@/components/LoadingOrb";
+import { DiagnosticLoader } from "@/components/DiagnosticLoader";
 import { Transcript } from "@/components/Transcript";
 import { Card, CardTitle, PanelCard } from "@/components/ui/card";
 import {
@@ -163,7 +163,7 @@ export function SessionDetail() {
   }, [messages]);
 
   if (q.isLoading) {
-    return <LoadingOrb label="Opening transcript" />;
+    return <DiagnosticLoader label="Opening transcript" />;
   }
   if (q.isError || !q.data) {
     return (
@@ -216,7 +216,7 @@ export function SessionDetail() {
           to={`/sessions${backSearch ? `?${backSearch}` : ""}`}
           className="text-[12px] text-muted-foreground hover:text-foreground"
         >
-          ← Sessions <kbd className="ml-1">esc</kbd>
+          ← Active missions <kbd className="ml-1">esc</kbd>
         </Link>
         {branchPath && branchPath.length > 1 ? (
           <BranchBreadcrumb path={branchPath} currentId={currentNavigationId} search={backSearch} />
@@ -278,7 +278,7 @@ export function SessionDetail() {
       <div className="grid grid-cols-1 items-start gap-3 lg:grid-cols-[minmax(0,1fr)_300px]">
         {/* Left: the transcript. */}
         <PanelCard
-          title="Transcript"
+          title="Holotrace · Transcript"
           aside={
             <span className="flex items-center gap-3">
               {SPEAKER_LEGEND.filter((s) => (speakerCounts.get(s.kind) ?? 0) > 0).map(
@@ -342,7 +342,7 @@ export function SessionDetail() {
         {/* Right: session anatomy, sticky. */}
         <div className="space-y-3 lg:sticky lg:top-0">
           <Card>
-            <CardTitle>Anatomy</CardTitle>
+            <CardTitle>Mission anatomy</CardTitle>
             <div className="mt-2 grid grid-cols-2 gap-x-3 gap-y-2">
               <Anat label="messages" value={anatomy.message_count} />
               <Anat label="tool calls" value={anatomy.tool_count} />
@@ -352,7 +352,7 @@ export function SessionDetail() {
 
             <div className="mt-4">
               <div className="microlabel text-[10px] text-faint-foreground">
-                Tool bursts across session
+                Tool packets across session
               </div>
               <div className="mt-1.5 flex h-9 items-end gap-px">
                 {buckets.map((b, i) => (

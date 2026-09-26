@@ -2,10 +2,11 @@ import { lazy, Suspense, type ReactNode } from "react";
 import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { AppShell } from "@/components/layout/AppShell";
-import { LoadingOrb } from "@/components/LoadingOrb";
+import { DiagnosticLoader } from "@/components/DiagnosticLoader";
 import { viewLoaders } from "@/lib/routePreload";
 
 const Overview = lazy(() => viewLoaders["/"]().then(({ Overview: view }) => ({ default: view })));
+const CommandFloorView = lazy(() => viewLoaders["/floor"]().then(({ CommandFloorView: view }) => ({ default: view })));
 const Sessions = lazy(() => viewLoaders["/sessions"]().then(({ Sessions: view }) => ({ default: view })));
 const SessionDetail = lazy(() => import("@/views/SessionDetail").then(({ SessionDetail: view }) => ({ default: view })));
 const Search = lazy(() => viewLoaders["/search"]().then(({ Search: view }) => ({ default: view })));
@@ -18,7 +19,7 @@ const Proposals = lazy(() => viewLoaders["/proposals"]().then(({ Proposals: view
 const Adjudicate = lazy(() => viewLoaders["/adjudicate"]().then(({ Adjudicate: view }) => ({ default: view })));
 
 function RouteLoader({ children }: { children: ReactNode }) {
-  return <Suspense fallback={<LoadingOrb label="Opening view" />}>{children}</Suspense>;
+  return <Suspense fallback={<DiagnosticLoader label="Opening view" />}>{children}</Suspense>;
 }
 
 const queryClient = new QueryClient({
@@ -37,6 +38,7 @@ export default function App() {
         <Routes>
           <Route element={<AppShell />}>
             <Route index element={<RouteLoader><Overview /></RouteLoader>} />
+            <Route path="floor" element={<RouteLoader><CommandFloorView /></RouteLoader>} />
             <Route path="sessions" element={<RouteLoader><Sessions /></RouteLoader>} />
             <Route path="sessions/:sessionId" element={<RouteLoader><SessionDetail /></RouteLoader>} />
             <Route path="search" element={<RouteLoader><Search /></RouteLoader>} />

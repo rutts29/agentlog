@@ -11,7 +11,7 @@ import {
 } from "recharts";
 import { fetchAutoReview } from "@/lib/api";
 import { EmptyState } from "@/components/EmptyState";
-import { LoadingOrb } from "@/components/LoadingOrb";
+import { DiagnosticLoader } from "@/components/DiagnosticLoader";
 import { Card, CardTitle, PanelCard } from "@/components/ui/card";
 import { Kpi } from "@/components/ui/kpi";
 import { HarnessTag, ModelBadge, StatusDot } from "@/components/ui/badges";
@@ -30,7 +30,7 @@ export function AutoReview() {
   }));
 
   if (q.isLoading) {
-    return <LoadingOrb label="Reading review signals" />;
+    return <DiagnosticLoader label="Reading review signals" />;
   }
   if (q.isError || !q.data) {
     return (
@@ -47,7 +47,7 @@ export function AutoReview() {
   return (
     <div className="space-y-3">
       <div className="flex items-baseline justify-between">
-        <h1 className="text-[18px] font-semibold tracking-tight">Auto-review</h1>
+        <h1 className="text-[18px] font-semibold tracking-tight">Signal review</h1>
         <span className="max-w-xl text-right text-[12px] text-faint-foreground">
           excluded from interaction-style metrics — listed as observed volume
         </span>
@@ -149,7 +149,7 @@ export function AutoReview() {
         </Card>
       </div>
 
-      <PanelCard title="Recent auto-review sessions" aside={`${data.items.length} shown`}>
+      <PanelCard title="Recent signal reviews · Auto-review" aside={`${data.items.length} shown`}>
         {data.items.length === 0 ? (
           <div className="p-4">
             <EmptyState

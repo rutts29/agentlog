@@ -9,7 +9,7 @@ import {
   type ProposalRow,
 } from "@/lib/api";
 import { EmptyState } from "@/components/EmptyState";
-import { LoadingOrb } from "@/components/LoadingOrb";
+import { DiagnosticLoader } from "@/components/DiagnosticLoader";
 import { CopyPath } from "@/components/CopyPath";
 import { cn } from "@/lib/utils";
 
@@ -286,7 +286,7 @@ export function Proposals() {
   return (
     <div className="mx-auto max-w-[720px] space-y-5">
       <div>
-        <h1 className="text-[22px] font-semibold tracking-tight">Proposals</h1>
+        <h1 className="text-[22px] font-semibold tracking-tight">Council proposals</h1>
         <p className="mt-1 max-w-[58ch] text-[13px] leading-relaxed text-muted-foreground">
           Standing rules for the agent. Nothing is written until you copy it in yourself.
         </p>
@@ -322,7 +322,7 @@ export function Proposals() {
       ) : null}
 
       {q.isLoading ? (
-        <LoadingOrb label="Reading proposals" compact />
+        <DiagnosticLoader label="Reading proposals" compact />
       ) : !q.data ? (
         <EmptyState
           title="Could not load proposals"
