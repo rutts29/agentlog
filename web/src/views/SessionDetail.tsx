@@ -40,6 +40,7 @@ import {
   sessionTreeQueryOptions,
 } from "@/lib/sessionQueries";
 import { useIngestStream } from "@/lib/useIngestStream";
+import { buildCommandReplay } from "@/lib/commandReplay";
 
 type Ctx = { range: string };
 type DetailSession = Awaited<ReturnType<typeof fetchSessionDetail>>["session"];
@@ -50,6 +51,7 @@ export function SessionDetail() {
   const [params] = useSearchParams();
   const queryClient = useQueryClient();
   const focus = params.get("msg");
+  const requestedReplayFrame = params.get("replayFrame");
   const currentDetailRef = useRef<{
     sessionId: string;
     session: DetailSession | undefined;
@@ -162,6 +164,19 @@ export function SessionDetail() {
     return [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8);
   }, [messages]);
 
+  const focusedReplayFrame = useMemo(() => {
+    if (!q.data || !focus) return null;
+    const frames = buildCommandReplay(q.data).frames;
+    const requestedFrameIndex = requestedReplayFrame == null
+      ? Number.NaN
+      : Number(requestedReplayFrame);
+    const requestedFrame = Number.isInteger(requestedFrameIndex)
+      ? frames[requestedFrameIndex]
+      : undefined;
+    if (requestedFrame?.messageId === focus) return requestedFrame;
+    return frames.find((frame) => frame.messageId === focus) ?? null;
+  }, [focus, q.data, requestedReplayFrame]);
+
   if (q.isLoading) {
     return <DiagnosticLoader label="Opening transcript" />;
   }
@@ -185,10 +200,17 @@ export function SessionDetail() {
   const backSearch = (() => {
     const p = new URLSearchParams(params);
     p.delete("msg");
+    p.delete("replayFrame");
     p.delete("root");
     return p.toString();
   })();
   const currentNavigationId = session.navigation_id ?? session.id;
+  const replaySearch = new URLSearchParams({
+    range: params.get("range") ?? "24h",
+    mode: "replay",
+    session: currentNavigationId,
+  });
+  if (focusedReplayFrame) replaySearch.set("frame", String(focusedReplayFrame.index));
   const branchCount = Math.max(
     0,
     treeQuery.data?.tree.descendant_count ??
@@ -262,6 +284,13 @@ export function SessionDetail() {
           </span>
           <span className="text-faint-foreground">·</span>
           <span className="tabular">{formatDuration(session.duration_seconds)}</span>
+          <span className="text-faint-foreground">·</span>
+          <Link
+            to={`/floor?${replaySearch.toString()}`}
+            className="font-mono text-[11px] text-accent hover:text-accent/80"
+          >
+            Replay on command floor →
+          </Link>
         </div>
       </div>
 

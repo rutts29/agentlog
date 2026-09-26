@@ -402,13 +402,13 @@ export function fetchProjects(range: string) {
   }>("/api/projects", { range });
 }
 
-export function fetchRecent(range: string, limit?: number) {
+export function fetchRecent(range: string, limit?: number, signal?: AbortSignal) {
   return getJson<{
     items: SessionRow[];
   }>("/api/sessions/recent", {
     range,
     limit: limit != null ? String(limit) : undefined,
-  });
+  }, signal);
 }
 
 export function fetchFacets(range: string, view?: "roots", signal?: AbortSignal) {

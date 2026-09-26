@@ -87,6 +87,12 @@ observe, deep-links to existing evidence, and can ship incrementally.
 5. Transcript, Sessions, and review surfaces.
 6. Historical replay and original production sprite assets.
 
+Historical replay is derived from the canonical session detail timeline. It
+reuses the same crew projection, moves the stable actor between observed work
+stations, and links each replay frame back to its source Holotrace message.
+Tool success, failure, action, and duration stay explicit; replay never invents
+unobserved workers.
+
 ## Non-negotiable behavior
 
 - No parser or database contract changes for visual convenience.
@@ -95,4 +101,3 @@ observe, deep-links to existing evidence, and can ship incrementally.
 - No invented activity, specialty, lineage, success, or failure state.
 - Loading preserves final layout and never uses the retired orbital capsule.
 - Motion communicates observed work and stops when work stops.
-

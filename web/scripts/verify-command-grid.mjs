@@ -23,6 +23,7 @@ const pkg = JSON.parse(fs.readFileSync(path.join(webRoot, "package.json"), "utf8
 
 for (const required of [
   "src/lib/commandFloor.ts",
+  "src/lib/commandReplay.ts",
   "src/views/CommandFloorView.tsx",
   "src/components/command-grid/CommandFloor.tsx",
   "src/components/command-grid/CrewSprite.tsx",
@@ -55,6 +56,7 @@ for (const label of [
   "Sector map",
   "Council review",
   "Holotrace · Transcript",
+  "source-backed historical projection",
 ]) {
   assert.ok(source.includes(label), `missing approved interface label: ${label}`);
 }
@@ -66,4 +68,3 @@ if (fs.existsSync(distAssets)) {
 }
 
 console.log(`Command Grid contract verified across ${sourceFiles.length} source files.`);
-

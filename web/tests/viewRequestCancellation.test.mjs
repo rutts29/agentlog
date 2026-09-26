@@ -7,6 +7,7 @@ import {
   fetchAdjudicationTaxonomy,
   fetchInsights,
   fetchProposals,
+  fetchRecent,
 } from "../src/lib/api.ts";
 
 globalThis.window = { location: { origin: "http://127.0.0.1" } };
@@ -28,8 +29,9 @@ test("analysis view requests preserve the cancellation signal", async (t) => {
     fetchAdjudicationQueue(false, controller.signal),
     fetchAdjudicationTaxonomy(controller.signal),
     fetchAdjudicationReport(controller.signal),
+    fetchRecent("24h", 20, controller.signal),
   ]);
 
-  assert.equal(signals.length, 5);
+  assert.equal(signals.length, 6);
   assert.ok(signals.every((signal) => signal === controller.signal));
 });
