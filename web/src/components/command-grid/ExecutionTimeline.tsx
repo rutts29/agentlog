@@ -1,6 +1,6 @@
 import { callsignForActor, type CommandFloorProjection } from "@/lib/commandFloor";
-import type { MissionFrame, MissionReplay } from "@/lib/missionReplay";
-import { formatDayTime } from "@/lib/utils";
+import { missionActorName, type MissionFrame, type MissionReplay } from "@/lib/missionReplay";
+import { formatDayTime, formatDuration } from "@/lib/utils";
 
 type Lane = {
   actorId: string;
@@ -8,13 +8,34 @@ type Lane = {
   score: number;
 };
 
-type FrameCluster = {
+type ActivityPhase = {
   id: string;
   frames: MissionFrame[];
   representative: MissionFrame;
+  label: string;
   kind: MissionFrame["kind"];
   outcome: MissionFrame["outcome"];
+  start: number;
+  end: number;
 };
+
+export type ExecutionPhaseSelection = {
+  actorId: string;
+  label: string;
+  representativeIndex: number;
+  startSeq: number;
+  endSeq: number;
+  startedAt: string | null;
+  endedAt: string | null;
+  eventCount: number;
+  toolEventCount: number;
+  outcome: MissionFrame["outcome"];
+  models: string[];
+};
+
+const PHASE_GAP_MS = 45_000;
+const TOOL_BURST_GAP_MS = 25_000;
+const MAX_PHASES_PER_LANE = 10;
 
 function timestamp(frame: MissionFrame, fallback: number): number {
   const value = frame.timestamp ? Date.parse(frame.timestamp) : Number.NaN;
@@ -26,7 +47,7 @@ function timelineWindow(replay: MissionReplay, frameIndex: number) {
   const currentAt = current?.timestamp ? Date.parse(current.timestamp) : Number.NaN;
   let frames: MissionFrame[] = [];
   if (Number.isFinite(currentAt)) {
-    for (const horizon of [15, 60]) {
+    for (const horizon of [5, 15, 60]) {
       const radius = horizon * 60 * 1_000;
       frames = replay.frames.filter((frame) => {
         if (!frame.timestamp) return false;
@@ -48,16 +69,6 @@ function timelineWindow(replay: MissionReplay, frameIndex: number) {
   return { frames, start, end: Math.max(start + 1, end) };
 }
 
-function blockPosition(frame: MissionFrame, localIndex: number, count: number, start: number, end: number) {
-  const at = timestamp(frame, start + localIndex);
-  const left = Math.max(0, Math.min(99, ((at - start) / (end - start)) * 100));
-  const durationWidth = frame.durationMs && frame.durationMs > 0
-    ? (frame.durationMs / (end - start)) * 100
-    : 0;
-  const clusterWidth = count > 1 ? Math.min(12, 2.4 + Math.log2(count) * 1.5) : 0;
-  return { left, width: Math.max(frame.kind === "tool" ? 1.8 : 0.8, clusterWidth, Math.min(24, durationWidth)) };
-}
-
 function lanePriority(frame: MissionFrame): number {
   if (frame.kind === "tool") return 4;
   if (frame.kind === "human") return 3;
@@ -65,72 +76,176 @@ function lanePriority(frame: MissionFrame): number {
   return 1;
 }
 
-function clusterFrames(frames: MissionFrame[], start: number, end: number): FrameCluster[] {
-  const bucketMs = Math.max(1_000, (end - start) / 48);
-  const buckets = new Map<number, MissionFrame[]>();
-  frames.forEach((frame, index) => {
-    const at = timestamp(frame, start + index);
-    const bucket = Math.floor((at - start) / bucketMs);
-    const values = buckets.get(bucket) ?? [];
-    values.push(frame);
-    buckets.set(bucket, values);
-  });
-  return [...buckets.entries()].map(([bucket, values]) => {
-    const failure = values.find((frame) => frame.outcome === "failure");
-    const human = values.find((frame) => frame.kind === "human");
-    const tool = values.find((frame) => frame.kind === "tool");
-    const representative = failure ?? human ?? tool ?? values[values.length - 1];
+function activityLabel(frame: MissionFrame): string {
+  const text = `${frame.tool ?? ""} ${frame.operationKind ?? ""} ${frame.action ?? ""} ${frame.context ?? ""} ${frame.detail}`.toLowerCase();
+  if (/pytest|vitest|jest|cargo test|go test|npm test|run_tests|\btests?\b/.test(text)) return "Run tests";
+  if (/apply_patch|\bpatch\b|\bedit(?:ed|ing)?\b|\bwrite(?:s|ing)?\b/.test(text)) return "Edit files";
+  if (/git diff|\breview(?:ed|ing)?\b|\baudit\b/.test(text)) return "Review changes";
+  if (/read_file|ripgrep|\bgrep\b|\bsearch\b|\binspect(?:ed|ing)?\b|\bfind\b/.test(text)) return "Inspect files";
+  if (/spawn_agent|\bspawn\b|\bfork\b|\bdelegate\b/.test(text)) return "Deploy worker";
+  if (/wait_agent|\bwait(?:ed|ing)?\b/.test(text)) return "Await worker";
+  if (/\bjs\b|browser|playwright|computer use/.test(text)) return "UI automation";
+  if (/exec|command|shell|terminal|stdin/.test(text)) return "Shell work";
+  switch (frame.kind) {
+    case "human": return "Human command";
+    case "agent": return "Agent update";
+    case "spawn": return "Deploy worker";
+    case "complete": return "Worker returned";
+    case "context": return "Task brief";
+    case "system": return "Runtime context";
+    case "tool": return frame.tool?.replaceAll("_", " ") || "Tool work";
+  }
+}
+
+function operationalFrames(frames: MissionFrame[]): MissionFrame[] {
+  const primary = frames.filter((frame) =>
+    frame.kind === "tool" ||
+    frame.kind === "human" ||
+    frame.kind === "spawn" ||
+    frame.kind === "complete",
+  );
+  if (primary.length > 0) return primary;
+  return frames.filter((frame) => frame.kind === "agent" || frame.kind === "context");
+}
+
+function phaseOutcome(frames: MissionFrame[]): MissionFrame["outcome"] {
+  if (frames.some((frame) => frame.outcome === "failure")) return "failure";
+  if (frames.some((frame) => frame.outcome === "success")) return "success";
+  return "unknown";
+}
+
+function dominantActivityLabel(frames: MissionFrame[]): string {
+  const counts = new Map<string, number>();
+  for (const frame of frames) {
+    const label = activityLabel(frame);
+    counts.set(label, (counts.get(label) ?? 0) + 1);
+  }
+  return [...counts.entries()]
+    .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))[0]?.[0] ?? "Tool work";
+}
+
+function collapseToolBursts(phases: ActivityPhase[]): ActivityPhase[] {
+  const collapsed: ActivityPhase[] = [];
+  for (const phase of phases) {
+    const previous = collapsed[collapsed.length - 1];
+    if (
+      previous &&
+      previous.kind === "tool" &&
+      phase.kind === "tool" &&
+      phase.start - previous.end <= TOOL_BURST_GAP_MS
+    ) {
+      previous.frames.push(...phase.frames);
+      previous.end = Math.max(previous.end, phase.end);
+      previous.label = dominantActivityLabel(previous.frames);
+      previous.outcome = phaseOutcome(previous.frames);
+      const failure = previous.frames.find((frame) => frame.outcome === "failure");
+      previous.representative = failure ?? previous.frames[previous.frames.length - 1];
+      continue;
+    }
+    collapsed.push(phase);
+  }
+  return collapsed;
+}
+
+function activityPhases(frames: MissionFrame[]): ActivityPhase[] {
+  const phases: ActivityPhase[] = [];
+  for (const frame of operationalFrames(frames)) {
+    const at = timestamp(frame, frame.index);
+    const label = activityLabel(frame);
+    const previous = phases[phases.length - 1];
+    const lifecycleBoundary = frame.kind === "spawn" || frame.kind === "complete";
+    if (
+      previous &&
+      !lifecycleBoundary &&
+      previous.kind !== "spawn" &&
+      previous.kind !== "complete" &&
+      previous.label === label &&
+      at - previous.end <= PHASE_GAP_MS
+    ) {
+      previous.frames.push(frame);
+      previous.end = Math.max(previous.end, at);
+      previous.representative = frame.outcome === "failure" ? frame : previous.representative;
+      previous.outcome = phaseOutcome(previous.frames);
+      continue;
+    }
+    phases.push({
+      id: `${frame.actorId}:${frame.index}`,
+      frames: [frame],
+      representative: frame,
+      label,
+      kind: frame.kind,
+      outcome: frame.outcome,
+      start: at,
+      end: at,
+    });
+  }
+  return collapseToolBursts(phases);
+}
+
+function focusedPhases(phases: ActivityPhase[], frameIndex: number): ActivityPhase[] {
+  if (phases.length <= MAX_PHASES_PER_LANE) return phases;
+  const active = Math.max(0, phases.findIndex((phase) =>
+    phase.frames.some((frame) => frame.index >= frameIndex),
+  ));
+  const before = Math.floor(MAX_PHASES_PER_LANE / 2);
+  const start = Math.max(0, Math.min(phases.length - MAX_PHASES_PER_LANE, active - before));
+  return phases.slice(start, start + MAX_PHASES_PER_LANE);
+}
+
+function phasePosition(phase: ActivityPhase, start: number, end: number) {
+  const left = Math.max(0, Math.min(98, ((phase.start - start) / (end - start)) * 100));
+  const recordedWidth = ((phase.end - phase.start) / (end - start)) * 100;
+  const contentWidth = Math.min(18, 5.5 + Math.log2(phase.frames.length + 1) * 1.4);
+  return { left, width: Math.max(4.5, recordedWidth, contentWidth) };
+}
+
+function phaseLayout(phases: ActivityPhase[], start: number, end: number): Map<string, { left: number; width: number }> {
+  const layout = phases.map((phase) => {
+    const position = phasePosition(phase, start, end);
+    const marker = phase.kind === "human" || phase.kind === "spawn" || phase.kind === "complete";
+    const width = marker ? position.width : Math.min(position.width, 24);
     return {
-      id: `${values[0].actorId}:${bucket}`,
-      frames: values,
-      representative,
-      kind: tool ? "tool" : human ? "human" : representative.kind,
-      outcome: failure ? "failure" : values.some((frame) => frame.outcome === "success") ? "success" : "unknown",
+      id: phase.id,
+      marker,
+      left: Math.min(position.left, 100 - width),
+      width,
     };
   });
+  const cards = layout.filter((item) => !item.marker);
+  for (let index = cards.length - 2; index >= 0; index -= 1) {
+    const current = cards[index];
+    const next = cards[index + 1];
+    const latestLeft = next.left - current.width - 0.7;
+    current.left = Math.max(0, Math.min(current.left, latestLeft));
+  }
+  return new Map(layout.map(({ id, left, width }) => [id, { left, width }]));
 }
 
-function compactToolName(tool: string): string {
-  const normalized = tool.toLowerCase();
-  if (/test|pytest|jest|vitest/.test(normalized)) return "tests";
-  if (/patch|edit|write/.test(normalized)) return "patch";
-  if (/read|search|grep|glob|find/.test(normalized)) return "inspect";
-  if (/spawn|fork|delegate/.test(normalized)) return "spawn";
-  if (/wait/.test(normalized)) return "wait";
-  if (/exec|command|shell|terminal|stdin/.test(normalized)) return "exec";
-  return tool.replaceAll("_", " ").slice(0, 12);
+function phaseMeta(phase: ActivityPhase): string {
+  const toolCalls = phase.frames.filter((frame) => frame.kind === "tool" && frame.action === "call").length;
+  const elapsedSeconds = Math.max(0, (phase.end - phase.start) / 1_000);
+  const duration = elapsedSeconds >= 1 ? formatDuration(elapsedSeconds) : null;
+  const count = toolCalls > 0
+    ? `${toolCalls} ${toolCalls === 1 ? "tool" : "tools"}`
+    : `${phase.frames.length} ${phase.frames.length === 1 ? "event" : "events"}`;
+  return duration ? `${count} · ${duration}` : count;
 }
 
-function clusterLabel(cluster: FrameCluster): string {
-  const semanticText = cluster.frames
-    .map((frame) => `${frame.tool ?? ""} ${frame.operationKind ?? ""} ${frame.action ?? ""} ${frame.context ?? ""} ${frame.detail}`)
-    .join(" ")
-    .toLowerCase();
-  if (/pytest|vitest|jest|cargo test|go test|npm test|run_tests|\btests?\b/.test(semanticText)) return "tests";
-  if (/apply_patch|\bpatch\b|\bedit(?:ed|ing)?\b|\bwrite(?:s|ing)?\b/.test(semanticText)) return "patch";
-  if (/git diff|\breview(?:ed|ing)?\b/.test(semanticText)) return "review";
-  if (/read_file|ripgrep|\bgrep\b|\bsearch\b|\binspect(?:ed|ing)?\b|\bfind\b/.test(semanticText)) return "inspect";
-  if (/spawn_agent|\bspawn\b|\bfork\b|\bdelegate\b/.test(semanticText)) return "spawn";
-  if (/wait_agent|\bwait(?:ed|ing)?\b/.test(semanticText)) return "wait";
-  const tools = cluster.frames
-    .map((frame) => frame.tool)
-    .filter((tool): tool is string => Boolean(tool));
-  if (tools.length > 0) {
-    const counts = new Map<string, number>();
-    for (const tool of tools) counts.set(tool, (counts.get(tool) ?? 0) + 1);
-    const dominant = [...counts.entries()].sort((left, right) => right[1] - left[1])[0]?.[0];
-    return dominant ? compactToolName(dominant) : "tool";
-  }
-  if (cluster.outcome === "failure") return "failed";
-  switch (cluster.kind) {
-    case "human": return "command";
-    case "agent": return "response";
-    case "spawn": return "spawn";
-    case "complete": return "returned";
-    case "context": return "brief";
-    case "system": return "system";
-    case "tool": return "tool";
-  }
+function phaseSelection(phase: ActivityPhase): ExecutionPhaseSelection {
+  const sequences = phase.frames.map((frame) => frame.seq);
+  return {
+    actorId: phase.representative.actorId,
+    label: phase.label,
+    representativeIndex: phase.representative.index,
+    startSeq: Math.min(...sequences),
+    endSeq: Math.max(...sequences),
+    startedAt: phase.frames[0]?.timestamp ?? null,
+    endedAt: phase.frames[phase.frames.length - 1]?.timestamp ?? null,
+    eventCount: phase.frames.length,
+    toolEventCount: phase.frames.filter((frame) => frame.kind === "tool").length,
+    outcome: phase.outcome,
+    models: [...new Set(phase.frames.map((frame) => frame.model).filter((model): model is string => Boolean(model)))],
+  };
 }
 
 export function ExecutionTimeline({
@@ -139,6 +254,7 @@ export function ExecutionTimeline({
   frameIndex,
   selectedActorId,
   onSelectFrame,
+  onSelectPhase,
   heading = "Execution timeline",
   description = "recorded multi-agent events",
 }: {
@@ -147,6 +263,7 @@ export function ExecutionTimeline({
   frameIndex: number;
   selectedActorId: string | null;
   onSelectFrame: (index: number) => void;
+  onSelectPhase?: (phase: ExecutionPhaseSelection) => void;
   heading?: string;
   description?: string;
 }) {
@@ -158,6 +275,16 @@ export function ExecutionTimeline({
     lane.score += lanePriority(frame);
     laneMap.set(frame.actorId, lane);
   }
+  const targetLaneCount = Math.min(6, replay.actors.length, 12);
+  if (laneMap.size < targetLaneCount) {
+    const additionalActors = [...replay.actors]
+      .filter((actor) => !laneMap.has(actor.id))
+      .sort((left, right) => left.depth - right.depth || right.tool_count - left.tool_count);
+    for (const actor of additionalActors) {
+      laneMap.set(actor.id, { actorId: actor.id, frames: [], score: 0 });
+      if (laneMap.size >= targetLaneCount) break;
+    }
+  }
   const requiredIds = new Set([replay.rootId, replay.frames[frameIndex]?.actorId, selectedActorId].filter((id): id is string => Boolean(id)));
   const lanes = [...laneMap.values()]
     .sort((left, right) => {
@@ -166,6 +293,8 @@ export function ExecutionTimeline({
       return rightRequired - leftRequired || right.score - left.score || left.actorId.localeCompare(right.actorId);
     })
     .slice(0, 12);
+  const phasesByActor = new Map(lanes.map((lane) => [lane.actorId, focusedPhases(activityPhases(lane.frames), frameIndex)]));
+  const visiblePhaseCount = [...phasesByActor.values()].reduce((total, phases) => total + phases.length, 0);
   const currentFrame = replay.frames[frameIndex];
   const currentAt = currentFrame ? timestamp(currentFrame, window.start) : window.start;
   const cursorLeft = Math.max(0, Math.min(100, ((currentAt - window.start) / (window.end - window.start)) * 100));
@@ -178,7 +307,7 @@ export function ExecutionTimeline({
     <section className="execution-timeline">
       <header className="execution-timeline__head">
         <div><span className="ops-panel__slash" aria-hidden />{heading} <small>{description}</small></div>
-        <span>{lanes.length} crew lanes · {window.frames.length} events in view</span>
+        <span>{lanes.length} crew lanes · {visiblePhaseCount} work phases</span>
       </header>
       <div className="execution-timeline__axis">
         <span>Crew</span>
@@ -188,33 +317,35 @@ export function ExecutionTimeline({
         {lanes.map((lane) => {
           const actor = projection.byId.get(lane.actorId);
           const meta = replay.actorById.get(lane.actorId);
-          const clusters = clusterFrames(lane.frames, window.start, window.end);
+          const phases = phasesByActor.get(lane.actorId) ?? [];
+          const layout = phaseLayout(phases, window.start, window.end);
           return (
             <div className="execution-lane" key={lane.actorId}>
               <div className="execution-lane__actor">
                 <strong>{actor?.callsign ?? callsignForActor(lane.actorId, (meta?.depth ?? 0) > 0)}</strong>
-                <small>{actor?.displayName ?? meta?.model ?? meta?.harness ?? "agent"}</small>
+                <small>{actor?.displayName ?? (meta ? missionActorName(meta) : "Agent")}</small>
               </div>
               <div className="execution-lane__track">
                 <span className="execution-lane__cursor" style={{ left: `${cursorLeft}%` }} />
-                {clusters.map((cluster, localIndex) => {
-                  const frame = cluster.representative;
-                  const position = blockPosition(frame, localIndex, cluster.frames.length, window.start, window.end);
-                  const toolNames = [...new Set(cluster.frames.map((item) => item.tool).filter((value): value is string => Boolean(value)))];
-                  const summary = cluster.frames.length > 1
-                    ? `${cluster.frames.length} events${toolNames.length > 0 ? ` · ${toolNames.slice(0, 3).join(", ")}` : ""}`
-                    : `${frame.title} · ${frame.detail}`;
+                {phases.length === 0 ? <span className="execution-lane__empty">No recorded work in this window</span> : null}
+                {phases.map((phase) => {
+                  const position = layout.get(phase.id) ?? phasePosition(phase, window.start, window.end);
+                  const summary = `${phase.label} · ${phaseMeta(phase)}`;
                   return (
                     <button
-                      key={cluster.id}
+                      key={phase.id}
                       type="button"
-                      className={`execution-block execution-block--${cluster.kind} execution-block--${cluster.outcome}`}
+                      className={`execution-block execution-block--${phase.kind} execution-block--${phase.outcome}`}
                       style={{ left: `${position.left}%`, width: `${position.width}%` }}
-                      onClick={() => onSelectFrame(frame.index)}
+                      onClick={() => {
+                        onSelectFrame(phase.representative.index);
+                        onSelectPhase?.(phaseSelection(phase));
+                      }}
                       title={summary}
                       aria-label={`${actor?.callsign ?? lane.actorId}: ${summary}`}
                     >
-                      {clusterLabel(cluster)}
+                      <strong>{phase.label}</strong>
+                      <small>{phaseMeta(phase)}</small>
                     </button>
                   );
                 })}
@@ -224,7 +355,7 @@ export function ExecutionTimeline({
         })}
       </div>
       {laneMap.size > lanes.length ? (
-        <div className="execution-timeline__overflow">+{laneMap.size - lanes.length} lower-activity lanes hidden in this window</div>
+        <div className="execution-timeline__overflow">+{laneMap.size - lanes.length} lower-activity lanes outside this window</div>
       ) : null}
     </section>
   );

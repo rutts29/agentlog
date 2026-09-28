@@ -8,6 +8,7 @@ from typing import Any
 
 
 INTERNAL_APPROVAL_GUARDIAN_THREAD_SOURCE = "internal_approval_guardian"
+GUARDIAN_REVIEW_THREAD_SOURCE = "guardian_review"
 GROK_BOOTSTRAP_ONLY_THREAD_SOURCE = "grok_bootstrap_only"
 GROK_AUTONOMOUS_AGENT_UNLINKED_THREAD_SOURCE = "autonomous_agent_unlinked"
 SUPPRESSED_ACTIVITY_THREAD_SOURCES = frozenset(

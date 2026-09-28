@@ -148,7 +148,9 @@ export function SessionDetail() {
   const modelsUsed = useMemo(() => {
     const counts = new Map<string, number>();
     for (const m of messages) {
-      if (m.model) counts.set(m.model, (counts.get(m.model) ?? 0) + 1);
+      if (m.model && !/^\(?unknown\)?$/i.test(m.model)) {
+        counts.set(m.model, (counts.get(m.model) ?? 0) + 1);
+      }
     }
     return [...counts.entries()].sort((a, b) => b[1] - a[1]);
   }, [messages]);
@@ -249,11 +251,18 @@ export function SessionDetail() {
               Worker
             </span>
           ) : null}
-          <ModelBadge
-            model={session.model}
-            harness={runtimeHarness(session)}
-            effort={session.effort}
-          />
+          {session.model && !/^\(?unknown\)?$/i.test(session.model) ? (
+            <ModelBadge
+              model={session.model}
+              harness={runtimeHarness(session)}
+              effort={session.effort}
+            />
+          ) : null}
+          {session.agent_profile ? (
+            <span className="inline-flex items-center rounded-[4px] border border-border px-1.5 py-[2px] font-mono text-[11px] leading-none text-muted-foreground">
+              profile: {session.agent_profile.replaceAll("-", " ")}{session.effort ? ` / ${session.effort}` : ""}
+            </span>
+          ) : null}
           <TranscriptStorageBadge
             storage={session.transcript_storage}
             sourceStatus={source?.status}
@@ -357,6 +366,9 @@ export function SessionDetail() {
               timeline={timeline}
               focusId={focus}
               isChildSession={isChildSession}
+              assistantIdentityFallback={session.agent_profile?.replaceAll("-", " ") ?? null}
+              sessionId={transcriptId}
+              range={params.get("range") ?? "24h"}
             />
           )}
           </div>
@@ -399,7 +411,9 @@ export function SessionDetail() {
               </div>
               <div className="mt-1 flex justify-between text-[10px] text-faint-foreground">
                 <span>start</span>
-                <span style={{ color: "var(--speaker-human)" }}>▂ human turn</span>
+                {(speakerCounts.get("human") ?? 0) > 0 ? (
+                  <span style={{ color: "var(--speaker-human)" }}>▂ human turn</span>
+                ) : null}
                 <span>end</span>
               </div>
             </div>
@@ -756,7 +770,8 @@ function BranchTree({
 function sourceWarningText(source: TranscriptSource | null): string | null {
   if (!source || source.status === "ready" || source.status === "legacy") return null;
   const prefix = source.status === "source_changed" ? "Source changed" : "Source unavailable";
-  return `${prefix}: ${source.warning ?? "the canonical transcript could not be read safely."}`;
+  const fallback = source.using_ledger_fallback ? " Showing the last indexed ledger copy." : "";
+  return `${prefix}.${fallback} ${source.warning ?? "The canonical transcript could not be read safely."}`;
 }
 
 function Anat({ label, value }: { label: string; value: number }) {

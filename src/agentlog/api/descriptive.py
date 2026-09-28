@@ -720,6 +720,8 @@ def _session_node_bases(
             "model": display_model(metric["model_canonical"]),
             "model_raw": metric["model"],
             "effort": metric["effort"],
+            "provider": metric["provider"],
+            "agent_profile": metric["agent_profile"],
             "project": _project_label(row["repo"], row["cwd"]),
             "started_at": row["started_at"],
             "ended_at": row["ended_at"],
@@ -1206,7 +1208,7 @@ def session_detail_v2(
             transcript = s
             transcript_id = resolved_id
 
-    messages = conn.execute(
+    ledger_messages = conn.execute(
         """
         SELECT id, seq, role, timestamp, model, model_canonical, effort, text,
                is_tool_plumbing, authored_by_agent
@@ -1215,8 +1217,25 @@ def session_detail_v2(
         (transcript_id,),
     ).fetchall()
     source_read = (source_reader or read_source_transcript)(conn, transcript_id)
-    if source_read.status != "legacy":
+    using_ledger_fallback = False
+    if source_read.status == "ready":
         messages = source_read.messages
+    else:
+        messages = ledger_messages
+        using_ledger_fallback = source_read.status != "legacy" and bool(ledger_messages)
+    latest_assistant_identity: tuple[str, str | None, str | None] | None = None
+    for message in reversed(messages):
+        if str(message["role"]) != "assistant":
+            continue
+        canonical = message["model_canonical"]
+        if not canonical:
+            continue
+        latest_assistant_identity = (
+            str(canonical),
+            str(message["model"]) if message["model"] else None,
+            str(message["effort"]) if message["effort"] else None,
+        )
+        break
     tools = conn.execute(
         """
         SELECT id, message_id, seq, tool_name, action, success, duration_ms,
@@ -1292,6 +1311,9 @@ def session_detail_v2(
 
     timeline: list[dict[str, Any]] = []
     for m in messages:
+        message_tools = tools_by_msg.get(m["id"], [])
+        if not str(m["text"] or "").strip() and not message_tools:
+            continue
         timeline.append(
             {
                 "kind": "message",
@@ -1311,7 +1333,7 @@ def session_detail_v2(
                 "authored_by_agent": bool(m["authored_by_agent"]),
                 "request_kind": kind_by_msg.get(m["id"]),
                 "skills": skills_by_msg.get(m["id"], []),
-                "tool_events": tools_by_msg.get(m["id"], []),
+                "tool_events": message_tools,
             }
         )
     for t in orphan_tools:
@@ -1351,6 +1373,7 @@ def session_detail_v2(
             "identity": source_read.source_identity,
             "hash": source_read.source_hash,
             "warning": source_read.warning,
+            "using_ledger_fallback": using_ledger_fallback,
         }
 
     return {
@@ -1361,9 +1384,25 @@ def session_detail_v2(
             "root_navigation_id": root_navigation_id,
             "harness": s["harness"],
             **projection,
-            "model": display_model(s["model_canonical"]),
-            "model_raw": s["model"],
-            "effort": s["effort"],
+            "model": display_model(
+                latest_assistant_identity[0]
+                if latest_assistant_identity is not None
+                else s["model_canonical"]
+            ),
+            "model_raw": (
+                latest_assistant_identity[1]
+                if latest_assistant_identity is not None
+                else s["model"]
+            ),
+            "effort": (
+                latest_assistant_identity[2]
+                if latest_assistant_identity is not None
+                and latest_assistant_identity[2] is not None
+                else s["effort"]
+            ),
+            "provider": s["provider"],
+            "agent_profile": s["agent_profile"],
+            "thread_source": s["thread_source"],
             "project": _project_label(s["repo"], s["cwd"]),
             "repo": s["repo"],
             "cwd": s["cwd"],
@@ -1834,7 +1873,9 @@ def mission_replay(
         f"""
         SELECT t.id, t.session_id, t.message_id, t.seq, t.tool_name,
                t.action, t.success, t.duration_ms, t.operation_kind,
-               m.timestamp AS message_timestamp, m.text AS message_text
+               m.timestamp AS message_timestamp, m.text AS message_text,
+               m.model AS message_model, m.model_canonical AS message_model_canonical,
+               m.effort AS message_effort
         FROM tool_events t
         LEFT JOIN messages m ON m.id = t.message_id
         WHERE t.session_id IN ({placeholders})
@@ -1927,6 +1968,12 @@ def mission_replay(
                 "success": row["success"],
                 "duration_ms": row["duration_ms"],
                 "operation_kind": row["operation_kind"],
+                "model": (
+                    display_model(row["message_model_canonical"])
+                    if (row["message_model"] or row["message_model_canonical"])
+                    else None
+                ),
+                "effort": row["message_effort"],
                 "source_message_id": row["message_id"],
             }
         )

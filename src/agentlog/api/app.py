@@ -29,6 +29,7 @@ from agentlog.api import (
     proposals as proposals_api,
     queries,
     skills as skills_api,
+    tool_trace as tool_trace_api,
     tokens,
     usage as usage_api,
 )
@@ -413,6 +414,23 @@ def create_app(
             raise HTTPException(status_code=404, detail="session not found")
         return replay
 
+    @app.get("/api/sessions/{session_id}/tool-trace")
+    def session_tool_trace(
+        session_id: str,
+        start_seq: int = Query(..., ge=0),
+        end_seq: int = Query(..., ge=0),
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> dict:
+        trace = tool_trace_api.tool_trace(
+            conn,
+            session_id,
+            start_seq=start_seq,
+            end_seq=end_seq,
+        )
+        if trace is None:
+            raise HTTPException(status_code=404, detail="session not found")
+        return trace
+
     @app.get("/api/sessions/{session_id}")
     def session(
         session_id: str,
@@ -538,6 +556,23 @@ def create_app(
         if replay is None:
             raise HTTPException(status_code=404, detail="session not found")
         return replay
+
+    @app.get("/api/sessions/{session_id:path}/tool-trace")
+    def session_tool_trace_path(
+        session_id: str,
+        start_seq: int = Query(..., ge=0),
+        end_seq: int = Query(..., ge=0),
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> dict:
+        trace = tool_trace_api.tool_trace(
+            conn,
+            session_id,
+            start_seq=start_seq,
+            end_seq=end_seq,
+        )
+        if trace is None:
+            raise HTTPException(status_code=404, detail="session not found")
+        return trace
 
     @app.get("/api/sessions/{session_id:path}")
     def session_path(

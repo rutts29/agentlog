@@ -115,6 +115,49 @@ test("identity and callsign are stable across activity changes", () => {
   assert.equal(building.workstation, "fabrication-bay");
 });
 
+test("every observed specialty reports to its matching work bay", () => {
+  const root = live({ state: "orchestrating", worker_count: 6 });
+  const cases = [
+    ["read_file", "researcher", "archive-owl", "archive-console"],
+    ["apply_patch", "builder", "builder-beetle", "fabrication-bay"],
+    ["pytest", "tester", "test-spider", "diagnostics-bay"],
+    ["review", "reviewer", "review-raven", "review-console"],
+    ["docker", "systems", "ops-crab", "server-rack"],
+    ["exec", "operator", "ops-crab", "server-rack"],
+  ];
+  const workers = cases.map(([tool], index) => live({
+    external_id: `worker-${index}`,
+    session_id: `codex:worker-${index}`,
+    source_path: `/sessions/subagents/worker-${index}.jsonl`,
+    state: "tool_running",
+    role: "worker",
+    parent_session_id: "codex:root-1",
+    tool,
+    activity: tool,
+  }));
+  const projection = projectCommandFloor([root, ...workers]);
+
+  cases.forEach(([, specialty, familiar, workstation], index) => {
+    const actor = projection.byId.get(`codex:worker-${index}`);
+    assert.equal(actor?.kind, "familiar");
+    if (actor?.kind !== "familiar") assert.fail("worker must project to familiar");
+    assert.equal(actor.specialty, specialty);
+    assert.equal(actor.familiar, familiar);
+    assert.equal(actor.workstation, workstation);
+  });
+  assert.equal(projection.byId.get("codex:root-1")?.workstation, "command-deck");
+});
+
+test("waiting and idle actors move to state-specific bays", () => {
+  const projection = projectCommandFloor([
+    live({ external_id: "waiting", session_id: "codex:waiting", state: "waiting" }),
+    live({ external_id: "idle", session_id: "codex:idle", state: "complete" }),
+  ]);
+
+  assert.equal(projection.byId.get("codex:waiting")?.workstation, "human-gate");
+  assert.equal(projection.byId.get("codex:idle")?.workstation, "standby");
+});
+
 test("unknown source and activity stay unknown", () => {
   const projection = projectCommandFloor([
     live({ state: "new-provider-state", source_snapshot_status: "other", tool: null }),

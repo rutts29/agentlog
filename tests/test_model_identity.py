@@ -85,6 +85,19 @@ class ModelIdentityResolveTests(unittest.TestCase):
             )
             self.assertTrue(is_known_non_model(raw))
 
+    def test_unregistered_future_models_pass_through_without_registry_edits(self) -> None:
+        for raw, provider in (
+            ("gpt-6-astra", "openai"),
+            ("gpt-7-research", "openai"),
+            ("claude-opus-6", "anthropic"),
+            ("grok-5-fast", "xai"),
+            ("gemini-4-pro", "google"),
+        ):
+            with self.subTest(raw=raw):
+                ident = resolve_model_identity(raw)
+                self.assertEqual(ident.canonical, raw.removesuffix("-fast"))
+                self.assertEqual(ident.provider, provider)
+
     def test_registry_covers_canonical_ids(self) -> None:
         for mid in (
             "gpt-5.5",

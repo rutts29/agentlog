@@ -5,6 +5,7 @@ import {
   buildMissionReplay,
   findMissionFrame,
   latestMissionFrameForActor,
+  missionActorName,
   projectMissionReplayFrame,
 } from "../src/lib/missionReplay.ts";
 
@@ -60,7 +61,7 @@ function payload() {
       { kind: "message", id: "root-human", actor_id: "codex:root", timestamp: "2026-09-26T10:00:05Z", seq: 1, role: "user", model: null, effort: null, text: "Run the mission", text_truncated: false, is_tool_plumbing: false, authored_by_agent: false, source_message_id: "root-human" },
       { kind: "lifecycle", phase: "spawn", id: "spawn:worker", actor_id: "codex:worker", timestamp: "2026-09-26T10:01:00Z", seq: -1 },
       { kind: "message", id: "worker-agent", actor_id: "codex:worker", timestamp: "2026-09-26T10:02:00Z", seq: 1, role: "assistant", model: "gpt-worker", effort: "medium", text: "Running tests", text_truncated: false, is_tool_plumbing: false, authored_by_agent: true, source_message_id: "worker-agent" },
-      { kind: "tool", id: "worker-tool", actor_id: "codex:worker", timestamp: "2026-09-26T10:02:01Z", time_evidence: "message", seq: 2, tool_name: "run_tests", action: "pytest -q", action_truncated: false, context: "Running the focused tests", context_truncated: false, success: 1, duration_ms: 4200, operation_kind: "execute", source_message_id: "worker-agent" },
+      { kind: "tool", id: "worker-tool", actor_id: "codex:worker", timestamp: "2026-09-26T10:02:01Z", time_evidence: "message", seq: 2, tool_name: "run_tests", action: "pytest -q", action_truncated: false, context: "Running the focused tests", context_truncated: false, success: 1, duration_ms: 4200, operation_kind: "execute", model: "gpt-7-review", effort: "high", source_message_id: "worker-agent" },
       { kind: "lifecycle", phase: "complete", id: "complete:worker", actor_id: "codex:worker", timestamp: "2026-09-26T10:05:00Z", seq: 999 },
       { kind: "lifecycle", phase: "complete", id: "complete:root", actor_id: "codex:root", timestamp: "2026-09-26T10:10:00Z", seq: 999 },
     ],
@@ -88,7 +89,9 @@ test("mission projection adds and removes familiars across recorded lifecycle", 
   assert.equal(beforeSpawn.operatorCount, 1);
   assert.equal(beforeSpawn.familiarCount, 0);
   assert.equal(duringTool.familiarCount, 1);
-  assert.equal(duringTool.actors.find((actor) => actor.kind === "familiar")?.workstation, "diagnostics-bay");
+  const activeWorker = duringTool.actors.find((actor) => actor.kind === "familiar");
+  assert.equal(activeWorker?.workstation, "diagnostics-bay");
+  assert.equal(activeWorker?.model, "gpt-7-review");
   assert.equal(afterReturn.familiarCount, 0);
 });
 
@@ -96,4 +99,15 @@ test("mission replay resolves exact cross-view frames and actor-local evidence",
   const replay = buildMissionReplay(payload());
   assert.equal(findMissionFrame(replay, "worker-agent", "codex:worker"), 3);
   assert.equal(latestMissionFrameForActor(replay, "codex:worker", 4)?.id, "worker-tool");
+});
+
+test("guardian and missing-model workers keep role labels instead of unknown model labels", () => {
+  const actor = {
+    ...payload().actors[1],
+    model: "(unknown)",
+    agent_profile: "codex-auto-review",
+    thread_source: "guardian_review",
+  };
+
+  assert.equal(missionActorName(actor), "Review familiar");
 });

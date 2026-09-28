@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-PARSER_VERSION = "16"
+PARSER_VERSION = "18"
 
 HOME = Path.home()
 DEFAULT_DB_PATH = HOME / ".agentlog" / "agentlog.db"

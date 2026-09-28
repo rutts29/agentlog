@@ -28,7 +28,7 @@ from agentlog.normalize.models import (
     TokenUsage,
     ToolEvent,
 )
-from agentlog.session_identity import INTERNAL_APPROVAL_GUARDIAN_THREAD_SOURCE
+from agentlog.session_identity import GUARDIAN_REVIEW_THREAD_SOURCE
 
 
 class StaticAdapter(TranscriptAdapter):
@@ -472,7 +472,7 @@ class ParserUpgradeRewriteTests(unittest.TestCase):
 
         artifact = self.repo.get_artifact_by_path(str(self.path))
         assert artifact is not None
-        self.assertEqual(artifact.parser_version, "16")
+        self.assertEqual(artifact.parser_version, PARSER_VERSION)
         self.assertEqual(
             [
                 (row["seq"], row["role"], row["content_hash"])
@@ -488,7 +488,7 @@ class ParserUpgradeRewriteTests(unittest.TestCase):
             ],
         )
 
-    def test_parser_upgrade_removes_internal_approval_guardian_activity(self) -> None:
+    def test_parser_upgrade_restores_guardian_activity_with_review_attribution(self) -> None:
         artifact_id, session_id = self._seed_old()
         self.path.write_text(
             "\n".join(
@@ -537,23 +537,29 @@ class ParserUpgradeRewriteTests(unittest.TestCase):
             self.conn.execute(
                 "SELECT thread_source FROM sessions WHERE id = ?", (session_id,)
             ).fetchone()["thread_source"],
-            INTERNAL_APPROVAL_GUARDIAN_THREAD_SOURCE,
+            GUARDIAN_REVIEW_THREAD_SOURCE,
         )
-        for table in (
-            "messages",
-            "tool_events",
-            "skill_exposures",
-            "token_usage",
-            "exchange_windows",
-        ):
-            with self.subTest(table=table):
-                self.assertEqual(
-                    self.conn.execute(
-                        f"SELECT COUNT(*) FROM {table} WHERE session_id = ?",
-                        (session_id,),
-                    ).fetchone()[0],
-                    0,
-                )
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM messages WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()[0],
+            1,
+        )
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT authored_by_agent FROM messages WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()[0],
+            1,
+        )
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM tool_events WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()[0],
+            1,
+        )
         artifact = self.repo.get_artifact_by_path(str(self.path))
         assert artifact is not None
         self.assertEqual(artifact.id, artifact_id)

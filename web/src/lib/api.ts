@@ -74,6 +74,8 @@ export type SessionIdentityFields = {
   workflow_group_id?: string | null;
   workflow_group_label?: string | null;
   workflow_group_position?: number | null;
+  provider?: string | null;
+  agent_profile?: string | null;
 };
 
 export type SessionIdentityLike = {
@@ -93,6 +95,7 @@ export type TranscriptSource = {
   identity?: string | null;
   hash?: string | null;
   warning?: string | null;
+  using_ledger_fallback?: boolean;
 };
 
 export type TranscriptStorage = "source_backed" | "legacy_materialized" | "materialized" | string;
@@ -151,6 +154,8 @@ export type SessionRow = SessionIdentityFields & {
   thread_source?: string | null;
   harness: string;
   model: string;
+  provider?: string | null;
+  agent_profile?: string | null;
   effort: string | null;
   project: string;
   repo?: string | null;
@@ -469,6 +474,7 @@ export type ToolEvent = {
   action: string | null;
   success: number | null;
   duration_ms: number | null;
+  operation_kind?: string | null;
 };
 
 export type TimelineMessage = {
@@ -690,6 +696,8 @@ export type MissionReplayActor = SessionIdentityFields & {
   harness: string;
   model: string | null;
   effort: string | null;
+  provider?: string | null;
+  agent_profile?: string | null;
   project: string;
   started_at: string | null;
   ended_at: string | null;
@@ -743,6 +751,8 @@ export type MissionReplayToolEvent = {
   success: number | null;
   duration_ms: number | null;
   operation_kind: string;
+  model: string | null;
+  effort: string | null;
   source_message_id: string | null;
 };
 
@@ -784,6 +794,54 @@ export function fetchMissionReplay(sessionId: string, signal?: AbortSignal) {
   return getJson<MissionReplayPayload>(
     `/api/sessions/${encodeURIComponent(sessionId)}/replay`,
     undefined,
+    signal,
+  );
+}
+
+export type ToolTraceItem = {
+  id: string;
+  call_id: string | null;
+  call_seq: number;
+  result_seq: number | null;
+  tool_name: string;
+  operation_kind: string;
+  timestamp: string | null;
+  result_timestamp: string | null;
+  message_id: string | null;
+  recorded_action: string;
+  model: string | null;
+  effort: string | null;
+  input: string | null;
+  input_truncated: boolean;
+  output: string | null;
+  output_truncated: boolean;
+  success: number | null;
+  duration_ms: number | null;
+};
+
+export type ToolTracePayload = {
+  session_id: string;
+  harness: string;
+  start_seq: number;
+  end_seq: number;
+  capture: {
+    source_backed: boolean;
+    detailed_items: number;
+    total_items: number;
+    note: string;
+  };
+  items: ToolTraceItem[];
+};
+
+export function fetchToolTrace(
+  sessionId: string,
+  startSeq: number,
+  endSeq: number,
+  signal?: AbortSignal,
+) {
+  return getJson<ToolTracePayload>(
+    `/api/sessions/${encodeURIComponent(sessionId)}/tool-trace`,
+    { start_seq: String(startSeq), end_seq: String(endSeq) },
     signal,
   );
 }
@@ -903,6 +961,9 @@ export type LiveSession = {
   /** Canonical root identity when this physical record belongs to T3. */
   logical_session_id?: string | null;
   logical_harness?: string | null;
+  model?: string | null;
+  effort?: string | null;
+  agent_profile?: string | null;
   source_path: string;
   state: PresenceState | string;
   last_activity_at: string | null;

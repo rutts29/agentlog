@@ -22,6 +22,7 @@ export type MissionFrameOutcome = "success" | "failure" | "unknown";
 export type MissionFrame = {
   id: string;
   index: number;
+  seq: number;
   actorId: string;
   kind: MissionFrameKind;
   timestamp: string | null;
@@ -32,6 +33,8 @@ export type MissionFrame = {
   context: string | null;
   durationMs: number | null;
   operationKind: string | null;
+  model: string | null;
+  effort: string | null;
   outcome: MissionFrameOutcome;
   messageId: string | null;
   timeEvidence: "recorded" | "message" | "session" | "unknown";
@@ -71,6 +74,7 @@ function messageFrame(event: MissionReplayMessageEvent): Omit<MissionFrame, "ind
     case "human":
       return {
         id: event.id,
+        seq: event.seq,
         actorId: event.actor_id,
         kind: "human",
         timestamp: event.timestamp,
@@ -81,6 +85,8 @@ function messageFrame(event: MissionReplayMessageEvent): Omit<MissionFrame, "ind
         context: null,
         durationMs: null,
         operationKind: null,
+        model: event.model,
+        effort: event.effort,
         outcome: "unknown",
         messageId: event.source_message_id,
         timeEvidence: event.timestamp ? "recorded" : "unknown",
@@ -88,6 +94,7 @@ function messageFrame(event: MissionReplayMessageEvent): Omit<MissionFrame, "ind
     case "assistant":
       return {
         id: event.id,
+        seq: event.seq,
         actorId: event.actor_id,
         kind: "agent",
         timestamp: event.timestamp,
@@ -98,6 +105,8 @@ function messageFrame(event: MissionReplayMessageEvent): Omit<MissionFrame, "ind
         context: null,
         durationMs: null,
         operationKind: null,
+        model: event.model,
+        effort: event.effort,
         outcome: "unknown",
         messageId: event.source_message_id,
         timeEvidence: event.timestamp ? "recorded" : "unknown",
@@ -107,6 +116,7 @@ function messageFrame(event: MissionReplayMessageEvent): Omit<MissionFrame, "ind
     case "skill":
       return {
         id: event.id,
+        seq: event.seq,
         actorId: event.actor_id,
         kind: "context",
         timestamp: event.timestamp,
@@ -117,6 +127,8 @@ function messageFrame(event: MissionReplayMessageEvent): Omit<MissionFrame, "ind
         context: null,
         durationMs: null,
         operationKind: null,
+        model: event.model,
+        effort: event.effort,
         outcome: "unknown",
         messageId: event.source_message_id,
         timeEvidence: event.timestamp ? "recorded" : "unknown",
@@ -125,6 +137,7 @@ function messageFrame(event: MissionReplayMessageEvent): Omit<MissionFrame, "ind
     case "tool":
       return {
         id: event.id,
+        seq: event.seq,
         actorId: event.actor_id,
         kind: "system",
         timestamp: event.timestamp,
@@ -135,6 +148,8 @@ function messageFrame(event: MissionReplayMessageEvent): Omit<MissionFrame, "ind
         context: null,
         durationMs: null,
         operationKind: null,
+        model: event.model,
+        effort: event.effort,
         outcome: "unknown",
         messageId: event.source_message_id,
         timeEvidence: event.timestamp ? "recorded" : "unknown",
@@ -147,6 +162,7 @@ function eventFrame(event: MissionReplayEvent): Omit<MissionFrame, "index"> {
   if (event.kind === "tool") {
     return {
       id: event.id,
+      seq: event.seq,
       actorId: event.actor_id,
       kind: "tool",
       timestamp: event.timestamp,
@@ -157,6 +173,8 @@ function eventFrame(event: MissionReplayEvent): Omit<MissionFrame, "index"> {
       context: event.context || null,
       durationMs: event.duration_ms,
       operationKind: event.operation_kind,
+      model: event.model,
+      effort: event.effort,
       outcome: event.success === 1 ? "success" : event.success === 0 ? "failure" : "unknown",
       messageId: event.source_message_id,
       timeEvidence: event.time_evidence,
@@ -164,6 +182,7 @@ function eventFrame(event: MissionReplayEvent): Omit<MissionFrame, "index"> {
   }
   return {
     id: event.id,
+    seq: event.seq,
     actorId: event.actor_id,
     kind: event.phase === "spawn" ? "spawn" : "complete",
     timestamp: event.timestamp,
@@ -174,6 +193,8 @@ function eventFrame(event: MissionReplayEvent): Omit<MissionFrame, "index"> {
     context: null,
     durationMs: null,
     operationKind: null,
+    model: null,
+    effort: null,
     outcome: event.phase === "complete" ? "success" : "unknown",
     messageId: null,
     timeEvidence: event.timestamp ? "recorded" : "unknown",
@@ -268,13 +289,14 @@ export function buildMissionReplay(payload: MissionReplayPayload): MissionReplay
 
 function actorFrameAt(replay: MissionReplay, actorId: string, frameIndex: number): MissionFrame | null {
   const indexes = replay.tracks.get(actorId) ?? [];
+  let fallback: MissionFrame | null = null;
   for (let index = indexes.length - 1; index >= 0; index -= 1) {
     const frame = replay.frames[indexes[index]];
-    if (frame.index <= frameIndex && frame.kind !== "spawn" && frame.kind !== "complete") {
-      return frame;
-    }
+    if (frame.index > frameIndex || frame.kind === "spawn" || frame.kind === "complete") continue;
+    fallback ??= frame;
+    if (frame.detail !== "No text captured") return frame;
   }
-  return null;
+  return fallback;
 }
 
 export function latestMissionFrameForActor(
@@ -285,12 +307,21 @@ export function latestMissionFrameForActor(
   return actorFrameAt(replay, actorId, frameIndex);
 }
 
-function actorName(actor: MissionReplayActor): string {
-  if (actor.depth === 0) return `${actor.project} coordinator`;
-  if (actor.workflow_group_label) return actor.workflow_group_label;
+export function missionActorName(actor: MissionReplayActor): string {
+  const meaningful = (value: string | null | undefined): string | null => {
+    const text = value?.trim();
+    return text && !/^\(?unknown\)?$/i.test(text) ? text : null;
+  };
+  const project = meaningful(actor.project) ?? "Unassigned mission";
+  if (actor.depth === 0) return `${project} coordinator`;
+  const workflow = meaningful(actor.workflow_group_label);
+  if (workflow) return workflow;
+  if (actor.agent_profile === "codex-auto-review" || actor.agent_profile === "guardian") return "Review familiar";
   if (actor.thread_source === "subagent") return "Subagent familiar";
+  if (/guardian|review/i.test(actor.thread_source ?? "")) return "Review familiar";
   if (actor.relationship === "agent_worker") return "Agent worker";
-  return `${actor.model || actor.logical_harness || actor.harness} familiar`;
+  const identity = meaningful(actor.model) ?? meaningful(actor.logical_harness) ?? meaningful(actor.harness);
+  return identity ? `${identity} familiar` : "Worker familiar";
 }
 
 function actorState(frame: MissionFrame | null, activeChildren: number): LiveSession["state"] {
@@ -330,11 +361,14 @@ export function projectMissionReplayFrame(
     .map((actor) => {
       const frame = actorFrameAt(replay, actor.id, frameIndex);
       const workerCount = activeChildren.get(actor.id) ?? 0;
-      const name = actorName(actor);
+      const name = missionActorName(actor);
       const activity = frame?.detail || (workerCount > 0 ? `${workerCount} linked workers active` : "Awaiting recorded activity");
       return {
         harness: actor.harness,
         harness_display: actor.logical_harness || actor.harness,
+        model: frame?.model || actor.model,
+        effort: frame?.effort || actor.effort,
+        agent_profile: actor.agent_profile,
         external_id: actor.id.split(":").slice(1).join(":"),
         session_id: actor.id,
         logical_session_id: actor.id,

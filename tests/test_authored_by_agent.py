@@ -13,7 +13,7 @@ from agentlog.db.schema import init_db
 from agentlog.ingest.claude import ClaudeAdapter
 from agentlog.ingest.codex import CodexAdapter
 from agentlog.ingest.cursor import CursorAdapter
-from agentlog.session_identity import INTERNAL_APPROVAL_GUARDIAN_THREAD_SOURCE
+from agentlog.session_identity import GUARDIAN_REVIEW_THREAD_SOURCE
 
 
 def _line(obj: dict) -> bytes:
@@ -379,7 +379,7 @@ class CodexSubagentAuthoredTests(unittest.TestCase):
         self.assertEqual(result.session.parent_session_id, "parent-1")
         self.assertFalse(result.messages[0].authored_by_agent)
 
-    def test_internal_approval_guardian_suppresses_activity(self) -> None:
+    def test_internal_approval_guardian_preserves_activity_with_review_attribution(self) -> None:
         data = b"".join(
             [
                 _line(
@@ -424,16 +424,64 @@ class CodexSubagentAuthoredTests(unittest.TestCase):
         self.assertEqual(result.session.agent_profile, "guardian")
         self.assertEqual(
             result.session.thread_source,
-            INTERNAL_APPROVAL_GUARDIAN_THREAD_SOURCE,
+            GUARDIAN_REVIEW_THREAD_SOURCE,
         )
-        self.assertEqual(result.messages, [])
-        self.assertEqual(result.tool_events, [])
+        self.assertEqual(len(result.messages), 1)
+        self.assertTrue(result.messages[0].authored_by_agent)
+        self.assertEqual(len(result.tool_events), 1)
         self.assertEqual(result.token_usages, [])
         self.assertEqual(result.skill_exposures, [])
-        self.assertEqual(
-            result.extras["activity_suppressed"],
-            "internal_approval_guardian",
+        self.assertTrue(result.extras["guardian_review"])
+
+    def test_new_guardian_source_shape_without_thread_source_is_suppressed(self) -> None:
+        data = b"".join(
+            [
+                _line(
+                    {
+                        "type": "session_meta",
+                        "payload": {
+                            "id": "child-new-guardian",
+                            "parent_thread_id": "parent-1",
+                            "source": {"subagent": {"other": "guardian"}},
+                        },
+                    }
+                ),
+                _line(
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": (
+                                        "The following is the Codex agent history added "
+                                        "since your last approval assessment. Continue the "
+                                        "same review conversation."
+                                    ),
+                                }
+                            ],
+                        },
+                    }
+                ),
+            ]
         )
+
+        result = CodexAdapter().parse_chunk(
+            Path("/tmp/rollout-child-new-guardian.jsonl"),
+            data,
+            start_offset=0,
+        )
+
+        self.assertEqual(result.session.agent_profile, "guardian")
+        self.assertEqual(
+            result.session.thread_source,
+            GUARDIAN_REVIEW_THREAD_SOURCE,
+        )
+        self.assertEqual(len(result.messages), 1)
+        self.assertTrue(result.messages[0].authored_by_agent)
+        self.assertTrue(result.extras["guardian_review"])
 
     def test_native_guardian_child_is_not_suppressed(self) -> None:
         data = b"".join(

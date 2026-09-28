@@ -84,3 +84,16 @@ test("developer messages are system", () => {
   assert.equal(speaker.kind, "system");
   assert.equal(speaker.label, "system");
 });
+
+test("guardian review history is context even when an older row lacks authorship metadata", () => {
+  const speaker = classifySpeaker({
+    role: "user",
+    text: "The following is the Codex agent history added since your last approval assessment. Continue the same review conversation.",
+    authored_by_agent: false,
+  });
+
+  assert.equal(speaker.kind, "synthetic");
+  assert.equal(speaker.label, "review packet");
+  assert.equal(speaker.detail, "guardian context");
+  assert.equal(speaker.collapsed, true);
+});

@@ -19,6 +19,7 @@ from agentlog.api.descriptive import (
 from agentlog.api.ranges import TimeRange, session_time_clause
 from agentlog.db.schema import connect, init_db
 from agentlog.session_identity import INTERNAL_APPROVAL_GUARDIAN_THREAD_SOURCE
+from agentlog.source_reader import SourceReadResult
 
 
 def _range(start: datetime | None = None) -> TimeRange:
@@ -938,6 +939,123 @@ class SessionsTreeBrowsingTests(unittest.TestCase):
             rows["codex:legacy"]["transcript_storage"], "legacy_materialized"
         )
         source_reader.assert_not_called()
+
+    def test_missing_source_falls_back_to_last_indexed_ledger_messages(self) -> None:
+        self.session(
+            "codex:missing-source",
+            external_id="missing-source",
+            transcript_storage="source_backed",
+        )
+        self.conn.execute(
+            """
+            INSERT INTO messages
+              (id, session_id, seq, role, text, content_hash)
+            VALUES ('cached-message', 'codex:missing-source', 1, 'assistant',
+                    'Last indexed answer', 'cached-message')
+            """
+        )
+        self.conn.commit()
+
+        detail = session_detail_v2(
+            self.conn,
+            "codex:missing-source",
+            source_reader=lambda _conn, _session_id: SourceReadResult(
+                "source_unavailable",
+                [],
+                warning="canonical source is missing",
+            ),
+        )
+
+        assert detail is not None
+        self.assertEqual(detail["timeline"][0]["text"], "Last indexed answer")
+        self.assertEqual(detail["anatomy"]["message_count"], 1)
+        self.assertTrue(detail["transcript"]["source"]["using_ledger_fallback"])
+
+    def test_detail_header_uses_latest_source_backed_assistant_model(self) -> None:
+        self.session(
+            "codex:model-switch",
+            external_id="model-switch",
+            model="gpt-5.6-sol",
+            effort="high",
+            transcript_storage="source_backed",
+        )
+        self.conn.commit()
+        source_messages = [
+            {
+                "id": "codex:model-switch:m:1",
+                "seq": 1,
+                "role": "assistant",
+                "timestamp": "2026-09-28T14:20:00+00:00",
+                "model": "gpt-5.6-sol",
+                "model_canonical": "gpt-5.6-sol",
+                "effort": "high",
+                "text": "Before switch",
+                "is_tool_plumbing": False,
+                "authored_by_agent": False,
+            },
+            {
+                "id": "codex:model-switch:m:2",
+                "seq": 2,
+                "role": "assistant",
+                "timestamp": "2026-09-28T14:27:00+00:00",
+                "model": "gpt-6-sol",
+                "model_canonical": "gpt-6-sol",
+                "effort": "xhigh",
+                "text": "After switch",
+                "is_tool_plumbing": False,
+                "authored_by_agent": False,
+            },
+        ]
+
+        detail = session_detail_v2(
+            self.conn,
+            "codex:model-switch",
+            source_reader=lambda _conn, _session_id: SourceReadResult(
+                "ready", source_messages
+            ),
+        )
+
+        assert detail is not None
+        self.assertEqual(detail["session"]["model"], "gpt-6-sol")
+        self.assertEqual(detail["session"]["effort"], "xhigh")
+        self.assertEqual(
+            [message["model"] for message in detail["messages"]],
+            ["gpt-5.6-sol", "gpt-6-sol"],
+        )
+
+    def test_empty_ledger_rows_render_only_when_they_anchor_tools(self) -> None:
+        self.session("codex:empty-rows", external_id="empty-rows")
+        self.conn.executemany(
+            """
+            INSERT INTO messages
+              (id, session_id, seq, role, text, content_hash)
+            VALUES (?, 'codex:empty-rows', ?, ?, ?, ?)
+            """,
+            [
+                ("empty-system", 1, "system", "", "empty-system"),
+                ("empty-agent", 2, "assistant", "", "empty-agent"),
+                ("answer", 3, "assistant", "Done", "answer"),
+            ],
+        )
+        self.conn.execute(
+            """
+            INSERT INTO tool_events
+              (id, session_id, message_id, seq, tool_name, action, operation_kind)
+            VALUES ('tool', 'codex:empty-rows', 'empty-agent', 1,
+                    'exec', 'call', 'execute_other')
+            """
+        )
+        self.conn.commit()
+
+        detail = session_detail_v2(self.conn, "codex:empty-rows")
+
+        assert detail is not None
+        self.assertEqual(
+            [item["id"] for item in detail["timeline"]],
+            ["empty-agent", "answer"],
+        )
+        anchored = next(item for item in detail["timeline"] if item["id"] == "empty-agent")
+        self.assertEqual(len(anchored["tool_events"]), 1)
 
 
 if __name__ == "__main__":

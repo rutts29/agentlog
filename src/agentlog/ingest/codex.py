@@ -32,7 +32,7 @@ from agentlog.normalize.synthetic import (
     synthetic_skill_exposures,
 )
 from agentlog.normalize.tool_ops import classify_operation
-from agentlog.session_identity import INTERNAL_APPROVAL_GUARDIAN_THREAD_SOURCE
+from agentlog.session_identity import GUARDIAN_REVIEW_THREAD_SOURCE
 
 
 _INTERNAL_APPROVAL_GUARDIAN_PREFIXES = (
@@ -784,7 +784,11 @@ class CodexAdapter(TranscriptAdapter):
                     if isinstance(source, dict)
                     else None
                 )
-                if payload.get("thread_source") == "subagent":
+                is_subagent_source = (
+                    payload.get("thread_source") == "subagent"
+                    or isinstance(sub, dict)
+                )
+                if is_subagent_source:
                     # thread_spawn with no role often forks parent history (human turns).
                     # Roleed workers/explorers and guardian "other" spawns get agent briefs.
                     if agent_role not in (None, ""):
@@ -797,7 +801,7 @@ class CodexAdapter(TranscriptAdapter):
                             spawn.get("agent_nickname") or spawn.get("agent_path")
                         )
                 guardian_other_subagent = (
-                    payload.get("thread_source") == "subagent"
+                    is_subagent_source
                     and isinstance(sub, dict)
                     and sub.get("other") == "guardian"
                 )
@@ -836,6 +840,30 @@ class CodexAdapter(TranscriptAdapter):
                 continue
 
             payload_type = payload.get("type")
+
+            if kind == "event_msg" and payload_type == "thread_settings_applied":
+                # Codex may emit a stale turn_context immediately before the
+                # settings actually applied to the turn. The applied-settings
+                # event is the runtime authority for in-session model switches.
+                settings = payload.get("thread_settings")
+                if isinstance(settings, dict):
+                    applied_model = settings.get("model")
+                    if isinstance(applied_model, str) and applied_model.strip():
+                        model = applied_model.strip()
+                    applied_effort = settings.get("reasoning_effort")
+                    if applied_effort is None:
+                        applied_effort = settings.get("effort")
+                    if applied_effort is not None:
+                        effort, effort_source = normalize_effort(
+                            str(applied_effort)
+                        )
+                    applied_provider = settings.get("model_provider_id")
+                    if (
+                        isinstance(applied_provider, str)
+                        and applied_provider.strip()
+                    ):
+                        provider = applied_provider.strip()
+                continue
 
             if kind == "event_msg" and payload_type == "token_count":
                 info = payload.get("info") if isinstance(payload.get("info"), dict) else {}
@@ -1181,11 +1209,7 @@ class CodexAdapter(TranscriptAdapter):
         flag_synthetic_user_messages(messages)
         skills = synthetic_skill_exposures(messages)
         if internal_approval_guardian:
-            messages = []
-            tools = []
-            skills = []
-            token_usages = []
-            thread_source = INTERNAL_APPROVAL_GUARDIAN_THREAD_SOURCE
+            thread_source = GUARDIAN_REVIEW_THREAD_SOURCE
 
         session = NormalizedSession(
             harness=Harness.CODEX,
@@ -1236,11 +1260,7 @@ class CodexAdapter(TranscriptAdapter):
                 "fork_context_boundary": fork_boundary.turn_id,
                 "checkpoint_blocked": fork_boundary.status == "ambiguous",
                 **({"grok_launches": grok_launches} if grok_launches else {}),
-                **(
-                    {"activity_suppressed": "internal_approval_guardian"}
-                    if internal_approval_guardian
-                    else {}
-                ),
+                **({"guardian_review": True} if internal_approval_guardian else {}),
                 **(
                     {
                         "checkpoint_blocked_reason": (

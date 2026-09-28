@@ -30,7 +30,8 @@ export function TraceShards({
       frame.index <= frameIndex &&
       frame.kind !== "context" &&
       frame.kind !== "system" &&
-      frame.detail !== "No text captured"
+      frame.detail !== "No text captured" &&
+      !(frame.kind === "tool" && frame.action === "result")
     )
     .slice(-10)
     .reverse();
@@ -45,21 +46,37 @@ export function TraceShards({
         <div className="trace-shards-row trace-shards-row--head" role="row">
           <span>Time</span><span>Source</span><span>Event</span><span>Details</span><span>Duration</span>
         </div>
-        {frames.map((frame) => (
-          <button
-            key={frame.id}
-            type="button"
-            className={`trace-shards-row trace-shards-row--${frame.kind} trace-shards-row--${frame.outcome}`}
-            onClick={() => onSelectFrame(frame.index)}
-            role="row"
-          >
-            <time>{formatDayTime(frame.timestamp)}</time>
-            <span className="trace-shards-row__source">{sourceLabel(replay, projection, frame)}</span>
-            <span>{frame.title}</span>
-            <span>{frame.detail}</span>
-            <span>{frame.durationMs == null ? "—" : formatDuration(frame.durationMs / 1000)}</span>
-          </button>
-        ))}
+        {frames.map((frame) => {
+          const toolLabel = frame.tool === "exec" || frame.tool === "exec_command"
+            ? "Shell command"
+            : frame.tool === "js"
+              ? "UI automation"
+              : frame.tool?.replaceAll("_", " ");
+          const event = frame.kind === "tool" ? toolLabel || "Tool call" : frame.title;
+          const operation = frame.operationKind === "execute_other"
+            ? "Execute command"
+            : frame.operationKind === "unknown"
+              ? null
+              : frame.operationKind?.replaceAll("_", " ");
+          const detail = frame.kind === "tool"
+            ? frame.context || operation || "Open replay for source payload"
+            : frame.detail;
+          return (
+            <button
+              key={frame.id}
+              type="button"
+              className={`trace-shards-row trace-shards-row--${frame.kind} trace-shards-row--${frame.outcome}`}
+              onClick={() => onSelectFrame(frame.index)}
+              role="row"
+            >
+              <time>{formatDayTime(frame.timestamp)}</time>
+              <span className="trace-shards-row__source">{sourceLabel(replay, projection, frame)}</span>
+              <span>{event}</span>
+              <span>{detail}</span>
+              <span>{frame.durationMs == null ? "" : formatDuration(frame.durationMs / 1000)}</span>
+            </button>
+          );
+        })}
       </div>
     </section>
   );

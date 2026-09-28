@@ -3,8 +3,12 @@ import { Link, useOutletContext, useSearchParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { DiagnosticLoader } from "@/components/DiagnosticLoader";
 import { CommandFloor } from "@/components/command-grid/CommandFloor";
-import { ExecutionTimeline } from "@/components/command-grid/ExecutionTimeline";
+import {
+  ExecutionTimeline,
+  type ExecutionPhaseSelection,
+} from "@/components/command-grid/ExecutionTimeline";
 import { MissionArena } from "@/components/command-grid/MissionArena";
+import { PhaseToolTrace } from "@/components/command-grid/PhaseToolTrace";
 import { fetchMissionReplay, fetchOrchestration, fetchRecent, type PresenceEvent } from "@/lib/api";
 import { projectCommandFloor, type CommandFloorActor } from "@/lib/commandFloor";
 import {
@@ -23,8 +27,13 @@ type FloorMode = "live" | "replay";
 
 function actorStateLabel(actor: CommandFloorActor): string {
   switch (actor.state.kind) {
-    case "working":
-      return `${actor.state.mode} · ${actor.state.label}`;
+    case "working": {
+      const mode = actor.state.mode === "tool" ? "working" : actor.state.mode;
+      const detail = /^(call|result|end)$/i.test(actor.state.label)
+        ? actor.state.tool || "tool activity"
+        : actor.state.label;
+      return `${mode} · ${detail}`;
+    }
     case "orchestrating":
       return `orchestrating · ${actor.state.workerCount} ${actor.state.workerCount === 1 ? "worker" : "workers"}`;
     case "waiting":
@@ -40,11 +49,24 @@ function replayOutcomeLabel(frame: MissionFrame): string {
   return "outcome unavailable";
 }
 
+function operationLabel(value: string | null): string {
+  const labels: Record<string, string> = {
+    artifact_read: "read artifact",
+    artifact_write: "write artifact",
+    execute_other: "execute command",
+    read_only: "read-only operation",
+    verification: "verification",
+  };
+  if (!value || value === "unknown") return "not classified";
+  return labels[value] ?? value.replaceAll("_", " ");
+}
+
 export function CommandFloorView() {
   const { range } = useOutletContext<Ctx>();
   const [params, setParams] = useSearchParams();
   const mode: FloorMode = params.get("mode") === "replay" ? "replay" : "live";
   const [selectedActorId, setSelectedActorId] = useState<string | null>(params.get("crew"));
+  const [selectedPhase, setSelectedPhase] = useState<ExecutionPhaseSelection | null>(null);
   const [playing, setPlaying] = useState(false);
   const presenceHandler = useRef<(data: PresenceEvent) => void>(() => {});
   const { connected } = useIngestStream(() => undefined, (data) => presenceHandler.current(data));
@@ -75,7 +97,7 @@ export function CommandFloorView() {
       seen.add(session.id);
       candidates.push({
         id: session.id,
-        label: `${session.project} · ${session.child_count} direct · ${formatDayTime(session.started_at)}`,
+        label: `${session.project} · ${session.child_count} direct workers · ${formatDayTime(session.started_at)}`,
       });
     }
     for (const session of recent.data?.items ?? []) {
@@ -162,6 +184,7 @@ export function CommandFloorView() {
 
   useEffect(() => {
     setPlaying(false);
+    setSelectedPhase(null);
   }, [mode, replaySessionId]);
 
   const traceSearch = (() => {
@@ -292,7 +315,7 @@ export function CommandFloorView() {
           <time className="replay-frame__index">{formatDayTime(frame.timestamp)}</time>
           <span><strong>{frame.title}</strong><small>{frame.detail}</small></span>
           <span>{projection.byId.get(frame.actorId)?.callsign ?? frame.kind}</span>
-          <span>{replayOutcomeLabel(frame)}</span>
+          {frame.outcome === "unknown" ? null : <span>{replayOutcomeLabel(frame)}</span>}
         </div>
       ) : null}
 
@@ -309,6 +332,18 @@ export function CommandFloorView() {
               frameIndex={frameIndex}
               selectedActorId={activeActorId}
               onSelectFrame={setReplayFrame}
+              onSelectPhase={(phase) => {
+                setSelectedActorId(phase.actorId);
+                setSelectedPhase(phase);
+              }}
+            />
+          ) : null}
+          {mode === "replay" && replay && selectedPhase ? (
+            <PhaseToolTrace
+              phase={selectedPhase}
+              replay={replay}
+              range={range}
+              onClose={() => setSelectedPhase(null)}
             />
           ) : null}
           <div className="command-floor-layout">
@@ -341,6 +376,9 @@ export function CommandFloorView() {
                   <span>{selected.kind}</span>
                   <span>{selected.specialty}</span>
                   <span>{selected.harnessDisplay}</span>
+                  {selected.model ? <span>{selected.model}</span> : null}
+                  {selected.effort ? <span>{selected.effort}</span> : null}
+                  {selected.agentProfile ? <span>{selected.agentProfile.replaceAll("-", " ")}</span> : null}
                 </div>
                 <dl>
                   <div><dt>State</dt><dd>{actorStateLabel(selected)}</dd></div>
@@ -353,12 +391,12 @@ export function CommandFloorView() {
                 {selectedFrame?.kind === "tool" ? (
                   <section className={`inspector-tool inspector-tool--${selectedFrame.outcome}`}>
                     <header><span>Tool packet</span><strong>{selectedFrame.tool}</strong></header>
-                    <p>{selectedFrame.context || selectedFrame.action || "Action unavailable"}</p>
+                    <p>{selectedFrame.context || selectedFrame.action || "No call context was captured in the normalized ledger."}</p>
                     <dl>
-                      <div><dt>Action</dt><dd>{selectedFrame.action || "unknown"}</dd></div>
-                      <div><dt>Outcome</dt><dd>{replayOutcomeLabel(selectedFrame)}</dd></div>
-                      <div><dt>Duration</dt><dd>{selectedFrame.durationMs == null ? "unavailable" : formatDuration(selectedFrame.durationMs / 1000)}</dd></div>
-                      <div><dt>Operation</dt><dd>{selectedFrame.operationKind || "unknown"}</dd></div>
+                      <div><dt>Action</dt><dd>{selectedFrame.action || "not recorded"}</dd></div>
+                      {selectedFrame.outcome === "unknown" ? null : <div><dt>Outcome</dt><dd>{replayOutcomeLabel(selectedFrame)}</dd></div>}
+                      {selectedFrame.durationMs == null ? null : <div><dt>Duration</dt><dd>{formatDuration(selectedFrame.durationMs / 1000)}</dd></div>}
+                      {!selectedFrame.operationKind || selectedFrame.operationKind === "unknown" ? null : <div><dt>Operation</dt><dd>{operationLabel(selectedFrame.operationKind)}</dd></div>}
                       <div><dt>Timing</dt><dd>{selectedFrame.timeEvidence}</dd></div>
                     </dl>
                   </section>
@@ -369,7 +407,14 @@ export function CommandFloorView() {
                     {recentSelectedTools.map((toolFrame) => (
                       <button type="button" key={toolFrame.id} onClick={() => setReplayFrame(toolFrame.index)}>
                         <span>{toolFrame.tool}</span>
-                        <small>{toolFrame.outcome} · {toolFrame.durationMs == null ? "?" : formatDuration(toolFrame.durationMs / 1000)}</small>
+                        {toolFrame.outcome !== "unknown" || toolFrame.durationMs != null ? (
+                          <small>
+                            {[
+                              toolFrame.outcome === "unknown" ? null : replayOutcomeLabel(toolFrame),
+                              toolFrame.durationMs == null ? null : formatDuration(toolFrame.durationMs / 1000),
+                            ].filter(Boolean).join(" · ")}
+                          </small>
+                        ) : null}
                       </button>
                     ))}
                   </section>

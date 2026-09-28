@@ -19,6 +19,7 @@ function filesUnder(root) {
 
 const sourceFiles = filesUnder(sourceRoot).filter((file) => /\.(css|ts|tsx)$/.test(file));
 const source = sourceFiles.map((file) => fs.readFileSync(file, "utf8")).join("\n");
+const commandGridCss = fs.readFileSync(path.join(sourceRoot, "index.css"), "utf8");
 const pkg = JSON.parse(fs.readFileSync(path.join(webRoot, "package.json"), "utf8"));
 
 for (const required of [
@@ -32,6 +33,7 @@ for (const required of [
   "src/components/command-grid/EvidenceTrail.tsx",
   "src/components/command-grid/MissionArena.tsx",
   "src/components/command-grid/MissionTopology.tsx",
+  "src/components/command-grid/PhaseToolTrace.tsx",
   "src/components/command-grid/ExecutionTimeline.tsx",
   "src/components/command-grid/RuntimeGrid.tsx",
   "src/components/command-grid/SectorMap.tsx",
@@ -84,6 +86,22 @@ for (const label of [
   "Execution timeline",
 ]) {
   assert.ok(source.includes(label), `missing approved interface label: ${label}`);
+}
+
+for (const station of [
+  "command-deck",
+  "archive-console",
+  "fabrication-bay",
+  "diagnostics-bay",
+  "review-console",
+  "server-rack",
+  "human-gate",
+  "standby",
+]) {
+  assert.ok(
+    commandGridCss.includes(`.deck-agent--${station}.deck-agent--slot-1`),
+    `missing station-owned actor slots for ${station}`,
+  );
 }
 
 const distAssets = path.join(webRoot, "dist", "assets");

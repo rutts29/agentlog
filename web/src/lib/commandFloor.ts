@@ -51,6 +51,9 @@ type ActorCommon = {
   externalId: string;
   harness: string;
   harnessDisplay: string;
+  model: string | null;
+  effort: string | null;
+  agentProfile: string | null;
   project: string;
   roomId: string;
   callsign: string;
@@ -258,6 +261,11 @@ function displayName(session: LiveSession): string {
   );
 }
 
+function recordedModel(value: string | null | undefined): string | null {
+  const text = value?.trim();
+  return text && !/^\(?unknown\)?$/i.test(text) ? text : null;
+}
+
 function aliasesFor(session: LiveSession): string[] {
   return [
     actorId(session),
@@ -300,6 +308,9 @@ export function projectCommandFloor(sessions: LiveSession[]): CommandFloorProjec
       externalId: session.external_id,
       harness: session.harness,
       harnessDisplay: session.harness_display || session.harness,
+      model: recordedModel(session.model),
+      effort: session.effort || null,
+      agentProfile: session.agent_profile || null,
       project,
       roomId: slug(project),
       callsign: callsignForActor(id, worker),

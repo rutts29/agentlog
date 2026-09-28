@@ -54,6 +54,9 @@ const NOTIFICATION_HEURISTIC =
 const AGENT_CONTEXT_HEURISTIC =
   /^<(codex_internal_context|recommended_plugins|skills_instructions|permissions(?:_instructions|\s+instructions)?|memory|multi_agent_mode|apps_instructions|plugins_instructions)\b/i;
 
+const GUARDIAN_REVIEW_HEURISTIC =
+  /^the following is the codex agent history (whose request action you are assessing|added since your last approval assessment)/i;
+
 /** Cursor emits these inside <user_query> after subagent/background completion. */
 const SYNTHETIC_QUERY_HEURISTIC =
   /^(perform any necessary follow-up actions|a (background|cloud) (agent|command) (has )?(completed|finished))/i;
@@ -119,6 +122,17 @@ export function classifySpeaker(msg: {
       detail: null,
       color: "var(--speaker-tool)",
       collapsed: text.length > 280,
+      extractedQuery: null,
+    };
+  }
+
+  if (GUARDIAN_REVIEW_HEURISTIC.test(text.trimStart())) {
+    return {
+      kind: "synthetic",
+      label: "review packet",
+      detail: "guardian context",
+      color: "var(--speaker-synthetic)",
+      collapsed: true,
       extractedQuery: null,
     };
   }

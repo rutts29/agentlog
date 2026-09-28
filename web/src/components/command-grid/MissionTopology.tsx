@@ -1,11 +1,6 @@
 import { Link } from "react-router-dom";
 import { callsignForActor } from "@/lib/commandFloor";
-import type { MissionReplay } from "@/lib/missionReplay";
-
-function actorName(actor: MissionReplay["actors"][number]): string {
-  if (actor.depth === 0) return `${actor.project || "Mission"} coordinator`;
-  return actor.model || actor.logical_harness || actor.harness || "Worker familiar";
-}
+import { missionActorName, type MissionReplay } from "@/lib/missionReplay";
 
 export function MissionTopology({
   replay,
@@ -35,7 +30,7 @@ export function MissionTopology({
             to={`/sessions/${encodeURIComponent(root.navigation_id ?? root.id)}?${new URLSearchParams({ range }).toString()}`}
           >
             <span>{callsignForActor(root.id, false)}</span>
-            <strong>{actorName(root)}</strong>
+            <strong>{missionActorName(root)}</strong>
             <small>{directWorkers} direct workers · {root.tool_count} tools</small>
           </Link>
         ) : null}
@@ -48,7 +43,7 @@ export function MissionTopology({
               to={`/sessions/${encodeURIComponent(worker.navigation_id ?? worker.id)}?${new URLSearchParams({ range }).toString()}`}
             >
               <span>{callsignForActor(worker.id, true)}</span>
-              <strong>{actorName(worker)}</strong>
+              <strong>{missionActorName(worker)}</strong>
               <small>L{worker.depth} · {worker.message_count} msgs · {worker.tool_count} tools</small>
             </Link>
           ))}

@@ -94,6 +94,33 @@ recorded lifecycle timestamps, while tool name, operation class, context,
 success, duration, and timing confidence remain explicit. The replay does not
 invent workers or missing tool arguments.
 
+## Observability contract
+
+Every harness uses the same detail contract:
+
+- `navigation_id` identifies the logical thread shown in the branch tree.
+- `logical_harness` names the product the user ran, such as T3 Code.
+- `runtime_harness` names the backing executor, such as Codex.
+- `transcript_session_id` identifies the canonical transcript and tool ledger.
+- Message-level model and effort identify the model used for that turn. The
+  session model remains the start model and does not overwrite later switches.
+
+Holotrace reads the canonical source when it exists. If a historical source is
+missing or changed but indexed rows remain, it shows the last indexed ledger
+copy with an explicit warning. It does not replace known history with an empty
+panel.
+
+Tool packets start collapsed on every page. Expanding a packet uses the same
+tool-detail rows as Command Floor. For Codex sources, inputs and outputs are
+read on demand from the local JSONL and never copied into the normalized
+database. Other harnesses show every normalized field they captured and state
+source coverage once at the packet level.
+
+Speaker attribution distinguishes human prompts, agent responses, worker
+briefs, guardian review packets, tool I/O, system context, and skill context.
+Synthetic and guardian messages remain visible for traceability but do not
+masquerade as human prompts.
+
 ## Production art
 
 The live and replay floors share one generated command-room environment and a

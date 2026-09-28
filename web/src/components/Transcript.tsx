@@ -1,5 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { TimelineItem, TimelineMessage, ToolEvent } from "@/lib/api";
+import { useQuery } from "@tanstack/react-query";
+import {
+  fetchToolTrace,
+  type TimelineItem,
+  type TimelineMessage,
+  type ToolEvent,
+  type ToolTraceItem,
+} from "@/lib/api";
+import { ToolTraceRows } from "@/components/command-grid/PhaseToolTrace";
 import { classifySpeaker, type SpeakerSpec } from "@/lib/speaker";
 import { formatClock, cn } from "@/lib/utils";
 import { useViewShortcuts } from "@/lib/keyboard";
@@ -42,10 +50,16 @@ export function Transcript({
   timeline,
   focusId,
   isChildSession = false,
+  assistantIdentityFallback = null,
+  sessionId,
+  range,
 }: {
   timeline: TimelineItem[];
   focusId: string | null;
   isChildSession?: boolean;
+  assistantIdentityFallback?: string | null;
+  sessionId: string;
+  range: string;
 }) {
   const items = useMemo(
     () => buildRenderItems(timeline, isChildSession),
@@ -78,13 +92,16 @@ export function Transcript({
     <div ref={containerRef} className="holotrace">
       {items.map((item) =>
         item.type === "toolgroup" ? (
-          <ToolGroup key={`g-${item.id}`} tools={item.tools} orphan />
+          <ToolGroup key={`g-${item.id}`} tools={item.tools} sessionId={sessionId} range={range} orphan />
         ) : (
           <Turn
             key={item.msg.id}
             msg={item.msg}
             spec={item.spec}
             focused={focusId === item.msg.id}
+            assistantIdentityFallback={assistantIdentityFallback}
+            sessionId={sessionId}
+            range={range}
           />
         ),
       )}
@@ -96,10 +113,16 @@ function Turn({
   msg,
   spec,
   focused,
+  assistantIdentityFallback,
+  sessionId,
+  range,
 }: {
   msg: TimelineMessage;
   spec: SpeakerSpec;
   focused: boolean;
+  assistantIdentityFallback: string | null;
+  sessionId: string;
+  range: string;
 }) {
   const [expanded, setExpanded] = useState(false);
   const [showEnvelope, setShowEnvelope] = useState(false);
@@ -113,6 +136,13 @@ function Turn({
   const body = spec.extractedQuery ?? msg.text ?? "";
   const collapsed = spec.collapsed && !expanded;
   const preview = collapsed ? body.slice(0, 220) : body;
+  const recordedModel = msg.model && !/^\(?unknown\)?$/i.test(msg.model) ? msg.model : null;
+  const assistantIdentity = recordedModel ?? assistantIdentityFallback;
+  const assistantIdentityLine = assistantIdentity
+    ? `${assistantIdentity}${msg.effort ? ` /${msg.effort}` : ""}`
+    : msg.effort
+      ? `effort ${msg.effort}`
+      : null;
 
   return (
     <article
@@ -135,10 +165,9 @@ function Turn({
       </div>
 
       <div className="holotrace-turn__body" style={{ borderColor: spec.color }}>
-        {spec.kind === "assistant" && (msg.model || msg.effort) ? (
+        {spec.kind === "assistant" && assistantIdentityLine ? (
           <div className="holotrace-turn__model">
-            {msg.model}
-            {msg.effort ? ` /${msg.effort}` : ""}
+            {assistantIdentityLine}
           </div>
         ) : null}
 
@@ -156,9 +185,9 @@ function Turn({
             {preview}
             {collapsed ? "…" : ""}
           </pre>
-        ) : (
+        ) : msg.tool_events.length === 0 ? (
           <div className="holotrace-turn__empty">(no text)</div>
-        )}
+        ) : null}
 
         <div className="holotrace-turn__actions">
           {spec.collapsed ? (
@@ -190,17 +219,75 @@ function Turn({
         ) : null}
 
         {msg.tool_events.length > 0 ? (
-          <ToolGroup tools={msg.tool_events} />
+          <ToolGroup tools={msg.tool_events} sessionId={sessionId} range={range} />
         ) : null}
       </div>
     </article>
   );
 }
 
-function ToolGroup({ tools, orphan }: { tools: ToolEvent[]; orphan?: boolean }) {
-  const [open, setOpen] = useState(tools.length <= 3);
+function normalizedTraceItems(tools: ToolEvent[]): ToolTraceItem[] {
+  const items: ToolTraceItem[] = [];
+  for (let index = 0; index < tools.length; index += 1) {
+    const tool = tools[index];
+    const next = tools[index + 1];
+    const paired =
+      tool.action === "call" &&
+      next?.tool_name === tool.tool_name &&
+      (next.action === "result" || next.action === "end");
+    const terminal = paired ? next : tool;
+    const recordedInput = tool.action && !/^(call|result|end)$/i.test(tool.action) ? tool.action : null;
+    items.push({
+      id: tool.id,
+      call_id: null,
+      call_seq: tool.seq ?? index,
+      result_seq: paired ? next.seq : null,
+      tool_name: tool.tool_name,
+      operation_kind: tool.operation_kind || "unknown",
+      timestamp: null,
+      result_timestamp: null,
+      message_id: tool.message_id,
+      recorded_action: tool.action || "recorded",
+      model: null,
+      effort: null,
+      input: recordedInput,
+      input_truncated: false,
+      output: null,
+      output_truncated: false,
+      success: terminal.success,
+      duration_ms: terminal.duration_ms,
+    });
+    if (paired) index += 1;
+  }
+  return items;
+}
+
+function ToolGroup({
+  tools,
+  sessionId,
+  range,
+  orphan,
+}: {
+  tools: ToolEvent[];
+  sessionId: string;
+  range: string;
+  orphan?: boolean;
+}) {
+  const [open, setOpen] = useState(false);
   const failed = tools.filter((t) => t.success === 0).length;
   const totalMs = tools.reduce((acc, t) => acc + (t.duration_ms ?? 0), 0);
+  const sequences = tools.map((tool) => tool.seq).filter((seq): seq is number => seq != null);
+  const startSeq = sequences.length > 0 ? Math.min(...sequences) : null;
+  const endSeq = sequences.length > 0 ? Math.max(...sequences) : null;
+  const fallbackItems = useMemo(() => normalizedTraceItems(tools), [tools]);
+  const trace = useQuery({
+    queryKey: ["transcript-tool-trace", sessionId, startSeq, endSeq],
+    queryFn: ({ signal }) => fetchToolTrace(sessionId, startSeq!, endSeq!, signal),
+    enabled: open && startSeq != null && endSeq != null,
+    staleTime: Infinity,
+  });
+  const traceItems = trace.data?.items.length ? trace.data.items : fallbackItems;
+  const callCount = trace.data?.items.length || fallbackItems.length;
 
   const summary = (
     <button
@@ -215,7 +302,7 @@ function ToolGroup({ tools, orphan }: { tools: ToolEvent[]; orphan?: boolean }) 
       >
         ▶
       </span>
-      <span>tool packet · {tools.length} {tools.length === 1 ? "call" : "calls"}</span>
+      <span>tool packet · {callCount} {callCount === 1 ? "call" : "calls"}</span>
       {failed > 0 ? (
         <span className="tool-packet-summary__failed">{failed} failed</span>
       ) : null}
@@ -228,36 +315,11 @@ function ToolGroup({ tools, orphan }: { tools: ToolEvent[]; orphan?: boolean }) 
   );
 
   const list = open ? (
-    <div className="tool-packet-list-expanded">
-      {tools.map((t) => (
-        <div
-          key={t.id}
-          className="tool-packet"
-        >
-          <span
-            aria-hidden
-            className="tool-packet__status"
-            style={{
-              background:
-                t.success === 0
-                  ? "var(--status-error)"
-                  : t.success === 1
-                    ? "var(--status-ok)"
-                    : "var(--faint-foreground)",
-            }}
-          />
-          <span className="tool-packet__name">{t.tool_name}</span>
-          {t.action ? (
-            <span className="tool-packet__action">{t.action}</span>
-          ) : null}
-          {t.duration_ms != null ? (
-            <span className="tool-packet__duration">
-              {t.duration_ms}ms
-            </span>
-          ) : null}
-        </div>
-      ))}
-    </div>
+    trace.isLoading ? (
+      <div className="tool-trace-inline-status">Reading local tool inputs and outputs…</div>
+    ) : (
+      <ToolTraceRows items={traceItems} sessionId={sessionId} range={range} />
+    )
   ) : null;
 
   if (orphan) {

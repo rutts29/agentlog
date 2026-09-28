@@ -15,6 +15,55 @@ def _line(kind: str, payload: dict, ts: str = "2026-06-20T12:00:00Z") -> bytes:
 
 
 class CodexModelIdentityIngestTests(unittest.TestCase):
+    def test_applied_thread_settings_override_stale_turn_context(self) -> None:
+        data = b"".join(
+            [
+                _line(
+                    "session_meta",
+                    {
+                        "id": "model-switch",
+                        "model_provider": "openai",
+                    },
+                ),
+                _line(
+                    "turn_context",
+                    {"model": "gpt-5.6-sol", "effort": "high"},
+                    ts="2026-09-28T14:26:41.362Z",
+                ),
+                _line(
+                    "event_msg",
+                    {
+                        "type": "thread_settings_applied",
+                        "thread_settings": {
+                            "model": "gpt-6-sol",
+                            "model_provider_id": "openai",
+                            "reasoning_effort": "xhigh",
+                        },
+                    },
+                    ts="2026-09-28T14:26:41.362Z",
+                ),
+                _line(
+                    "response_item",
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "new model turn"}],
+                    },
+                    ts="2026-09-28T14:26:59Z",
+                ),
+            ]
+        )
+
+        result = CodexAdapter().parse_chunk(
+            Path("/tmp/model-switch.jsonl"), data, start_offset=0
+        )
+
+        self.assertEqual(result.session.model, "gpt-6-sol")
+        self.assertEqual(result.session.provider, "openai")
+        self.assertEqual(result.session.effort, "xhigh")
+        self.assertEqual(result.messages[-1].model, "gpt-6-sol")
+        self.assertEqual(result.messages[-1].effort, "xhigh")
+
     def test_t3code_originator_keeps_harness_separate_from_execution_identity(self) -> None:
         data = b"".join(
             [

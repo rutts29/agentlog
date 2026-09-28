@@ -40,6 +40,18 @@ _EFFORT_MODE_SUFFIXES: tuple[str, ...] = (
 
 _WS_RE = re.compile(r"[_\s]+")
 
+_PROVIDER_PREFIXES: tuple[tuple[str, str], ...] = (
+    ("gpt-", "openai"),
+    ("o1-", "openai"),
+    ("o3-", "openai"),
+    ("o4-", "openai"),
+    ("claude-", "anthropic"),
+    ("grok-", "xai"),
+    ("gemini-", "google"),
+    ("kimi-", "moonshot"),
+    ("glm-", "zhipu"),
+)
+
 
 @dataclass(frozen=True)
 class ModelIdentity:
@@ -107,6 +119,14 @@ def _candidates(key: str) -> list[str]:
     add(no_cursor)
     add(_strip_effort_suffixes(no_cursor))
     return out
+
+
+def _provider_from_model_slug(key: str) -> str | None:
+    """Infer only stable provider namespaces for unregistered model slugs."""
+    for prefix, provider in _PROVIDER_PREFIXES:
+        if key.startswith(prefix):
+            return provider
+    return None
 
 
 def resolve_model_identity(
@@ -216,7 +236,7 @@ def resolve_model_identity(
     return ModelIdentity(
         raw=source,
         canonical=provisional,
-        provider=provider,
+        provider=provider or _provider_from_model_slug(provisional),
         agent_profile=agent_profile,
         family=None,
     )
