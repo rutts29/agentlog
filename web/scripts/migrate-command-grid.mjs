@@ -32,4 +32,3 @@ for (const file of sourceFiles(sourceRoot)) {
 }
 
 console.log(`Command Grid migration updated ${changed} source file${changed === 1 ? "" : "s"}.`);
-

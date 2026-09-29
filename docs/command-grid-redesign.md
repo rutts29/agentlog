@@ -102,8 +102,11 @@ Every harness uses the same detail contract:
 - `logical_harness` names the product the user ran, such as T3 Code.
 - `runtime_harness` names the backing executor, such as Codex.
 - `transcript_session_id` identifies the canonical transcript and tool ledger.
-- Message-level model and effort identify the model used for that turn. The
-  session model remains the start model and does not overwrite later switches.
+- Message-level model and effort identify the model used for that turn. Codex
+  `thread_settings_applied` records take precedence when a preceding
+  `turn_context` carries stale settings. The detail header shows the latest
+  source-backed assistant model; indexed session lists catch up after ingest.
+  Earlier turns keep their original model labels.
 
 Holotrace reads the canonical source when it exists. If a historical source is
 missing or changed but indexed rows remain, it shows the last indexed ledger
@@ -129,7 +132,7 @@ portraits and six mechanical familiars under `web/src/assets/command-grid/`.
 The scene maps Agentlog's observed state onto those assets; the art never owns
 session or activity state.
 
-The room ships as an optimized 385 KB JPEG and the transparent sprites are
+The room ships as an optimized 528 KiB JPEG and the transparent sprites are
 256 px PNGs, roughly 58–70 KB each. The original generated masters remain
 outside the frontend bundle. CSS transitions move actors when telemetry changes
 their station, and state keyframes communicate working, waiting, coordinating,

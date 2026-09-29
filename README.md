@@ -55,8 +55,11 @@ Transcript retention is deliberately forward-only:
   canonical local artifact transiently. It verifies harness identity,
   checkpoint prefix, stable reads, session identity, and message metadata
   before returning text.
-- A missing, rewritten, unstable, or mismatched source fails closed as
-  unavailable/changed; it does not serve stale transcript text.
+- A missing, rewritten, unstable, or mismatched source is reported as
+  unavailable/changed. If indexed message rows still contain text, the
+  dashboard can show that last indexed copy with an explicit warning. Full
+  current transcript text and tool inputs/outputs still require the local
+  canonical artifact.
 
 This model reduces future materialization of transcript content. It does not
 retroactively erase existing `legacy_materialized` data from a local database.
@@ -89,10 +92,14 @@ agentlog ingest
 agentlog stats
 agentlog sessions --harness codex
 agentlog search "checkpoint"
+cd web && npm ci && npm run build && cd ..
 agentlog serve
 ```
 
 `agentlog ingest` discovers supported artifacts on the current machine.
+On another machine, build the dashboard there and ingest that machine's local
+agent artifacts. Git carries the code and art, not your transcript files,
+SQLite database, or local API token.
 
 For project-specific configuration proposals, set `AGENTLOG_REPO_ROOTS` to the
 repository directories to inspect, separated by your operating system's path
