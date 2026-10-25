@@ -42,27 +42,13 @@ The ledger stores normalized sessions, message metadata, tool events, model
 and token context, exchange windows, and derived observations. The dashboard
 is a local FastAPI service with a React frontend; it is not a hosted product.
 
-### Source-backed transcript storage
+### Transcript storage
 
-Transcript retention is deliberately forward-only:
-
-- Existing rows remain `legacy_materialized`, whose message text is already in
-  SQLite and searchable through FTS.
-- Newly discovered session identities use `source_backed` storage. SQLite keeps
-  identity and integrity metadata, content hashes, tool/token data, and
-  derived windows, while stored message text is blank and excluded from FTS.
-- When text is requested for a source-backed session, agentlog re-reads the
-  canonical local artifact transiently. It verifies harness identity,
-  checkpoint prefix, stable reads, session identity, and message metadata
-  before returning text.
-- A missing, rewritten, unstable, or mismatched source is reported as
-  unavailable/changed. If indexed message rows still contain text, the
-  dashboard can show that last indexed copy with an explicit warning. Full
-  current transcript text and tool inputs/outputs still require the local
-  canonical artifact.
-
-This model reduces future materialization of transcript content. It does not
-retroactively erase existing `legacy_materialized` data from a local database.
+For new sessions, agentlog reads transcript text from the original local artifact
+and stores metadata and provenance in SQLite. Text is read on demand and checked
+against the indexed source before it is returned. Existing databases retain any
+previously stored transcript text. See [transcript storage](docs/transcript-storage.md)
+for the retention model and source-integrity checks.
 
 ## Privacy and trust boundaries
 
@@ -82,9 +68,14 @@ retroactively erase existing `legacy_materialized` data from a local database.
 
 ## Install and use locally
 
-Requires Python 3.11+.
+Requires Git and Python 3.11+. The dashboard also needs Node.js 20+ and npm.
+The commands below use Bash or Zsh.
 
 ```bash
+git clone https://github.com/rutts29/agentlog.git
+cd agentlog
+python3 -m venv .venv
+source .venv/bin/activate
 python -m pip install -e .
 
 agentlog --help
@@ -92,9 +83,18 @@ agentlog ingest
 agentlog stats
 agentlog sessions --harness codex
 agentlog search "checkpoint"
-cd web && npm ci && npm run build && cd ..
+```
+
+Build and start the dashboard from the repository root:
+
+```bash
+npm --prefix web ci
+npm --prefix web run build
 agentlog serve
 ```
+
+Open `http://127.0.0.1:3000`. The server creates a local API token automatically
+and handles browser authentication through an HttpOnly session.
 
 `agentlog ingest` discovers supported artifacts on the current machine.
 On another machine, build the dashboard there and ingest that machine's local
@@ -131,4 +131,6 @@ npm ci
 npm run build
 ```
 
-No license is currently included.
+## License
+
+Shared for others to run, study and adapt. Available under the [MIT License](LICENSE).
