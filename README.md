@@ -133,4 +133,4 @@ npm run build
 
 ## License
 
-Shared for others to run, study and adapt. Available under the [MIT License](LICENSE).
+Shared for others to run, study and adapt. Available under the [Apache License 2.0](LICENSE).

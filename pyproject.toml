@@ -3,7 +3,7 @@ name = "agentlog"
 version = "0.1.0"
 description = "Local-first analysis of AI coding agent transcripts"
 readme = "README.md"
-license = "MIT"
+license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = [
